@@ -1,0 +1,16 @@
+[package]
+name = "checker"
+description = "Raft safety invariants and linearizability checker for raftsim."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# checker, raft-core'a BAĞLI DEĞİLDİR: kendi nötr görünüm tiplerini tanımlar (Faz 2/3),
+# böylece kâhin (oracle) uygulamanın tiplerini ve olası hatalarını paylaşmaz.
+[dependencies]
+
+[lints]
+workspace = true

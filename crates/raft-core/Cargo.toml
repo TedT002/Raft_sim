@@ -1,0 +1,16 @@
+[package]
+name = "raft-core"
+description = "Sans-IO Raft consensus state machine (no I/O, no clock, no threads)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Faz 0: bilerek bağımlılık yok. Çekirdek hiçbir workspace crate'ine bağlanamaz;
+# rand/rand_chacha Faz 2'de (seed'li seçim zaman aşımı için) eklenecek.
+[dependencies]
+
+[lints]
+workspace = true

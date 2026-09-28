@@ -1,0 +1,35 @@
+# raft-core için anlamsal (semantic) yasak listesi: `scripts/check_forbidden.sh`'in metin
+# taramasıyla yakalayamadığı takma adları, yeniden dışa aktarımları ve süslü parantezli
+# import'ları derleyici düzeyinde yakalar. Clippy bu dosyayı CARGO_MANIFEST_DIR'den başlayarak
+# arar; bu yüzden yalnızca raft-core'a uygulanır. Dosyalar BİRLEŞMEZ: kökte ileride bir
+# clippy.toml açılırsa bu dosya yine kendi başına eksiksiz kalmalıdır.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is random; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is random; use BTreeSet" },
+    { path = "std::time::Instant", reason = "wall-clock time; use Input::Tick" },
+    { path = "std::time::SystemTime", reason = "wall-clock time; use Input::Tick" },
+    { path = "std::sync::Mutex", reason = "raft-core is single-threaded and synchronous" },
+    # Rastgele anahtarlı ya da kararsız hash, küresel veya iş parçacığına özgü durum. Faz 5'te
+    # seed koşuları aynı süreçte paralel yürüyecek; paylaşılan durum bir koşunun sonucunu
+    # diğerine sızdırır.
+    { path = "std::hash::RandomState", reason = "randomly keyed hasher; results differ per run" },
+    { path = "std::hash::DefaultHasher", reason = "algorithm is unspecified and may change between Rust versions" },
+    { path = "std::sync::OnceLock", reason = "global state is shared across parallel seed runs" },
+    { path = "std::sync::LazyLock", reason = "global state is shared across parallel seed runs" },
+    { path = "std::thread::LocalKey", reason = "thread_local! state leaks between runs on the same thread" },
+]
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "wall-clock time; use Input::Tick" },
+    { path = "std::time::SystemTime::now", reason = "wall-clock time; use Input::Tick" },
+    { path = "std::thread::spawn", reason = "raft-core is single-threaded" },
+    { path = "std::io::stdout", reason = "no I/O in raft-core; return an Output" },
+    { path = "std::io::stderr", reason = "no I/O in raft-core; return an Output" },
+    { path = "std::io::stdin", reason = "no I/O in raft-core; inputs arrive as Input" },
+]
+disallowed-macros = [
+    { path = "std::println", reason = "no I/O in raft-core; return an Output" },
+    { path = "std::eprintln", reason = "no I/O in raft-core; return an Output" },
+    { path = "std::print", reason = "no I/O in raft-core; return an Output" },
+    { path = "std::eprint", reason = "no I/O in raft-core; return an Output" },
+    { path = "std::dbg", reason = "no I/O in raft-core" },
+]

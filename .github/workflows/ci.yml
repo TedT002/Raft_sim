@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# En az yetki ilkesi: iş akışı yalnızca kodu okur; hiçbir şeye yazmaz.
+permissions:
+  contents: read
+
+# Aynı PR'a art arda push edilince eski koşu iptal edilir (yalnızca son hâl önemlidir). main'e
+# yapılan push'larda iptal YOK: her commit'in kendi CI sonucu kalsın, geçmişte "hangi commit
+# yeşildi" sorusu cevapsız kalmasın.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: Phase gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Eylem, değiştirilebilir bir sürüm etiketine (v7) değil tam bir commit SHA'sına sabitlenir:
+      # etiket sonradan başka bir commit'e taşınabilir (tedarik zinciri saldırısı), SHA taşınamaz.
+      # persist-credentials: false — checkout varsayılan olarak GITHUB_TOKEN'ı iş süresince
+      # .git/config'e yazar; bu durumda sonraki adımlarda çalışan her kod (build.rs, testler,
+      # ileride eklenecek bağımlılıklar) token'ı okuyabilir. Bu iş akışı hiçbir yere push
+      # etmediği için token'ı diskte tutmaya gerek yok.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml'daki kanal/bileşen/profil AÇIKÇA kurulur: argümansız
+      # `rustup toolchain install` dosyadaki pini okur. Örtük (implicit) kurulum rustup 1.29'da
+      # uyarı basar ve rustup 1.30'da proxy dışı yollarda kaldırılıyor.
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+      # Ucuz betik kontrolleri derlemeden ÖNCE çalışır (hızlı başarısızlık): saniyeler süren bir
+      # tarama, dakikalar süren bir derlemeden önce hata verirse geri bildirim döngüsü kısalır.
+      # Betikler de birer CI kapısı olduğu için önce kendileri lint'lenir (shellcheck runner
+      # imajında hazır gelir).
+      - name: Lint scripts (shellcheck)
+        run: shellcheck scripts/*.sh
+      - name: Forbidden patterns in raft-core
+        run: ./scripts/check_forbidden.sh
+      - name: Forbidden-pattern guard self-test
+        run: ./scripts/test_check_forbidden.sh
+      - name: Crate dependency direction
+        run: ./scripts/check_deps.sh
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked

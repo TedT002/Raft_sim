@@ -1,0 +1,5 @@
+# Bağımsız çalışan `rustfmt` (editör eklentileri, kaydederken biçimlendiren araçlar)
+# Cargo.toml'daki edition'ı OKUMAZ ve 2015 varsayar; `cargo fmt` ise 2024 ile biçimler. İkisi
+# farklı sonuç verirse `cargo fmt --check` kapısı kırılır. Edition'ı burada da sabitleyerek
+# ikisini eşitliyoruz.
+edition = "2024"

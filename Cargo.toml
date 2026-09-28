@@ -1,0 +1,35 @@
+# Sanal (virtual) workspace manifest'i: kökte paket yok, yalnızca üyeler var.
+[workspace]
+# resolver "2" bilinçli bir seçimdir. Edition 2024'ün varsayılanı MSRV'ye duyarlı "3"tür; ama
+# toolchain tam sürüme sabitlendiği ve Cargo.lock commit edildiği için bu fark sonucu etkilemez.
+# Sanal manifest'te resolver edition'dan çıkarılmadığı için açıkça yazıyoruz.
+resolver = "2"
+members = [
+    "crates/raft-core",
+    "crates/sim",
+    "crates/checker",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Yalnızca sabitlenmiş toolchain ile test ediyoruz; bu yüzden MSRV = pin (rust-toolchain.toml).
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TedT002/Raft_sim"
+publish = false
+
+# İç (path) bağımlılıklar tek yerde tanımlanır; üyeler `workspace = true` ile kullanır.
+# Bağımlılık yönü: sim -> raft-core, sim -> checker, cli -> sim, cli -> checker.
+# raft-core hiçbir workspace crate'ine bağımlı OLMAZ (bkz. scripts/check_deps.sh).
+[workspace.dependencies]
+raft-core = { path = "crates/raft-core" }
+sim = { path = "crates/sim" }
+checker = { path = "crates/checker" }
+
+# `#![forbid(unsafe_code)]` yalnızca yazıldığı crate kökünü kapsar; `tests/*.rs` entegrasyon
+# testleri AYRI crate'lerdir ve bu özniteliği miras almaz. Workspace lint'i her hedefi
+# (lib, bin, tests, benches, examples) kapsayan ikinci bir güvenlik ağıdır.
+[workspace.lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,9 @@
+# Toolchain TAM sürüme sabitlenir (kanal adı "stable" DEĞİL). Neden:
+# 1) clippy ve rustfmt çıktısı her makinede ve CI'da aynı olur; yeni bir stable sürümün
+#    eklediği lint'ler `-D warnings` ile CI'ı habersizce kırmaz.
+# 2) Determinizm: derleyici + Cargo.lock sabitken aynı seed aynı izi üretir.
+# Yükseltme = tek commit: bu dosya + Cargo.toml'daki rust-version + yeni lint düzeltmeleri.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

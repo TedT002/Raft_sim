@@ -1,0 +1,21 @@
+[package]
+name = "cli"
+description = "raftsim command-line interface (fuzz / replay; phase 5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Paket adı `cli` (=> `cargo run -p cli -- ...`), ikili adı `raftsim`.
+[[bin]]
+name = "raftsim"
+path = "src/main.rs"
+
+[dependencies]
+sim = { workspace = true }
+checker = { workspace = true }
+
+[lints]
+workspace = true
