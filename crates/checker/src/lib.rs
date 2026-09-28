@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Doctest'ler de uyarısız olmalı (clippy doctest'leri görmez).
+#![doc(test(attr(deny(warnings))))]
 
 // Faz 0: kasıtlı olarak hiçbir genel öğe yok (bu fazın kapsamı yalnızca iskelet). İlk
 // invariant/linearizability tipleri Faz 2/3/4'te eklenecek.

@@ -27,6 +27,12 @@ publish = false
 raft-core = { path = "crates/raft-core" }
 sim = { path = "crates/sim" }
 checker = { path = "crates/checker" }
+# Dış bağımlılıklar da sürümleri tek yerde olsun diye burada tanımlanır. Yalnızca onaylı liste
+# kullanılabilir (scripts/check_deps.sh denetler).
+# rand_chacha: ChaCha8 akışı platformlar ve sürümler arasında değer-kararlıdır; `std` özelliğine
+# ihtiyacımız olmadığı için varsayılan özellikler kapalı (daha küçük bağımlılık yüzeyi).
+rand_chacha = { version = "0.10", default-features = false }
+thiserror = "2"
 
 # `#![forbid(unsafe_code)]` yalnızca yazıldığı crate kökünü kapsar; `tests/*.rs` entegrasyon
 # testleri AYRI crate'lerdir ve bu özniteliği miras almaz. Workspace lint'i her hedefi

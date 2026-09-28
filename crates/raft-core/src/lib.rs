@@ -77,6 +77,9 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Doctest'ler de uyarısız olmalı: clippy doctest'leri görmez, bu öznitelik onları derleyici
+// uyarılarına karşı korur (örnekler README gibi okunur; uyarılı örnek kötü örnektir).
+#![doc(test(attr(deny(warnings))))]
 
 mod input;
 mod message;

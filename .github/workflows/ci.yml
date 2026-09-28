@@ -55,9 +55,13 @@ jobs:
         run: shellcheck scripts/*.sh
       - name: Forbidden patterns in raft-core
         run: ./scripts/check_forbidden.sh
+      # Simülatör de determinizm için kritik: aynı yasaklar (gerçek saat, entropi, Hash* koleksiyonlar,
+      # iş parçacıkları, G/Ç) onun için de geçerli.
+      - name: Forbidden patterns in sim
+        run: ./scripts/check_forbidden.sh crates/sim
       - name: Forbidden-pattern guard self-test
         run: ./scripts/test_check_forbidden.sh
-      - name: Crate dependency direction
+      - name: Crate dependencies (direction + allowlist)
         run: ./scripts/check_deps.sh
       - name: Format
         run: cargo fmt --all -- --check
@@ -65,3 +69,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      # Testler bir de tek iş parçacığıyla koşar: determinizm, test çalıştırıcısının paralelliğine
+      # bağlı olmamalı. İkisinde de geçmesi, testlerin paylaşılan bir duruma dayanmadığına dair ek
+      # bir kanıttır.
+      - name: Test (single-threaded)
+        run: cargo test --workspace --locked -- --test-threads=1
+      # Clippy doctest'leri ve rustdoc bağlantılarını denetlemez; bozuk bir [`Tip`] bağlantısı ya da
+      # uyarılı bir örnek burada yakalanır.
+      - name: Docs
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

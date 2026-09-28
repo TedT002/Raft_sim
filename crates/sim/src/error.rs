@@ -1,0 +1,51 @@
+//! Simülatörün yapılandırma ve bölünme hataları.
+
+use raft_core::NodeId;
+
+/// Geçersiz bir simülasyon ya da ağ yapılandırması.
+///
+/// Hatalı bir yapılandırma panikle değil bu tiple bildirilir: Faz 5'teki fuzz koşucusu binlerce
+/// rastgele senaryo üretecek; tek bir geçersiz değer bütün süreci çökertmemeli, reddedilmelidir.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ConfigError {
+    /// Bir olasılık sonlu değil ya da `[0, 1]` aralığının dışında.
+    #[error("{name} must be a probability in [0, 1], got {value}")]
+    InvalidProbability {
+        /// Alanın adı (ör. `drop_prob`).
+        name: &'static str,
+        /// Verilen değer.
+        value: f64,
+    },
+    /// `min_delay` sıfır. Bir mesaj gönderildiği anda varamaz: aksi hâlde aynı zaman damgasında
+    /// sonsuz bir mesaj zinciri oluşabilir ve `run_until` hiç ilerleyemezdi.
+    #[error("min_delay must be at least 1 tick")]
+    ZeroMinDelay,
+    /// `min_delay`, `max_delay`'den büyük.
+    #[error("min_delay ({min}) must not exceed max_delay ({max})")]
+    DelayRange {
+        /// En küçük gecikme (tick).
+        min: u64,
+        /// En büyük gecikme (tick).
+        max: u64,
+    },
+    /// `tick_every` sıfır: saat hiç ilerlemezdi.
+    #[error("tick_every must be at least 1")]
+    ZeroTickInterval,
+    /// Aynı düğüm kimliği birden fazla kez verildi.
+    #[error("node {0:?} was added more than once")]
+    DuplicateNode(NodeId),
+}
+
+/// Geçersiz bir bölünme tanımı. Hata durumunda ne ağ ne trace değişir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PartitionError {
+    /// Bir düğüm tanımda birden fazla kez geçiyor (aynı grupta ya da farklı gruplarda): hangi gruba
+    /// ait olduğu belirsiz olurdu, sessizce "son yazılan kazanır" demek ise bir yazım hatasını
+    /// gizlerdi.
+    #[error("node {0:?} is listed more than once in the partition")]
+    DuplicateNode(NodeId),
+    /// Tanımdaki bir düğüm simülasyonda yok: büyük olasılıkla bir yazım hatası. Kabul edilseydi
+    /// bölünme, farkına varılmadan amaçlanandan farklı bir ağ kurardı.
+    #[error("node {0:?} is not part of the simulation")]
+    UnknownNode(NodeId),
+}

@@ -8,17 +8,17 @@ pinned toolchain and `Cargo.lock`).
 
 ## Status
 
-Work in progress — Phase 0 skeleton: the workspace builds and CI gates run; there is no Raft logic and
-no simulator yet. The `raft-core` crate exposes only its type skeleton, and `RaftNode::step` is an
+Work in progress — Phase 1: the deterministic simulator runs; there is no Raft logic yet. The simulator
+currently drives a toy ping/pong protocol that lives only in its tests, and `RaftNode::step` is still an
 intentional no-op.
 
 ## Why
 
 Consensus bugs hide in timing and fault interleavings that are hard to reproduce with real clocks,
-threads and sockets. `raftsim` is designed to simulate the network, clock, disk and randomness instead,
-so that a single `u64` seed will deterministically replay an entire run, including injected message
-loss, delay, reordering, partitions and crashes. The approach follows the deterministic simulation
-testing style popularized by FoundationDB and TigerBeetle.
+threads and sockets. `raftsim` simulates the network, the clock and randomness instead (a simulated disk
+and crashes come next), so that a single `u64` seed deterministically replays an entire run, including
+injected message loss, delay, reordering, duplication and partitions. The approach follows the
+deterministic simulation testing style popularized by FoundationDB and TigerBeetle.
 
 ## Architecture
 
@@ -34,12 +34,21 @@ must be durable (written and fsynced) before any later output of the same step i
 how the core honors Raft's rule that `currentTerm`, `votedFor` and `log[]` are updated on stable
 storage before responding to RPCs (Figure 2 of the paper).
 
+The simulator is protocol-agnostic: it drives any node with the same sans-IO shape
+(`SimNode::step(NodeInput) -> Vec<NodeOutput>`), and Raft will be plugged in through an adapter. Events
+are ordered by `(time, seq)`, so simultaneous events run in insertion order; every component draws
+from its own ChaCha8 stream derived from one master seed; and every processed event is folded into an
+FNV-1a trace hash, so two runs with the same seed produce byte-identical traces. Partitions follow a
+"cut cable" model: a message is delivered only if its endpoints stayed connected for its whole
+flight, so messages sent during a partition never arrive, and messages in flight across a cut are
+lost even if the partition heals before they are due.
+
 Crates and their dependency direction (`raft-core` depends on no workspace crate):
 
 | Crate | Responsibility |
 |---|---|
 | `raft-core` | Pure, sans-IO Raft state machine (Figure 2); currently a type skeleton |
-| `sim` | Planned: deterministic simulation (virtual clock, event queue, simulated network/disk, faults) |
+| `sim` | Deterministic simulator: virtual clock, event queue, seeded network, trace hash; disk and crashes planned |
 | `checker` | Planned: Raft safety invariants and linearizability checker, independent of `raft-core`'s types |
 | `cli` | `raftsim` binary: planned `fuzz` and `replay --seed N` subcommands |
 
@@ -53,7 +62,7 @@ sim -> checker
 ## Roadmap
 
 - [x] Phase 0 — Skeleton: workspace, crate boundaries, `raft-core` API skeleton, CI gates
-- [ ] Phase 1 — Simulator: virtual clock, event queue, simulated network (loss, duplication, delay,
+- [x] Phase 1 — Simulator: virtual clock, event queue, simulated network (loss, duplication, delay,
       partitions), trace hashing
 - [ ] Phase 2 — Leader election: roles, terms, randomized timeouts, persisting term/vote, crash/restart
 - [ ] Phase 3 — Log replication: `AppendEntries`, commit rule, state machine application, simulated
@@ -74,7 +83,10 @@ done:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test --workspace -- --test-threads=1
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ./scripts/check_forbidden.sh
+./scripts/check_forbidden.sh crates/sim
 ./scripts/test_check_forbidden.sh
 ./scripts/check_deps.sh
 ```

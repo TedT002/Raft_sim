@@ -1,0 +1,35 @@
+# sim için anlamsal (semantic) yasak listesi: simülatör de determinizm için kritiktir. Metin taraması
+# (`scripts/check_forbidden.sh crates/sim`) süslü parantezli import'ları (`use std::{thread}`) ve
+# takma adları kaçırabilir; clippy yolları derleyici düzeyinde çözer. Clippy bu dosyayı
+# CARGO_MANIFEST_DIR'den başlayarak arar; bu yüzden yalnızca sim'e uygulanır ve raft-core'unkinden
+# bağımsız, kendi başına eksiksiz olmalıdır (dosyalar birleşmez).
+#
+# Not: Faz 5'teki paralel fuzz koşucusu iş parçacığı açacak; o kod bu yüzden sim'de değil cli'de
+# yaşamalı. Simülasyonun kendisi tek iş parçacıklı ve senkron kalır.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is random; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is random; use BTreeSet" },
+    { path = "std::time::Instant", reason = "wall-clock time; the simulator owns logical time" },
+    { path = "std::time::SystemTime", reason = "wall-clock time; the simulator owns logical time" },
+    { path = "std::sync::Mutex", reason = "a simulation run is single-threaded and synchronous" },
+    { path = "std::hash::RandomState", reason = "randomly keyed hasher; results differ per run" },
+    { path = "std::hash::DefaultHasher", reason = "algorithm is unspecified and may change between Rust versions; use Fnv1a64" },
+    { path = "std::sync::OnceLock", reason = "global state is shared across parallel seed runs" },
+    { path = "std::sync::LazyLock", reason = "global state is shared across parallel seed runs" },
+    { path = "std::thread::LocalKey", reason = "thread_local! state leaks between runs on the same thread" },
+]
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "wall-clock time; the simulator owns logical time" },
+    { path = "std::time::SystemTime::now", reason = "wall-clock time; the simulator owns logical time" },
+    { path = "std::thread::spawn", reason = "a simulation run is single-threaded; parallelism belongs in cli" },
+    { path = "std::io::stdout", reason = "no I/O in the simulator; return data instead" },
+    { path = "std::io::stderr", reason = "no I/O in the simulator; return data instead" },
+    { path = "std::io::stdin", reason = "no I/O in the simulator" },
+]
+disallowed-macros = [
+    { path = "std::println", reason = "no I/O in the simulator; return data instead" },
+    { path = "std::eprintln", reason = "no I/O in the simulator; return data instead" },
+    { path = "std::print", reason = "no I/O in the simulator; return data instead" },
+    { path = "std::eprint", reason = "no I/O in the simulator; return data instead" },
+    { path = "std::dbg", reason = "no I/O in the simulator" },
+]

@@ -1,6 +1,6 @@
 [package]
 name = "sim"
-description = "Deterministic simulation harness for raftsim (virtual time, network, disk, faults)."
+description = "Deterministic simulation harness for raftsim (virtual time, event queue, seeded network, trace hash)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,8 @@ repository.workspace = true
 [dependencies]
 raft-core = { workspace = true }
 checker = { workspace = true }
+rand_chacha = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
