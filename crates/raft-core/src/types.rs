@@ -1,4 +1,4 @@
-//! Temel, protokolden bağımsız değer tipleri: düğüm kimliği ve opak komut baytları.
+//! Temel değer tipleri: düğüm kimliği, term, log index'i ve opak komut baytları.
 
 /// Bir Raft düğümünü küme içinde benzersiz biçimde tanımlayan kimlik.
 ///
@@ -9,6 +9,22 @@
 /// garanti eder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u64);
+
+/// Raft term'i (§5.1): seçim dönemlerini numaralandıran, yalnızca ileri giden mantıksal saat.
+///
+/// Her term bir seçimle başlar ve en fazla bir lideri olur (Election Safety). Term'ler, düğümlerin
+/// eskimiş bilgiyi tanımasını sağlar: daha küçük term'li bir istek reddedilir; daha büyük bir term
+/// gören düğüm onu hemen benimser ve Follower'a döner (Figure 2, "All Servers").
+///
+/// `Default` değeri `Term(0)`'dır: Figure 2'deki ilk açılış değeri ("initialized to 0 on first
+/// boot"). `Ord`: term'ler yalnızca büyüklükleriyle karşılaştırılır.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Term(pub u64);
+
+/// Log index'i (§5.3). Girdiler 1'den numaralanır; `LogIndex(0)` "hiç girdi yok" demektir: boş bir
+/// log'un `lastLogIndex`'i 0'dır (Figure 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LogIndex(pub u64);
 
 /// İstemcinin durum makinesine uygulanmasını istediği komutun opak bayt gösterimi.
 ///

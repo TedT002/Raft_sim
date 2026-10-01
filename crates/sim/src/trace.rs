@@ -11,21 +11,26 @@ use raft_core::NodeId;
 
 use crate::fnv::{Fnv1a64, fnv1a64};
 
-/// Bir mesajın trace'e girecek kanonik bayt kodlaması.
+/// Bir değerin trace'e girecek kanonik bayt kodlaması: düğümler arası mesajlar (`SimNode::Msg`) ve
+/// diske yazılan kalıcı durum (`SimNode::Durable`) için.
 ///
-/// Aynı mesaj her zaman aynı baytları üretmelidir; farklı mesajlar mümkünse farklı baytlar. Kodlama
-/// bir kez yayımlandıktan sonra değiştirilirse, o mesaj tipini kullanan koşuların özetleri de
-/// değişir.
+/// Aynı değer her zaman aynı baytları üretmelidir; farklı değerler mümkünse farklı baytlar. Kodlama
+/// bir kez yayımlandıktan sonra değiştirilirse, o tipi kullanan koşuların özetleri de değişir.
 pub trait TraceEncode {
-    /// Mesajın kanonik baytlarını `out`'un sonuna ekler.
+    /// Değerin kanonik baytlarını `out`'un sonuna ekler.
     fn encode(&self, out: &mut Vec<u8>);
 }
 
-/// Bir mesajın trace özeti: kanonik baytlarının FNV-1a 64 değeri.
+/// Kalıcı durumu olmayan düğümler (`type Durable = ()`) için: boş kodlama.
+impl TraceEncode for () {
+    fn encode(&self, _out: &mut Vec<u8>) {}
+}
+
+/// Bir mesajın ya da kalıcı durumun trace özeti: kanonik baytlarının FNV-1a 64 değeri.
 #[must_use]
-pub fn digest<M: TraceEncode + ?Sized>(msg: &M) -> u64 {
+pub fn digest<M: TraceEncode + ?Sized>(value: &M) -> u64 {
     let mut bytes = Vec::new();
-    msg.encode(&mut bytes);
+    value.encode(&mut bytes);
     fnv1a64(&bytes)
 }
 
@@ -43,6 +48,9 @@ pub enum DropReason {
     UnknownDestination,
     /// Teslim zamanı `u64` zaman ekseninin sonunu aşıyor; mesaj sessizce yok edilmez, açıkça düşer.
     TimeOverflow,
+    /// Hedef düğüm teslim anında çökmüş durumdaydı. Düğüm sonradan yeniden başlasa bile bu mesajı
+    /// almaz: kapalı bir makine kendisine gelen paketi saklamaz.
+    NodeDown,
 }
 
 impl DropReason {
@@ -54,6 +62,7 @@ impl DropReason {
             DropReason::PartitionInFlight => 3,
             DropReason::UnknownDestination => 4,
             DropReason::TimeOverflow => 5,
+            DropReason::NodeDown => 6,
         }
     }
 }
@@ -117,6 +126,25 @@ pub enum TraceKind {
     },
     /// Bölünme sona erdi.
     Heal,
+    /// Bir düğüm kalıcı durumunu diske yazdı. Özet (`digest`) yazılan durumun kanonik
+    /// kodlamasınındır: iki koşu, düğümlerin iç durumu ayrıştığı anda (ilk farklı mesajı
+    /// beklemeden) farklı trace özeti verir.
+    Persist {
+        /// Diske yazan düğüm.
+        node: NodeId,
+        /// Yazılan durumun özeti.
+        digest: u64,
+    },
+    /// Bir düğüm çöktü: tick almaz, mesajları teslim anında düşer.
+    Crash {
+        /// Çöken düğüm.
+        node: NodeId,
+    },
+    /// Çökmüş bir düğüm diskindeki durumla yeniden başlatıldı.
+    Restart {
+        /// Yeniden başlatılan düğüm.
+        node: NodeId,
+    },
 }
 
 /// Belirli bir zamanda gerçekleşen bir trace olayı.
@@ -192,6 +220,19 @@ impl TraceEvent {
                 }
             }
             TraceKind::Heal => hasher.write_u8(6),
+            TraceKind::Persist { node, digest } => {
+                hasher.write_u8(7);
+                hasher.write_u64(node.0);
+                hasher.write_u64(*digest);
+            }
+            TraceKind::Crash { node } => {
+                hasher.write_u8(8);
+                hasher.write_u64(node.0);
+            }
+            TraceKind::Restart { node } => {
+                hasher.write_u8(9);
+                hasher.write_u64(node.0);
+            }
         }
     }
 }
@@ -276,6 +317,31 @@ mod tests {
         assert_eq!(a.hash(), b.hash());
         assert_ne!(a.hash(), swapped.hash());
         assert_eq!(a.len(), 2);
+    }
+
+    // Yaşam döngüsü olayları birbirinden ayrışır: aynı düğüm için Tick, Crash, Restart ve Persist
+    // farklı etiketlerle kodlanır, Persist'in özeti de hash'e girer.
+    #[test]
+    fn lifecycle_events_have_distinct_encodings() {
+        let node = NodeId(3);
+        let kinds = [
+            TraceKind::Tick { node },
+            TraceKind::Crash { node },
+            TraceKind::Restart { node },
+            TraceKind::Persist { node, digest: 1 },
+            TraceKind::Persist { node, digest: 2 },
+        ];
+        let mut hashes: Vec<u64> = kinds
+            .into_iter()
+            .map(|kind| {
+                let mut trace = Trace::new();
+                trace.record(TraceEvent { time: 1, kind });
+                trace.hash()
+            })
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 5);
     }
 
     // Uzunluk önekleri sayesinde grup sınırları özete girer: [[1],[2,3]] ≠ [[1,2],[3]].

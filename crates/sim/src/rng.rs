@@ -88,11 +88,21 @@ impl SeedTree {
         splitmix64_mix(hasher.finish())
     }
 
+    /// Bileşenin 32 baytlık ChaCha anahtarı: alt-seed'in genişletilmiş hâli (yöntemin 3. adımı).
+    ///
+    /// API'sinde rand türlerini taşımayan tüketiciler (ör. bir `[u8; 32]` seed alan
+    /// `raft_core::RaftNode`) RNG'yi bu anahtarla kendileri kurar. Böylece türetme yine tek yerde,
+    /// burada kalır ve `rng_for(c)` ile aynı akışı verir.
+    #[must_use]
+    pub fn seed_bytes_for(&self, component: Component) -> [u8; 32] {
+        expand_seed(self.seed_for(component))
+    }
+
     /// Bileşenin kendi RNG'si: alt-seed'den genişletilmiş anahtarla kurulan bir `ChaCha8Rng`.
     /// ChaCha8 akışı platformlar ve sürümler arasında değer-kararlıdır.
     #[must_use]
     pub fn rng_for(&self, component: Component) -> ChaCha8Rng {
-        ChaCha8Rng::from_seed(expand_seed(self.seed_for(component)))
+        ChaCha8Rng::from_seed(self.seed_bytes_for(component))
     }
 }
 
@@ -224,6 +234,22 @@ mod tests {
             tree.rng_for(Component::Network).next_u64(),
             0x18ab_bf2f_102d_0b34
         );
+    }
+
+    // `seed_bytes_for` ile kendi kurulan RNG, `rng_for`'un verdiği akışın aynısıdır: anahtarı
+    // dışarıdan alan tüketiciler (raft-core) aynı türetmeyi kullanır.
+    #[test]
+    fn seed_bytes_build_the_same_stream_as_rng_for() {
+        use rand_chacha::rand_core::SeedableRng;
+
+        let tree = SeedTree::new(42);
+        for component in [Component::Network, Component::Node(NodeId(3))] {
+            let mut own = ChaCha8Rng::from_seed(tree.seed_bytes_for(component));
+            let mut derived = tree.rng_for(component);
+            for _ in 0..4 {
+                assert_eq!(own.next_u64(), derived.next_u64());
+            }
+        }
     }
 
     // Aralık uçları dahildir, lo == hi sabit döner, tüm u64 aralığı da çalışır.

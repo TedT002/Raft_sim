@@ -8,9 +8,14 @@ publish.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Faz 0: bilerek bağımlılık yok. Çekirdek hiçbir workspace crate'ine bağlanamaz;
-# rand/rand_chacha Faz 2'de (seed'li seçim zaman aşımı için) eklenecek.
+# Çekirdek hiçbir workspace crate'ine bağlanamaz (sim/checker/cli'yi bilmez); yalnızca onaylı dış
+# crate'ler:
+# - rand_chacha: seçim zaman aşımı, kurucuya verilen seed'den kurulan ChaCha8 akışından çekilir.
+#   ChaCha8'in çıktısı platformlar ve sürümler arasında değer-kararlıdır.
+# - thiserror: `ConfigError` (kütüphane crate'lerinde özel hata tipleri).
 [dependencies]
+rand_chacha = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

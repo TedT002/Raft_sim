@@ -4,12 +4,15 @@
 //! bir sürücü ancak Faz 6'da gerekir. Zaman yalnızca kuyruktaki bir sonraki olayın zamanına
 //! atlayarak ilerler (discrete-event simulation): arada "boşta geçen" gerçek süre yoktur, bu yüzden
 //! saatlerce süren bir senaryo milisaniyeler içinde ve her seferinde aynı sırayla koşar.
+//!
+//! Her düğüm simüle bir makinede yaşar: süreç (düğümün kendisi), diski ve yaşam durumu. Makine
+//! çökebilir ve diskindeki durumla yeniden başlatılabilir (`crash`/`restart`).
 
 use std::collections::BTreeMap;
 
 use raft_core::NodeId;
 
-use crate::error::{ConfigError, PartitionError};
+use crate::error::{ConfigError, LifecycleError, PartitionError};
 use crate::network::{Fate, Network};
 use crate::node::{NodeInput, NodeOutput, SimNode};
 use crate::queue::EventQueue;
@@ -31,8 +34,9 @@ impl Default for SimConfig {
 /// Kuyruktaki olaylar.
 #[derive(Debug, Clone)]
 enum Event<M> {
-    /// Bir düğümün periyodik tick'i.
-    Tick { node: NodeId },
+    /// Bir düğümün periyodik tick'i. `incarnation`, tick zincirinin düğümün hangi açılışına ait
+    /// olduğunu söyler (bkz. `Host::incarnation`).
+    Tick { node: NodeId, incarnation: u64 },
     /// Yoldaki bir mesajın (ya da kopyasının) teslim anı.
     Deliver(Delivery<M>),
 }
@@ -50,19 +54,46 @@ struct Delivery<M> {
     sent_epoch: u64,
 }
 
+/// Simüle bir makine: düğüm süreci, diski ve yaşam durumu.
+struct Host<N: SimNode> {
+    node: N,
+    /// Diskteki kalıcı durum. Faz 2'de her `Persist` anında ve bütünüyle kalıcıdır.
+    disk: N::Durable,
+    up: bool,
+    /// Kaçıncı açılış (0 = ilk). Her yeniden başlatmada artar ve yeni tick zinciri bu numarayla
+    /// kurulur. Kuyrukta önceki bir açılıştan kalmış tick bulunursa numarası tutmadığı için yok
+    /// sayılır. Aksi hâlde çöküp hemen kalkan bir düğümde eski ve yeni zincir üst üste biner ("çift
+    /// tick") ve düğümün saati iki kat hızlı akardı.
+    incarnation: u64,
+}
+
+/// Bir düğümün simülatördeki anlık görünümü: süreci, diski ve ayakta olup olmadığı.
+#[derive(Debug)]
+pub struct HostView<'a, N: SimNode> {
+    /// Düğümün kimliği.
+    pub id: NodeId,
+    /// Düğüm süreci. Çökmüş bir düğümün bellek durumu anlamsızdır (yeniden başlatmada diskten
+    /// yeniden kurulur); invariant denetimleri yalnızca ayaktaki düğümlere bakmalıdır.
+    pub node: &'a N,
+    /// Diskteki kalıcı durum.
+    pub disk: &'a N::Durable,
+    /// Düğüm ayakta mı?
+    pub up: bool,
+}
+
 /// Deterministik simülasyon: aynı düğümler, aynı ağ (aynı seed'li RNG) ve aynı çağrılar her
 /// seferinde birebir aynı trace'i üretir.
 ///
-/// Düğüm olduğu sürece kuyruk asla boşalmaz: her tick bir sonrakini kurar. Simülasyonu her zaman
-/// sonlu bir ufukla (`run_until(t)`) sürün; "hepsini boşalt" niyetiyle `while sim.step() {}` ya da
-/// `run_until(u64::MAX)` pratikte bitmez.
+/// Ayakta düğüm olduğu sürece kuyruk asla boşalmaz: her tick bir sonrakini kurar. Simülasyonu her
+/// zaman sonlu bir ufukla (`run_until(t)`) sürün; "hepsini boşalt" niyetiyle `while sim.step() {}`
+/// ya da `run_until(u64::MAX)` pratikte bitmez.
 pub struct Simulation<N: SimNode, Net: Network> {
     config: SimConfig,
     now: u64,
     queue: EventQueue<Event<N::Msg>>,
-    // BTreeMap: düğümler üzerinde gezinme sırası (ilk tick'lerin sıralanması) her koşuda aynı
-    // olsun.
-    nodes: BTreeMap<NodeId, N>,
+    // BTreeMap: düğümler üzerinde gezinme sırası (ilk tick'lerin sıralanması, invariant
+    // denetimleri) her koşuda aynı olsun.
+    hosts: BTreeMap<NodeId, Host<N>>,
     network: Net,
     trace: Trace,
     next_msg_id: u64,
@@ -70,6 +101,7 @@ pub struct Simulation<N: SimNode, Net: Network> {
 
 impl<N: SimNode, Net: Network> Simulation<N, Net> {
     /// Simülasyonu kurar ve her düğümün ilk tick'ini `tick_every` anına, `NodeId` sırasıyla koyar.
+    /// Her düğüm boş bir diskle (`N::Durable::default()`) ve ayakta başlar.
     ///
     /// # Errors
     ///
@@ -82,21 +114,33 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         if config.tick_every == 0 {
             return Err(ConfigError::ZeroTickInterval);
         }
-        let mut by_id = BTreeMap::new();
+        let mut hosts = BTreeMap::new();
         for (id, node) in nodes {
-            if by_id.insert(id, node).is_some() {
+            let host = Host {
+                node,
+                disk: N::Durable::default(),
+                up: true,
+                incarnation: 0,
+            };
+            if hosts.insert(id, host).is_some() {
                 return Err(ConfigError::DuplicateNode(id));
             }
         }
         let mut queue = EventQueue::new();
-        for &id in by_id.keys() {
-            queue.push(config.tick_every, Event::Tick { node: id });
+        for &id in hosts.keys() {
+            queue.push(
+                config.tick_every,
+                Event::Tick {
+                    node: id,
+                    incarnation: 0,
+                },
+            );
         }
         Ok(Self {
             config,
             now: 0,
             queue,
-            nodes: by_id,
+            hosts,
             network,
             trace: Trace::new(),
             next_msg_id: 0,
@@ -121,10 +165,43 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         self.trace.hash()
     }
 
-    /// Bir düğüme (salt okunur) erişim: testlerin düğüm iç durumunu incelemesi için.
+    /// Bir düğüme (salt okunur) erişim: testlerin düğüm iç durumunu incelemesi için. Çökmüş bir
+    /// düğüm de döner; onun bellek durumu yeniden başlatmaya kadar donmuştur ve anlamsızdır.
     #[must_use]
     pub fn node(&self, id: NodeId) -> Option<&N> {
-        self.nodes.get(&id)
+        self.hosts.get(&id).map(|host| &host.node)
+    }
+
+    /// Bir düğümün diskindeki kalıcı durum.
+    #[must_use]
+    pub fn disk(&self, id: NodeId) -> Option<&N::Durable> {
+        self.hosts.get(&id).map(|host| &host.disk)
+    }
+
+    /// Bir düğümün diskine yazma erişimi. YALNIZCA crate içi testler içindir: bir denetimin (ör.
+    /// `RaftCluster`'ın dayanıklılık denetimi) disk ile bellek ayrıştığında gerçekten ihlal
+    /// bildirdiğini göstermek için diski elle bozar. Genel API'de yoktur; simülasyonda disk
+    /// yalnızca `Persist` çıktılarıyla değişir.
+    #[cfg(test)]
+    pub(crate) fn disk_mut(&mut self, id: NodeId) -> Option<&mut N::Durable> {
+        self.hosts.get_mut(&id).map(|host| &mut host.disk)
+    }
+
+    /// Düğüm ayakta mı? Simülasyonda olmayan bir düğüm için `false`.
+    #[must_use]
+    pub fn is_up(&self, id: NodeId) -> bool {
+        self.hosts.get(&id).is_some_and(|host| host.up)
+    }
+
+    /// Bütün düğümler (çökmüşler dahil), `NodeId` sırasıyla: her adımdan sonra invariant
+    /// denetleyen sürücüler için.
+    pub fn hosts(&self) -> impl Iterator<Item = HostView<'_, N>> {
+        self.hosts.iter().map(|(&id, host)| HostView {
+            id,
+            node: &host.node,
+            disk: &host.disk,
+            up: host.up,
+        })
     }
 
     /// Ağ modeline (salt okunur) erişim.
@@ -133,8 +210,8 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         &self.network
     }
 
-    /// Kuyruktaki en erken olayı işler. Kuyruk boşsa `false` döner; düğüm olduğu sürece kuyruk
-    /// boşalmadığından bunu bir "bitti" sinyali olarak kullanmayın (bkz. tip dokümanı).
+    /// Kuyruktaki en erken olayı işler. Kuyruk boşsa `false` döner; ayakta düğüm olduğu sürece
+    /// kuyruk boşalmadığından bunu bir "bitti" sinyali olarak kullanmayın (bkz. tip dokümanı).
     pub fn step(&mut self) -> bool {
         let Some(scheduled) = self.queue.pop() else {
             return false;
@@ -143,23 +220,34 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         // ≥ 1, ağ gecikmesi `NonZeroU64`); bu yüzden zaman asla geri gitmez.
         self.now = scheduled.time;
         match scheduled.event {
-            Event::Tick { node } => self.handle_tick(node),
+            Event::Tick { node, incarnation } => self.handle_tick(node, incarnation),
             Event::Deliver(delivery) => self.handle_delivery(delivery),
         }
         true
     }
 
+    /// `time` anına kadar (o dahil) bekleyen bir olay varsa onu işler ve `true` döner. Yoksa saati
+    /// `time`'a getirir (saat zaten ilerideyse olduğu yerde kalır; zaman geri gitmez) ve `false`
+    /// döner. `run_until` bunun döngüsüdür; olaylar arasında invariant denetlemek isteyen
+    /// sürücüler (ör. `RaftCluster`) doğrudan bunu kullanır.
+    pub fn step_until(&mut self, time: u64) -> bool {
+        if self.queue.peek_time().is_some_and(|next| next <= time) {
+            self.step()
+        } else {
+            self.now = self.now.max(time);
+            false
+        }
+    }
+
     /// Zamanı `time` anına kadar ilerletir: zamanı `time` veya daha erken olan bütün olayları
-    /// işler, sonra saati `time`'a getirir (sonraki olay daha geç olsa bile).
+    /// işler, sonra saati `time`'a getirir (sonraki olay daha geç olsa bile; saat zaten ilerideyse
+    /// olduğu yerde kalır).
     ///
     /// Aynı zaman damgasında sonsuz döngü olamaz: her olay yalnızca kendisinden SONRAKİ bir zamana
     /// yeni olay koyar. Zaman ekseninin sonunda (`u64::MAX`) tick'ler durur ve sonu aşan teslimler
     /// düşer.
     pub fn run_until(&mut self, time: u64) {
-        while self.queue.peek_time().is_some_and(|next| next <= time) {
-            self.step();
-        }
-        self.now = self.now.max(time);
+        while self.step_until(time) {}
     }
 
     /// Ağı gruplara böler ve bunu trace'e kaydeder. Anlamı için bkz. [`Network::partition`].
@@ -172,7 +260,7 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         if let Some(&unknown) = groups
             .iter()
             .flat_map(|group| group.iter())
-            .find(|id| !self.nodes.contains_key(id))
+            .find(|id| !self.hosts.contains_key(id))
         {
             return Err(PartitionError::UnknownNode(unknown));
         }
@@ -204,10 +292,89 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         });
     }
 
-    fn handle_tick(&mut self, node: NodeId) {
+    /// Bir düğümü çökertir. Düğüm artık tick almaz ve ona gelen mesajlar teslim anında düşer
+    /// ([`DropReason::NodeDown`]). Diski korunur: `restart` düğümü diskteki durumla geri getirir.
+    ///
+    /// Düğümün çökmeden önce gönderdiği ve hâlâ yolda olan mesajlar ağdadır, yine teslim edilir:
+    /// kablodaki paket, gönderen makine kapansa da yoluna devam eder. Düğüm nesnesi bellekte kalır
+    /// ama hiçbir girdi almaz; yeniden başlatmada `Restart` sözleşmesi gereği bütün bellek
+    /// durumunu diskten yeniden kurmalıdır.
+    ///
+    /// # Errors
+    ///
+    /// Düğüm simülasyonda yoksa ya da zaten çökmüşse [`LifecycleError`]; o durumda simülasyon
+    /// değişmez.
+    pub fn crash(&mut self, id: NodeId) -> Result<(), LifecycleError> {
+        let host = self
+            .hosts
+            .get_mut(&id)
+            .ok_or(LifecycleError::UnknownNode(id))?;
+        if !host.up {
+            return Err(LifecycleError::AlreadyDown(id));
+        }
+        host.up = false;
         self.trace.record(TraceEvent {
             time: self.now,
-            kind: TraceKind::Tick { node },
+            kind: TraceKind::Crash { node: id },
+        });
+        Ok(())
+    }
+
+    /// Çökmüş bir düğümü diskindeki durumla yeniden başlatır. Düğüm hemen
+    /// `NodeInput::Restart(disk)` ile adımlanır ve çıktıları her olayınki gibi sırayla uygulanır.
+    /// Yeni tick zinciri bir aralık sonra başlar (ilk açılıştaki gibi).
+    ///
+    /// # Errors
+    ///
+    /// Düğüm simülasyonda yoksa ya da zaten ayaktaysa [`LifecycleError`]; o durumda simülasyon
+    /// değişmez.
+    pub fn restart(&mut self, id: NodeId) -> Result<(), LifecycleError> {
+        let host = self
+            .hosts
+            .get_mut(&id)
+            .ok_or(LifecycleError::UnknownNode(id))?;
+        if host.up {
+            return Err(LifecycleError::AlreadyUp(id));
+        }
+        host.up = true;
+        // Yeni açılış, yeni tick zinciri: kuyrukta önceki açılıştan kalmış bir tick artık yok
+        // sayılır (bkz. `Host::incarnation`). 2^64 açılış imkânsızdır; yine de taşma paniği yerine
+        // doygun toplama.
+        host.incarnation = host.incarnation.saturating_add(1);
+        let incarnation = host.incarnation;
+        let disk = host.disk.clone();
+        self.trace.record(TraceEvent {
+            time: self.now,
+            kind: TraceKind::Restart { node: id },
+        });
+        if let Some(first_tick) = self.now.checked_add(self.config.tick_every) {
+            self.queue.push(
+                first_tick,
+                Event::Tick {
+                    node: id,
+                    incarnation,
+                },
+            );
+        }
+        let outputs = host.node.step(NodeInput::Restart(disk));
+        self.apply_outputs(id, outputs);
+        Ok(())
+    }
+
+    fn handle_tick(&mut self, id: NodeId, incarnation: u64) {
+        let Some(host) = self.hosts.get_mut(&id) else {
+            return;
+        };
+        // Çökmüş düğüm tick almaz; önceki bir açılışa ait tick de (numarası tutmaz) yok sayılır.
+        // İkisinde de zincir burada biter ve yeniden kurulmaz: yeniden başlatma kendi zincirini
+        // kurar (bkz. `restart`). Yok sayılan tick trace'e de girmez, çünkü hiçbir düğüm onu
+        // gözlemlemedi.
+        if !host.up || host.incarnation != incarnation {
+            return;
+        }
+        self.trace.record(TraceEvent {
+            time: self.now,
+            kind: TraceKind::Tick { node: id },
         });
         // Sonraki tick, bu tick'in çıktıları yönlendirilmeden ÖNCE kuyruğa konur: tick'ler sabit
         // bir ritimle ilerleyen "saat"tir. Böylece aynı anda düşen bir tick ile bir mesaj teslimi
@@ -217,12 +384,16 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         // `checked_add`: doygun toplama, zaman ekseninin sonunda yeni tick'i AYNI âna koyar ve
         // sonsuz döngü yaratırdı; taşma durumunda tick zinciri biter.
         if let Some(next) = self.now.checked_add(self.config.tick_every) {
-            self.queue.push(next, Event::Tick { node });
+            self.queue.push(
+                next,
+                Event::Tick {
+                    node: id,
+                    incarnation,
+                },
+            );
         }
-        if let Some(state) = self.nodes.get_mut(&node) {
-            let outputs = state.step(NodeInput::Tick);
-            self.route_outputs(node, outputs);
-        }
+        let outputs = host.node.step(NodeInput::Tick);
+        self.apply_outputs(id, outputs);
     }
 
     fn handle_delivery(&mut self, delivery: Delivery<N::Msg>) {
@@ -235,14 +406,17 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
             sent_at,
             sent_epoch,
         } = delivery;
-        let drop_reason = if !self.nodes.contains_key(&to) {
-            Some(DropReason::UnknownDestination)
-        } else if !self.network.connected_since(from, to, sent_epoch) {
+        let drop_reason = match self.hosts.get(&to) {
+            None => Some(DropReason::UnknownDestination),
             // "Kablo kesildi": uçuş boyunca uçlar bir an bile ayrıldıysa mesaj kaybolur; bölünme
-            // şimdi iyileşmiş olsa bile.
-            Some(DropReason::PartitionInFlight)
-        } else {
-            None
+            // şimdi iyileşmiş olsa bile. Ağ kararı makineden önce gelir: kesik kablodaki paket
+            // makineye hiç ulaşmaz.
+            Some(_) if !self.network.connected_since(from, to, sent_epoch) => {
+                Some(DropReason::PartitionInFlight)
+            }
+            // Kablo sağlam ama karşıdaki makine kapalı: paket kaybolur.
+            Some(host) if !host.up => Some(DropReason::NodeDown),
+            Some(_) => None,
         };
         if let Some(reason) = drop_reason {
             self.trace.record(TraceEvent {
@@ -268,18 +442,33 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
                 sent_at,
             },
         });
-        if let Some(state) = self.nodes.get_mut(&to) {
-            let outputs = state.step(NodeInput::Message { from, msg });
-            self.route_outputs(to, outputs);
+        if let Some(host) = self.hosts.get_mut(&to) {
+            let outputs = host.node.step(NodeInput::Message { from, msg });
+            self.apply_outputs(to, outputs);
         }
     }
 
-    /// Bir düğümün çıktılarını VERİLDİKLERİ SIRAYLA uygular (sans-IO sözleşmesi).
-    fn route_outputs(&mut self, from: NodeId, outputs: Vec<NodeOutput<N::Msg>>) {
+    /// Bir düğümün çıktılarını VERİLDİKLERİ SIRAYLA uygular (sans-IO sözleşmesi). Sıra anlamlıdır:
+    /// bir `Persist`, kendisinden sonraki `Send`'ler ağa çıkmadan önce diske yazılır.
+    fn apply_outputs(&mut self, from: NodeId, outputs: Vec<NodeOutput<N::Msg, N::Durable>>) {
         for output in outputs {
             match output {
                 NodeOutput::Send { to, msg } => self.send(from, to, msg),
+                NodeOutput::Persist(state) => self.persist(from, state),
             }
+        }
+    }
+
+    /// Kalıcı durumu diske yazar ve özetini trace'e kaydeder. Faz 2'de disk anında ve bütünüyle
+    /// kalıcıdır; `fsync`'e kadar bekleyen yazmalar Faz 3'te gelecek.
+    fn persist(&mut self, id: NodeId, state: N::Durable) {
+        let digest = digest(&state);
+        self.trace.record(TraceEvent {
+            time: self.now,
+            kind: TraceKind::Persist { node: id, digest },
+        });
+        if let Some(host) = self.hosts.get_mut(&id) {
+            host.disk = state;
         }
     }
 
@@ -375,14 +564,15 @@ mod tests {
 
     impl SimNode for Sender {
         type Msg = Blip;
+        type Durable = ();
 
-        fn step(&mut self, input: NodeInput<Blip>) -> Vec<NodeOutput<Blip>> {
+        fn step(&mut self, input: NodeInput<Blip, ()>) -> Vec<NodeOutput<Blip, ()>> {
             match input {
                 NodeInput::Tick => vec![NodeOutput::Send {
                     to: self.to,
                     msg: Blip,
                 }],
-                NodeInput::Message { .. } => Vec::new(),
+                NodeInput::Message { .. } | NodeInput::Restart(()) => Vec::new(),
             }
         }
     }

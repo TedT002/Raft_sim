@@ -2,7 +2,7 @@
 
 use crate::message::Message;
 use crate::persist::PersistentState;
-use crate::types::{Command, NodeId};
+use crate::types::{Command, LogIndex, NodeId};
 
 /// Bir `step` çağrısının sonucunda yapılması istenen eylemlerden biri.
 ///
@@ -27,7 +27,18 @@ pub enum Output {
     Persist(PersistentState),
     /// Verilen komutun durum makinesine uygulanması istenir (yalnızca commit edilmiş girdiler için;
     /// Faz 3'te `commitIndex`/`lastApplied` mantığıyla üretilecek).
-    Apply(Command),
+    ///
+    /// `index`, girdinin log'daki yeridir. Neden komutla birlikte taşınıyor: State Machine Safety
+    /// ("hiçbir iki düğüm aynı index'te farklı komut uygulamaz") doğrudan bu index üzerinden
+    /// denetlenir, ve yeniden başlatma sonrası aynı girdinin tekrar uygulanması index'e bakılarak
+    /// ayıklanabilir. Index olmasaydı, denetçi index'i uygulama sırasından tahmin etmek zorunda
+    /// kalırdı ve bir kayma, ihlali gizleyebilirdi.
+    Apply {
+        /// Girdinin log index'i.
+        index: LogIndex,
+        /// Uygulanacak komut.
+        command: Command,
+    },
     /// İstemciye bir cevap gönderilmesi istenir.
     ClientResponse(ClientResponse),
 }

@@ -73,8 +73,10 @@ impl PingPongNode {
 
 impl SimNode for PingPongNode {
     type Msg = PingPong;
+    // Ping/Pong'un kalıcı durumu yoktur; yeniden başlatmada yapacak bir şeyi de yok.
+    type Durable = ();
 
-    fn step(&mut self, input: NodeInput<PingPong>) -> Vec<NodeOutput<PingPong>> {
+    fn step(&mut self, input: NodeInput<PingPong, ()>) -> Vec<NodeOutput<PingPong, ()>> {
         match input {
             NodeInput::Tick => {
                 let Some(last) = self.peers.len().checked_sub(1) else {
@@ -106,6 +108,7 @@ impl SimNode for PingPongNode {
                 self.pongs_received += 1;
                 Vec::new()
             }
+            NodeInput::Restart(()) => Vec::new(),
         }
     }
 }
@@ -213,6 +216,8 @@ pub struct DeliveryRecord {
 pub struct DropRecord {
     /// Düşen gönderimin numarası.
     pub msg_id: u64,
+    /// Alıcı.
+    pub to: NodeId,
     /// Gönderim zamanı.
     pub sent_at: u64,
     /// Düşme zamanı.
@@ -272,11 +277,13 @@ pub fn drops(sim: &PingPongSim) -> Vec<DropRecord> {
         .filter_map(|event| match event.kind {
             TraceKind::Drop {
                 msg_id,
+                to,
                 sent_at,
                 reason,
                 ..
             } => Some(DropRecord {
                 msg_id,
+                to,
                 sent_at,
                 at: event.time,
                 reason,

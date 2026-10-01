@@ -8,9 +8,11 @@ publish.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# checker, raft-core'a BAĞLI DEĞİLDİR: kendi nötr görünüm tiplerini tanımlar (Faz 2/3),
-# böylece kâhin (oracle) uygulamanın tiplerini ve olası hatalarını paylaşmaz.
+# checker, raft-core'a BAĞLI DEĞİLDİR: düz değerler (term ve düğüm kimliği için u64) ve kendi
+# nötr tipleriyle çalışır; böylece kâhin (oracle) uygulamanın tiplerini ve olası hatalarını
+# paylaşmaz. thiserror: ihlal tipleri (kütüphane crate'lerinde özel hata tipleri).
 [dependencies]
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

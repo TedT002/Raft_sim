@@ -5,7 +5,10 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sim::{Component, DropReason, NodeId, SeedTree, TraceKind, uniform_inclusive};
+use sim::{
+    Component, DropReason, NodeId, RaftCluster, RaftConfig, SeedTree, TraceEvent, TraceKind,
+    uniform_inclusive,
+};
 use support::{LOSSY, cluster, cluster_with_ghost_peers, cluster_with_network_rng, count_drops};
 
 // Determinizm: aynı seed ve aynı ayarlarla iki bağımsız koşu, olay olay aynı trace'i ve aynı özeti
@@ -94,10 +97,12 @@ fn an_extra_network_draw_does_not_change_node_decisions() {
 // kırılır. Değişiklik bilinçliyse, yayımlanmış seed'lerin artık başka koşular ürettiği kabul edilir
 // ve değer güncellenir.
 //
-// Senaryo trace kodlamasının her parçasına dokunur: her olay türü (Tick, Send, Deliver, Drop,
-// Partition, Heal) ve simülasyonda ulaşılabilen her düşme nedeni. Ping/Pong test protokolü de
-// sabitlenen senaryonun parçasıdır: `support` modülündeki bir değişiklik bu değeri değiştirirse, bu
-// da bilinçli bir güncelleme gerektirir ("değeri güncelle" refleksiyle geçiştirilmemeli).
+// Senaryo Faz 1'in trace kodlamasının her parçasına dokunur: o fazın her olay türü (Tick, Send,
+// Deliver, Drop, Partition, Heal) ve çökme olmadan ulaşılabilen her düşme nedeni. Faz 2'nin yaşam
+// döngüsü olayları (Persist, Crash, Restart, NodeDown) Raft altın senaryosunda sabitlenir; bu
+// senaryo bilerek değiştirilmedi, Faz 1'in değeri olduğu gibi kalsın diye. Ping/Pong test protokolü
+// de sabitlenen senaryonun parçasıdır: `support` modülündeki bir değişiklik bu değeri değiştirirse,
+// bu da bilinçli bir güncelleme gerektirir ("değeri güncelle" refleksiyle geçiştirilmemeli).
 #[test]
 fn golden_trace_hash_is_stable() {
     let mut sim = cluster_with_ghost_peers(1, 3, &[NodeId(99)], LOSSY);
@@ -125,5 +130,70 @@ fn golden_trace_hash_is_stable() {
         sim.trace_hash(),
         0xad97_5436_c53d_becd,
         "trace hash of the pinned scenario changed"
+    );
+}
+
+/// Sabit bir Raft senaryosu: 5 düğüm kayıplı ağda; 80. tick'te düğüm 2 çöker, 120'de ağ {1,3} |
+/// {4,5} diye bölünür (düğüm 2 kapalı ve hiçbir grupta değil), 200'de iyileşir, 220'de düğüm 2
+/// yeniden başlar, koşu 400'e kadar sürer. Her olaydan sonra invariant'lar denetlenir.
+fn raft_scenario(seed: u64) -> RaftCluster {
+    let mut cluster =
+        RaftCluster::new(seed, 5, LOSSY, RaftConfig::default()).expect("valid config");
+    cluster.run_until(80).expect("no violation");
+    cluster.crash(NodeId(2)).expect("node 2 is up");
+    cluster.run_until(120).expect("no violation");
+    cluster
+        .partition(&[&[NodeId(1), NodeId(3)], &[NodeId(4), NodeId(5)]])
+        .expect("valid partition");
+    cluster.run_until(200).expect("no violation");
+    cluster.heal();
+    cluster.run_until(220).expect("no violation");
+    cluster.restart(NodeId(2)).expect("node 2 is down");
+    cluster.run_until(400).expect("no violation");
+    cluster
+}
+
+// Raft koşuları da deterministiktir: aynı seed ve aynı hata programı olay olay aynı trace'i ve
+// aynı özeti verir. Farklı seed'ler farklı koşular üretir.
+#[test]
+fn raft_runs_are_deterministic() {
+    let first = raft_scenario(11);
+    let second = raft_scenario(11);
+    assert_eq!(first.sim().trace().events(), second.sim().trace().events());
+    assert_eq!(first.sim().trace_hash(), second.sim().trace_hash());
+    let hashes: BTreeSet<u64> = (0..10)
+        .map(|seed| raft_scenario(seed).sim().trace_hash())
+        .collect();
+    assert_eq!(hashes.len(), 10);
+}
+
+// Raft için "altın" özet: sabit senaryonun trace özeti dondurulmuştur. Raft mantığı, mesaj ya da
+// disk kodlaması, seed türetimi ya da simülatörün olay sırası istemeden değişirse bu test kırılır.
+// Değişiklik bilinçliyse değer bilinçli olarak güncellenir (yayımlanmış seed'ler artık başka
+// koşular üretir).
+//
+// Senaryo Faz 2'nin yeni trace olaylarının hepsine dokunur: Persist, Crash, Restart ve kapalı
+// düğüme giden mesajların düşüşü (NodeDown).
+#[test]
+fn golden_raft_trace_hash_is_stable() {
+    let cluster = raft_scenario(1);
+    let events = cluster.sim().trace().events();
+    let has = |wanted: fn(&TraceEvent) -> bool| events.iter().any(wanted);
+    assert!(has(|e| matches!(e.kind, TraceKind::Persist { .. })));
+    assert!(has(|e| matches!(e.kind, TraceKind::Crash { .. })));
+    assert!(has(|e| matches!(e.kind, TraceKind::Restart { .. })));
+    assert!(has(|e| matches!(
+        e.kind,
+        TraceKind::Drop {
+            reason: DropReason::NodeDown,
+            ..
+        }
+    )));
+    assert!(!cluster.elections().is_empty());
+    assert_eq!(cluster.sim().trace().len(), 3298);
+    assert_eq!(
+        cluster.sim().trace_hash(),
+        0x105e_a8b0_6ce0_ae32,
+        "trace hash of the pinned Raft scenario changed"
     );
 }

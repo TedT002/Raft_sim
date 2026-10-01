@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "checker"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "cli"
@@ -44,6 +47,10 @@ dependencies = [
 [[package]]
 name = "raft-core"
 version = "0.1.0"
+dependencies = [
+ "rand_chacha",
+ "thiserror",
+]
 
 [[package]]
 name = "rand_chacha"

@@ -1,4 +1,4 @@
-//! Simülatörün yapılandırma ve bölünme hataları.
+//! Simülatörün yapılandırma, bölünme ve yaşam döngüsü (çökme/yeniden başlatma) hataları.
 
 use raft_core::NodeId;
 
@@ -48,4 +48,23 @@ pub enum PartitionError {
     /// bölünme, farkına varılmadan amaçlanandan farklı bir ağ kurardı.
     #[error("node {0:?} is not part of the simulation")]
     UnknownNode(NodeId),
+}
+
+/// Geçersiz bir çökme ya da yeniden başlatma isteği. Hata durumunda simülasyon değişmez (ne düğüm
+/// ne trace).
+///
+/// Sessizce yok saymak yerine hata dönülür: zaten çökmüş bir düğümü "çökertmek" ya da ayaktaki bir
+/// düğümü "yeniden başlatmak", hata senaryosunu üreten kodda (Faz 5 fuzz koşucusu) bir mantık
+/// hatasının işaretidir; yok sayılsaydı senaryo, yazıldığından farklı bir koşu üretirdi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LifecycleError {
+    /// Düğüm simülasyonda yok.
+    #[error("node {0:?} is not part of the simulation")]
+    UnknownNode(NodeId),
+    /// Düğüm zaten çökmüş durumda.
+    #[error("node {0:?} is already down")]
+    AlreadyDown(NodeId),
+    /// Düğüm zaten ayakta.
+    #[error("node {0:?} is already up")]
+    AlreadyUp(NodeId),
 }
