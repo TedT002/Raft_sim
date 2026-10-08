@@ -171,6 +171,7 @@ impl SimNode for Journal {
     type Durable = Count;
     type Request = ();
     type Applied = ();
+    type Response = ();
 
     fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
         match input {

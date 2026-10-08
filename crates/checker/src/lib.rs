@@ -3,9 +3,10 @@
 //! Bu crate, bir simülasyon koşusunun Raft'ın güvenlik özelliklerini (Election Safety, Leader
 //! Append-Only, Log Matching, Leader Completeness, State Machine Safety) ve istemci geçmişinin
 //! linearizability'sini (Wing & Gong yaklaşımı, KV modeli üzerinde) ihlal edip etmediğini
-//! bağımsız biçimde denetler. Şu an (Faz 3) Figure 3'ün beş güvenlik özelliğinin hepsi vardır:
-//! [`ElectionSafety`], [`LeaderAppendOnly`], [`LogMatching`], [`LeaderCompleteness`] ve
-//! [`StateMachineSafety`]. Linearizability kontrolcüsü Faz 4'te eklenecek.
+//! bağımsız biçimde denetler. Figure 3'ün beş güvenlik özelliği: [`ElectionSafety`],
+//! [`LeaderAppendOnly`], [`LogMatching`], [`LeaderCompleteness`] ve [`StateMachineSafety`].
+//! İstemci geçmişi için KV modeli üzerinde linearizability kontrolcüsü: [`check_kv`] (Wing & Gong
+//! araması, Lowe'un just-in-time iyileştirmesi, bellekleme ve anahtar bazlı bölme).
 //!
 //! **Kasıtlı olarak `raft-core`'a bağımlı DEĞİLDİR.** Bir "kâhin" (oracle) her zaman denetlediği
 //! uygulamadan bağımsız tipler ve mantık üzerinde çalışmalıdır: `checker` düz değerlerle (ör. term
@@ -23,6 +24,7 @@
 mod append_only;
 mod completeness;
 mod election;
+mod linearizability;
 mod log_matching;
 mod state_machine;
 mod view;
@@ -31,6 +33,9 @@ mod view;
 pub use append_only::{LeaderAppendOnly, LeaderAppendOnlyViolation};
 pub use completeness::{LeaderCompleteness, LeaderCompletenessViolation};
 pub use election::{ElectionSafety, ElectionSafetyViolation};
+pub use linearizability::{
+    KvInput, KvOperation, KvOutput, LinearizabilityError, MalformedReason, check_kv,
+};
 pub use log_matching::{LogMatching, LogMatchingViolation};
 pub use state_machine::{StateMachineSafety, StateMachineSafetyViolation};
 pub use view::EntryView;

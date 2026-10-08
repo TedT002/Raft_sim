@@ -6,8 +6,8 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sim::{
-    ClusterConfig, Component, DropReason, KvCommand, NodeId, RaftCluster, SeedTree, TraceEvent,
-    TraceKind, uniform_inclusive,
+    ClusterConfig, Component, DropReason, KvCommand, KvRequest, NodeId, RaftCluster, Role,
+    SeedTree, TraceEvent, TraceKind, uniform_inclusive,
 };
 use support::{LOSSY, cluster, cluster_with_ghost_peers, cluster_with_network_rng, count_drops};
 
@@ -154,7 +154,8 @@ fn submit_to_leader(cluster: &mut RaftCluster, keys: &[&str]) -> Option<NodeId> 
 /// tick'te lidere üç komut verilir. 80'de lidere bir komut daha verilir ve lider, o komutun yazması
 /// fsync'i beklerken çöker (bekleyen yazma ve tutulan mesajlar kaybolur). 120'de ağ {1,3} | {4,5}
 /// diye bölünür, 200'de iyileşir, 220'de çökmüş düğümler yeniden başlar, 300'de iki komut daha
-/// verilir ve koşu 400'e kadar sürer. Her olaydan sonra invariant'lar denetlenir.
+/// verilir ve bir istemci, lider olmayan bir düğüme istek verir (`NotLeader` cevabı); koşu 400'e
+/// kadar sürer. Her olaydan sonra invariant'lar denetlenir.
 fn raft_scenario(seed: u64) -> RaftCluster {
     let mut cluster = RaftCluster::new(seed, ClusterConfig::new(5, LOSSY)).expect("valid config");
     cluster.run_until(60).expect("no violation");
@@ -177,6 +178,21 @@ fn raft_scenario(seed: u64) -> RaftCluster {
     }
     cluster.run_until(300).expect("no violation");
     let _ = submit_to_leader(&mut cluster, &["e", "f"]);
+    let follower = (1..=5).map(NodeId).find(|&id| {
+        cluster
+            .node(id)
+            .is_some_and(|node| node.role() != Role::Leader)
+    });
+    if let Some(follower) = follower {
+        let request = KvRequest {
+            client: 1,
+            seq: 1,
+            command: KvCommand::Get { key: b"e".to_vec() },
+        };
+        cluster
+            .submit_request(follower, request)
+            .expect("the node is up");
+    }
     cluster.run_until(400).expect("no violation");
     cluster
 }
@@ -200,10 +216,10 @@ fn raft_runs_are_deterministic() {
 // Değişiklik bilinçliyse değer bilinçli olarak güncellenir (yayımlanmış seed'ler artık başka
 // koşular üretir).
 //
-// Senaryo Faz 2 ve Faz 3'ün trace olaylarının hepsine dokunur: yazma (Persist) ve fsync (Sync),
-// çökme ve çökmenin kaybettirdikleri (CrashLoss), yeniden başlatma, kapalı düğüme giden mesajların
-// düşüşü (NodeDown), istemci komutları (Client) ve uygulamalar (Apply). Komutlar commit edilip
-// uygulanmış olmalı: aksi hâlde senaryo log replikasyonunu sabitlemezdi.
+// Senaryo Faz 2-4'ün trace olaylarının hepsine dokunur: yazma (Persist) ve fsync (Sync), çökme ve
+// çökmenin kaybettirdikleri (CrashLoss), yeniden başlatma, kapalı düğüme giden mesajların düşüşü
+// (NodeDown), istemci komutları (Client), uygulamalar (Apply) ve istemci cevapları (Reply).
+// Komutlar commit edilip uygulanmış olmalı: aksi hâlde senaryo log replikasyonunu sabitlemezdi.
 #[test]
 fn golden_raft_trace_hash_is_stable() {
     let cluster = raft_scenario(1);
@@ -216,6 +232,7 @@ fn golden_raft_trace_hash_is_stable() {
     assert!(has(|e| matches!(e.kind, TraceKind::Restart { .. })));
     assert!(has(|e| matches!(e.kind, TraceKind::Client { .. })));
     assert!(has(|e| matches!(e.kind, TraceKind::Apply { .. })));
+    assert!(has(|e| matches!(e.kind, TraceKind::Reply { .. })));
     assert!(has(|e| matches!(
         e.kind,
         TraceKind::Drop {
@@ -224,10 +241,10 @@ fn golden_raft_trace_hash_is_stable() {
         }
     )));
     assert!(!cluster.elections().is_empty());
-    assert_eq!(cluster.sim().trace().len(), 3366);
+    assert_eq!(cluster.sim().trace().len(), 3486);
     assert_eq!(
         cluster.sim().trace_hash(),
-        0x0810_0570_05c8_1a9a,
+        0xf865_89f8_cba6_1210,
         "trace hash of the pinned Raft scenario changed"
     );
 }

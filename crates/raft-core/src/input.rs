@@ -23,8 +23,10 @@ pub enum Input {
     },
     /// Bir istemci, durum makinesine uygulanmak üzere bir komut gönderdi. Yalnızca lider kabul
     /// eder: komutu kendi term'iyle log'una ekler ve takipçilere gönderir (Figure 2, Leaders).
-    /// Lider olmayan bir düğüm isteği yok sayar; liderin kim olduğunu bildiren cevap (`NotLeader`)
-    /// Faz 4'te gelecek.
+    /// Lider olmayan bir düğüm isteği log'a eklemez ve `ClientResponse::NotLeader { hint }` ile
+    /// bildiği lideri söyler (§8). Kabul edilen isteğin sonucu, komut commit edilip uygulandığında
+    /// durum makinesinden gelir. Komut boş olmamalıdır: boş komut no-op'a ayrılmıştır
+    /// (`Command::noop`).
     ClientRequest(Command),
     /// Düğüm çöktü ve yeniden başlatıldı; sürücü, simüle diskte `fsync` olmuş (dolayısıyla çökmeden
     /// sağ çıkan) kalıcı durumu geri veriyor. Çekirdek diski kendisi okuyamadığı için (sans-IO)

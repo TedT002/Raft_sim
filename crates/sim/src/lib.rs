@@ -23,9 +23,13 @@
 //! - **Disk** ([`SimDisk`]): yazmalar `fsync` tamamlanana kadar bekler; bir yazmadan sonraki
 //!   çıktılar (mesajlar, uygulamalar) o yazma kalıcı olana kadar tutulur. Çökme bekleyen yazmaları
 //!   kaybettirir, istenirse bir öneklerini diske ulaştırır ("kısmen yazılır").
-//! - **Raft adaptörü** ([`RaftCluster`]): istemci komutları ([`KvCommand`]), düğüm başına KV
-//!   durum makinesi ([`KvStore`]) ve her olaydan sonra Figure 3'ün beş güvenlik özelliğiyle
-//!   dayanıklılık (bellek = diske yazdırılan durum) denetimi.
+//! - **Raft adaptörü** ([`RaftCluster`]): istemci istekleri ([`KvRequest`]: oturum ve
+//!   [`KvCommand`]), düğüm başına oturumlu KV durum makinesi ([`KvStore`], §8: aynı istek bir kez
+//!   uygulanır) ve her olaydan sonra Figure 3'ün beş güvenlik özelliğiyle kümenin diğer
+//!   denetimleri (dayanıklılık, çıktı sırası, commit edilmiş girdilerin korunması).
+//! - **İstemciler** ([`ClientDriver`]): sırayla çalışan, zaman aşımında aynı `(client, seq)` ile
+//!   yeniden deneyen, `NotLeader` ipucunu izleyen istemciler; cevapların bir kısmı seed'li olarak
+//!   kaybolur. Geçmiş, `checker`'ın linearizability kontrolcüsünün tipleriyle kaydedilir.
 //!
 //! Bu crate `raft-core`'a ve `checker`'a bağımlıdır (bağımlılık yönü: `sim -> raft-core`,
 //! `sim -> checker`); tersi asla olmaz. Sans-IO çekirdek hiçbir workspace crate'ini bilmemelidir.
@@ -59,6 +63,7 @@
 //!     type Durable = ();
 //!     type Request = ();
 //!     type Applied = ();
+//!     type Response = ();
 //!
 //!     fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
 //!         match input {
@@ -93,6 +98,7 @@
 // Doctest'ler de uyarısız olmalı (clippy doctest'leri görmez).
 #![doc(test(attr(deny(warnings))))]
 
+mod client;
 mod disk;
 mod error;
 mod fnv;
@@ -108,15 +114,22 @@ mod trace;
 // Genel API düz (flat) olarak kökten dışa aktarılır; modüller ileride yeniden düzenlenebilir.
 // `NodeId` burada da dışa aktarılır: sim'i kullanan crate'ler (ör. Faz 5'te `cli`) düğüm
 // kimliklerine raft-core'a doğrudan bağımlı olmadan ulaşabilsin.
+// İstemci geçmişi `checker`'ın linearizability tipleriyle kaydedilir. Onlar da buradan dışa
+// aktarılır: sim'i kullanan kod (testler, Faz 5'te `cli`) geçmişi aynı API'den denetleyebilsin.
+pub use checker::{
+    KvInput, KvOperation, KvOutput, LinearizabilityError, MalformedReason, check_kv,
+};
+pub use client::{ClientConfig, ClientDriver, ClientStats, OpMix};
 pub use disk::{DiskConfig, SimDisk};
 pub use error::{ConfigError, LifecycleError, PartitionError};
 pub use fnv::{Fnv1a64, fnv1a64};
-pub use kv::{KvCommand, KvDecodeError, KvStore};
+pub use kv::{KvApplied, KvCommand, KvDecodeError, KvRequest, KvResult, KvStore};
 pub use network::{Fate, Network, NetworkConfig, SimNetwork};
 pub use node::{DurableState, InputOf, NodeInput, NodeOutput, OutputOf, SimNode, UpdateOf};
 pub use queue::{EventQueue, Scheduled};
 pub use raft::{
-    AppliedEntry, ClusterConfig, ClusterError, DurabilityMismatch, Election, RaftCluster, Violation,
+    AppliedEntry, ClientReply, ClusterConfig, ClusterError, DurabilityMismatch, Election,
+    NotLeaderReply, RaftCluster, ReplyOutcome, Violation,
 };
 pub use raft_core::NodeId;
 // `RaftCluster`'ın genel API'sinde görünen raft-core tipleri de aynı gerekçeyle buradan dışa

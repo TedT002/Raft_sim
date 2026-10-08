@@ -1,9 +1,11 @@
 //! Sans-IO Raft düğümü: tek genel API `step(Input) -> Vec<Output>`.
 //!
 //! Kapsam: lider seçimi (§5.2, seçim kısıtı §5.4.1), log replikasyonu (§5.3), commit kuralı
-//! (§5.4.2), commit edilen girdilerin sırayla uygulanması ve çökme sonrası yeniden başlatma.
-//! İstemci arayüzünün geri kalanı (Faz 4: `NotLeader` cevabı, tekrarlanan isteklerin ayıklanması,
-//! liderliğin başında no-op girdi) henüz yoktur.
+//! (§5.4.2), commit edilen girdilerin sırayla uygulanması, çökme sonrası yeniden başlatma ve
+//! istemci arayüzünün çekirdekteki kısmı (§8): lider olmayan düğümün `NotLeader { hint }` cevabı ve
+//! yeni liderin term başında eklediği no-op girdi. Tekrarlanan isteklerin ayıklanması (aynı
+//! `(client_id, seq)`'in bir kez uygulanması) durum makinesinin işidir: komutlar çekirdek için
+//! opaktır (C1).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,7 +18,7 @@ use crate::log::{Log, LogEntry};
 use crate::message::{
     AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
 };
-use crate::output::Output;
+use crate::output::{ClientResponse, Output};
 use crate::persist::{PersistUpdate, PersistentState};
 use crate::role::Role;
 use crate::types::{Command, LogIndex, NodeId, Term};
@@ -78,6 +80,11 @@ pub struct RaftNode {
     election_timeout: u64,
     // Liderin son heartbeat'ten bu yana geçen tick sayısı.
     heartbeat_elapsed: u64,
+    // Bu term'in lideri olarak bilinen düğüm: istemciye `NotLeader` cevabında ipucu olarak verilir
+    // (§8). Yalnızca o term'in liderinden gelen AppendEntries ile öğrenilir; term değişince
+    // unutulur, çünkü yeni term'in lideri henüz bilinmez. Geçicidir: yanlış bir ipucu yalnızca
+    // istemciye bir deneme kaybettirir, güvenliği etkilemez.
+    leader_id: Option<NodeId>,
     // Lider olunan term'de her takipçinin ilerlemesi. BTreeMap: takipçiler her koşuda aynı sırayla
     // gezilir.
     progress: BTreeMap<NodeId, Progress>,
@@ -137,6 +144,7 @@ impl RaftNode {
             election_elapsed: 0,
             election_timeout,
             heartbeat_elapsed: 0,
+            leader_id: None,
             progress: BTreeMap::new(),
         }
     }
@@ -189,6 +197,13 @@ impl RaftNode {
         self.commit_index
     }
 
+    /// Bu düğümün bildiği lider: kendisi lider ise kendi kimliği, değilse bu term'de AppendEntries
+    /// aldığı düğüm; bilinmiyorsa `None`. `NotLeader` cevabındaki ipucu budur.
+    #[must_use]
+    pub fn leader_hint(&self) -> Option<NodeId> {
+        self.leader_id
+    }
+
     /// Durum makinesine uygulanmış en yüksek index (Figure 2: `lastApplied`).
     #[must_use]
     pub fn last_applied(&self) -> LogIndex {
@@ -215,7 +230,8 @@ impl RaftNode {
     /// sırasız ya da eksik yürütmek (O1 ihlali) ise derleyicinin göremeyeceği, sürücünün
     /// sorumluluğundaki bir hatadır.
     ///
-    /// Çıktıların sırası: varsa tek bir `Persist`, sonra `Send`'ler, en sonda `Apply`'lar.
+    /// Çıktıların sırası: varsa tek bir `Persist`, sonra `Send`'ler, sonra `Apply`'lar, en sonda
+    /// (yalnızca bir istemci isteği adımında) `ClientResponse`.
     ///
     /// N3: `step` tam (total) bir fonksiyondur: her `Input` değeri için panik atmadan döner.
     /// Simülatör her düğümü her tick'te adımlar; tek bir panik bütün koşuyu ve determinizm
@@ -229,10 +245,13 @@ impl RaftNode {
         // unutamaz. Log için aynı güvenceyi `Log`'un kendi değişiklik takibi verir.
         let before = (self.current_term, self.voted_for);
         let mut outbox = Outbox::new();
+        let mut response = None;
         match input {
             Input::Tick => self.on_tick(&mut outbox),
             Input::Message { from, msg } => self.on_message(from, msg, &mut outbox),
-            Input::ClientRequest(command) => self.on_client_request(command, &mut outbox),
+            Input::ClientRequest(command) => {
+                response = self.on_client_request(command, &mut outbox);
+            }
             Input::Restart(state) => {
                 self.restart(state);
                 // R1: yüklenen durum zaten diskteki durumdur; yeniden yazmaya gerek yok. Yeniden
@@ -255,6 +274,7 @@ impl RaftNode {
             .into_iter()
             .chain(outbox.into_iter().map(|(to, msg)| Output::Send { to, msg }))
             .chain(applies)
+            .chain(response.map(Output::ClientResponse))
             .collect()
     }
 
@@ -294,6 +314,8 @@ impl RaftNode {
             return;
         };
         self.current_term = Term(term);
+        // Yeni term'in lideri henüz yok (seçimi belki bu düğüm kazanacak).
+        self.leader_id = None;
         // §5.2: aday önce kendine oy verir. Bu oy da kalıcıdır: çöküp aynı term'de kalkan aday,
         // başka bir adaya oy vermemelidir.
         self.voted_for = Some(self.id);
@@ -317,6 +339,7 @@ impl RaftNode {
     /// Seçimi kazanan aday lider olur.
     fn become_leader(&mut self, outbox: &mut Outbox) {
         self.role = Role::Leader;
+        self.leader_id = Some(self.id);
         self.votes.clear();
         // Figure 2 ("Volatile state on leaders", seçimden sonra yeniden kurulur): nextIndex = son
         // log index'i + 1, matchIndex = 0. Lider takipçilerin log'larını bilmez; iyimser başlar.
@@ -333,8 +356,24 @@ impl RaftNode {
                 (peer, progress)
             })
             .collect();
-        // §5.2: lider seçilir seçilmez AppendEntries (heartbeat) gönderir. Böylece aynı term'in
-        // diğer adayları liderliği öğrenip Follower'a döner, takipçiler de yeni seçim başlatmaz.
+        // §8: yeni lider term'inin başında log'una bir no-op girdi ekler. Neden: lider önceki
+        // term'lerin girdilerini kopyalarını sayarak commit edemez (§5.4.2); onlar ancak liderin
+        // kendi term'inden bir girdi commit edilince dolaylı olarak commit olur. İstemci komutu
+        // gelmezse bu hiç olmayabilirdi ve lider, hangi girdilerin commit edildiğini bilemezdi
+        // (ör. log üzerinden geçen bir okuma, eski bir girdinin kaderini beklerdi). No-op girdi,
+        // commit durumunu ilk çoğunluk onayında netleştirir.
+        //
+        // nextIndex yukarıda no-op'tan ÖNCEKİ log'a göre kuruldu (Figure 2: liderin son index'i +
+        // 1): aşağıdaki AppendEntries no-op'u ilk girdi olarak taşır.
+        self.log.append(LogEntry {
+            term: self.current_term,
+            command: Command::noop(),
+        });
+        // Tek düğümlü küme: no-op, liderin kendi kopyasıyla zaten çoğunluktadır.
+        self.advance_commit_index();
+        // §5.2: lider seçilir seçilmez AppendEntries gönderir. Böylece aynı term'in diğer adayları
+        // liderliği öğrenip Follower'a döner, takipçiler de yeni seçim başlatmaz. Bu ilk mesaj
+        // no-op girdiyi de taşır.
         self.broadcast_append_entries(outbox);
     }
 
@@ -371,13 +410,20 @@ impl RaftNode {
         })
     }
 
-    /// İstemciden bir komut geldi.
-    fn on_client_request(&mut self, command: Command, outbox: &mut Outbox) {
+    /// İstemciden bir komut geldi. Lider olmayan düğüm, istemciye verilecek cevabı döndürür.
+    fn on_client_request(
+        &mut self,
+        command: Command,
+        outbox: &mut Outbox,
+    ) -> Option<ClientResponse> {
         // Komutu yalnızca lider kabul eder (Figure 2, Leaders: "If command received from client:
-        // append entry to local log"). Lider olmayan düğüm isteği yok sayar; liderin kim olduğunu
-        // bildiren `NotLeader` cevabı Faz 4'te gelecek.
+        // append entry to local log"). §8: lider olmayan düğüm isteği log'a eklemez, bildiği lideri
+        // söyler; istemci isteği oraya gönderir. Aday da lider değildir ve henüz bir lider
+        // bilmez.
         if self.role != Role::Leader {
-            return;
+            return Some(ClientResponse::NotLeader {
+                hint: self.leader_id,
+            });
         }
         self.log.append(LogEntry {
             term: self.current_term,
@@ -387,6 +433,8 @@ impl RaftNode {
         self.advance_commit_index();
         // Girdiyi bir sonraki heartbeat'i beklemeden gönder; bu gönderim heartbeat yerine de geçer.
         self.broadcast_append_entries(outbox);
+        // Kabul edilen isteğin cevabı, komut commit edilip uygulandığında durum makinesinden gelir.
+        None
     }
 
     /// Bir eşten gelen RPC'yi ya da cevabı işler.
@@ -420,8 +468,9 @@ impl RaftNode {
     fn become_follower(&mut self, term: Term) {
         let was_leader = self.role == Role::Leader;
         self.current_term = term;
-        // Yeni term'de henüz kimseye oy verilmedi.
+        // Yeni term'de henüz kimseye oy verilmedi ve bu term'in lideri henüz bilinmiyor.
         self.voted_for = None;
+        self.leader_id = None;
         self.role = Role::Follower;
         self.votes.clear();
         // Liderlik bitti: takipçi ilerlemesi yalnızca lider olunan term için anlamlıdır.
@@ -489,7 +538,7 @@ impl RaftNode {
 
     /// `AppendEntries` alıcısı (Figure 2): isteği işler ve cevabını gönderir.
     fn on_append_entries(&mut self, from: NodeId, request: AppendEntries, outbox: &mut Outbox) {
-        let (success, match_index) = self.accept_append_entries(request);
+        let (success, match_index) = self.accept_append_entries(from, request);
         outbox.push((
             from,
             Message::AppendEntriesResponse(AppendEntriesResponse {
@@ -502,7 +551,7 @@ impl RaftNode {
 
     /// AppendEntries'i Figure 2'nin beş kuralıyla uygular; cevabın `success` ve `match_index`
     /// alanlarını döndürür.
-    fn accept_append_entries(&mut self, request: AppendEntries) -> (bool, LogIndex) {
+    fn accept_append_entries(&mut self, from: NodeId, request: AppendEntries) -> (bool, LogIndex) {
         // Madde 1, §5.1: eski term'li bir liderin isteği reddedilir. Cevaptaki güncel term
         // sayesinde eski lider geride kaldığını öğrenip Follower'a döner; ipucu anlamsızdır.
         if request.term < self.current_term {
@@ -520,6 +569,10 @@ impl RaftNode {
         // tanır ve Follower'a döner. `votedFor` değişmez: bu term'deki oy zaten kullanıldı.
         self.role = Role::Follower;
         self.votes.clear();
+        // Bu term'de AppendEntries gönderen, bu term'in lideridir (Election Safety: tek lider).
+        // Tutarlılık denetimi aşağıda başarısız olsa bile: o, log'un değil göndericinin
+        // kimliğinin sınavıdır. İstemcilere verilecek ipucu budur (§8).
+        self.leader_id = Some(from);
         // Figure 2: mevcut liderden AppendEntries almak seçim zamanlayıcısını sıfırlar.
         self.reset_election_timer();
 
@@ -743,7 +796,7 @@ mod tests {
     use crate::message::{
         AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
     };
-    use crate::output::Output;
+    use crate::output::{ClientResponse, Output};
     use crate::persist::{LogUpdate, PersistUpdate, PersistentState};
     use crate::role::Role;
     use crate::types::{Command, LogIndex, NodeId, Term};
@@ -808,6 +861,14 @@ mod tests {
         }
     }
 
+    /// Liderin term başında eklediği no-op girdi (§8).
+    fn noop(term: u64) -> LogEntry {
+        LogEntry {
+            term: Term(term),
+            command: Command::noop(),
+        }
+    }
+
     fn append(term: u64, prev: (u64, u64), entries: Vec<LogEntry>, leader_commit: u64) -> Message {
         Message::AppendEntries(AppendEntries {
             term: Term(term),
@@ -862,6 +923,20 @@ mod tests {
             index: LogIndex(index),
             command: Command::new(vec![byte]),
         }
+    }
+
+    /// No-op girdinin uygulanması: durum makinesi onu alır ve hiçbir şey yapmaz.
+    fn apply_noop(index: u64) -> Output {
+        Output::Apply {
+            index: LogIndex(index),
+            command: Command::noop(),
+        }
+    }
+
+    fn not_leader(hint: Option<u64>) -> Output {
+        Output::ClientResponse(ClientResponse::NotLeader {
+            hint: hint.map(NodeId),
+        })
     }
 
     fn client(byte: u8) -> Input {
@@ -1053,16 +1128,24 @@ mod tests {
         assert_eq!(node.role(), Role::Candidate);
     }
 
-    // §5.2: çoğunluğun (3 düğümde 2) oyunu alan aday lider olur ve hemen heartbeat gönderir. Term
-    // ve oy değişmediği için bu adımda `Persist` yoktur (O2).
+    // §5.2 ve §8: çoğunluğun (3 düğümde 2) oyunu alan aday lider olur, term'inin no-op girdisini
+    // log'una ekler ve onu taşıyan AppendEntries'i hemen gönderir. Term ve oy değişmez ama log
+    // değiştiği için no-op, mesajlardan ÖNCE diske yazdırılır (O2). Lider artık kendini lider
+    // olarak bilir.
     #[test]
-    fn a_majority_of_votes_makes_a_leader_that_sends_heartbeats_at_once() {
+    fn a_majority_of_votes_makes_a_leader_that_sends_its_no_op_at_once() {
         let mut node = candidate(1, &[1, 2, 3], 1);
+        let first = append(1, (0, 0), vec![noop(1)], 0);
         assert_eq!(
             node.step(message(2, vote(1, true))),
-            vec![send(2, heartbeat(1)), send(3, heartbeat(1))]
+            vec![
+                persist_log(1, Some(1), 1, vec![noop(1)]),
+                send(2, first.clone()),
+                send(3, first)
+            ]
         );
         assert_eq!(node.role(), Role::Leader);
+        assert_eq!(node.leader_hint(), Some(NodeId(1)));
     }
 
     // E2: oylar küme olarak sayılır. 5 düğümde çoğunluk 3'tür: aynı düğümün (ağda çoğaltılmış) oyu
@@ -1210,11 +1293,18 @@ mod tests {
     // cevaptan önce diske yazdırılır.
     #[test]
     fn a_higher_term_turns_any_role_into_a_follower() {
+        // Oy isteğinin log'u, liderin no-op girdisi kadar günceldir: seçim kısıtı (§5.4.1) oyu
+        // engellemesin, denetlenen şey yalnızca yeni term'in benimsenmesi olsun.
+        let up_to_date = Message::RequestVote(RequestVote {
+            term: Term(5),
+            last_log_index: LogIndex(1),
+            last_log_term: Term(1),
+        });
         let higher = [
             vote(5, false),
             heartbeat_reply(5, false),
             heartbeat(5),
-            request_vote(5),
+            up_to_date,
         ];
         for msg in higher {
             let starts = [
@@ -1265,18 +1355,20 @@ mod tests {
         assert_eq!(node.voted_for(), Some(NodeId(1)));
     }
 
-    // Lider her `heartbeat_interval` tick'te bir bütün eşlerine heartbeat gönderir; arada
-    // sessizdir.
+    // Lider her `heartbeat_interval` tick'te bir bütün eşlerine AppendEntries gönderir; arada
+    // sessizdir. Henüz onaylanmamış girdiler (burada term başındaki no-op) her heartbeat'te
+    // yeniden gönderilir: kaybolan mesajlar için ayrı bir yeniden gönderim zamanlayıcısı gerekmez.
     #[test]
     fn a_leader_sends_heartbeats_every_interval() {
         let mut node = leader(1, &[1, 2, 3], 12);
+        let heartbeat = append(1, (0, 0), vec![noop(1)], 0);
         for _ in 0..10 {
             for _ in 0..H - 1 {
                 assert!(node.step(Input::Tick).is_empty());
             }
             assert_eq!(
                 node.step(Input::Tick),
-                vec![send(2, heartbeat(1)), send(3, heartbeat(1))]
+                vec![send(2, heartbeat.clone()), send(3, heartbeat.clone())]
             );
         }
     }
@@ -1318,14 +1410,20 @@ mod tests {
         assert_eq!(node.persistent_state(), older);
     }
 
-    // Tek düğümlü küme: kendi oyu çoğunluktur, ilk zaman aşımında lider olur. Gönderecek eşi
-    // olmadığından tek çıktı yeni term'in kaydıdır ve lider sonrasında sessiz kalır.
+    // Tek düğümlü küme: kendi oyu çoğunluktur, ilk zaman aşımında lider olur. No-op girdisi kendi
+    // kopyasıyla zaten çoğunluktadır: aynı adımda commit edilir ve uygulanır. Gönderecek eşi
+    // olmadığından çıktılar yalnızca yazma (yeni term, oy ve no-op) ve uygulamadır; lider
+    // sonrasında sessiz kalır.
     #[test]
     fn a_single_node_cluster_elects_itself() {
         let mut node = node(1, &[1], 16);
         let (_, outputs) = tick_until_output(&mut node);
-        assert_eq!(outputs, vec![persist(1, Some(1))]);
+        assert_eq!(
+            outputs,
+            vec![persist_log(1, Some(1), 1, vec![noop(1)]), apply_noop(1)]
+        );
         assert_eq!(node.role(), Role::Leader);
+        assert_eq!(node.commit_index(), LogIndex(1));
         for _ in 0..3 * T {
             assert!(node.step(Input::Tick).is_empty());
         }
@@ -1350,15 +1448,26 @@ mod tests {
         assert_eq!(node.role(), Role::Follower);
     }
 
-    // Lider olmayan düğüm istemci isteğini yok sayar (Faz 4'te `NotLeader` cevabı gelecek): ne
-    // takipçi ne aday isteği log'una ekler; düğüm birebir aynı kalır.
+    // §8, S1: lider olmayan düğüm istemci isteğini log'una eklemez (düğüm birebir aynı kalır) ve
+    // bildiği lideri söyler. Taze bir takipçi ve bir aday lider bilmez. Takipçi, bir term'in
+    // liderinden AppendEntries alınca onu öğrenir (tutarlılık denetimi başarısız olsa bile); daha
+    // yüksek bir term görünce yeniden unutur, çünkü yeni term'in lideri henüz bilinmez.
     #[test]
-    fn non_leaders_ignore_client_requests() {
+    fn non_leaders_answer_client_requests_with_the_known_leader() {
         for mut node in [node(1, &[1, 2, 3], 18), candidate(1, &[1, 2, 3], 18)] {
             let before = node.clone();
-            assert!(node.step(client(7)).is_empty());
+            assert_eq!(node.step(client(7)), vec![not_leader(None)]);
             assert_eq!(node, before);
         }
+
+        let mut node = node(1, &[1, 2, 3], 18);
+        let _ = node.step(message(2, append(1, (5, 1), Vec::new(), 0)));
+        assert_eq!(node.step(client(7)), vec![not_leader(Some(2))]);
+        assert!(node.log().is_empty(), "the request is not appended");
+        let _ = node.step(message(3, request_vote(2)));
+        assert_eq!(node.step(client(7)), vec![not_leader(None)]);
+        let _ = node.step(message(3, heartbeat(2)));
+        assert_eq!(node.step(client(7)), vec![not_leader(Some(3))]);
     }
 
     // Figure 2, AppendEntries madde 3-4 ve 2: takipçi yeni girdileri ekler, bunları cevaptan ÖNCE
@@ -1483,15 +1592,17 @@ mod tests {
     }
 
     // Figure 2, Leaders: lider istemci komutunu kendi term'iyle log'una ekler, ekleneni cevaptan
-    // önce diske yazdırır ve heartbeat'i beklemeden bütün takipçilere gönderir.
+    // önce diske yazdırır ve heartbeat'i beklemeden bütün takipçilere gönderir. Takipçiler henüz
+    // hiçbir şey onaylamadığı için mesaj, term başındaki no-op'u da taşır. Kabul edilen isteğe
+    // çekirdek cevap vermez: sonuç, komut uygulanınca durum makinesinden gelir.
     #[test]
     fn a_leader_appends_client_commands_and_replicates_them_at_once() {
         let mut node = leader(1, &[1, 2, 3], 25);
-        let replicate = append(1, (0, 0), vec![entry(1, 7)], 0);
+        let replicate = append(1, (0, 0), vec![noop(1), entry(1, 7)], 0);
         assert_eq!(
             node.step(client(7)),
             vec![
-                persist_log(1, Some(1), 1, vec![entry(1, 7)]),
+                persist_log(1, Some(1), 2, vec![entry(1, 7)]),
                 send(2, replicate.clone()),
                 send(3, replicate),
             ]
@@ -1499,19 +1610,19 @@ mod tests {
     }
 
     // Figure 2, Leaders: başarılı cevap matchIndex/nextIndex'i ilerletir; kendi term'indeki girdi
-    // çoğunluğa (lider + 1 takipçi) ulaşınca commit edilir ve uygulanır. Takipçinin eksiği
-    // kalmadığından ek bir gönderim yoktur.
+    // çoğunluğa (lider + 1 takipçi) ulaşınca commit edilir ve uygulanır: önce no-op, sonra komut.
+    // Takipçinin eksiği kalmadığından ek bir gönderim yoktur.
     #[test]
     fn a_majority_of_matches_commits_a_current_term_entry() {
         let mut node = leader(1, &[1, 2, 3], 26);
         let _ = node.step(client(7));
         assert_eq!(
-            node.step(message(2, append_reply(1, true, 1))),
-            vec![apply(1, 7)]
+            node.step(message(2, append_reply(1, true, 2))),
+            vec![apply_noop(1), apply(2, 7)]
         );
-        assert_eq!(node.commit_index(), LogIndex(1));
-        assert_eq!(node.progress[&NodeId(2)].match_index, LogIndex(1));
-        assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(2));
+        assert_eq!(node.commit_index(), LogIndex(2));
+        assert_eq!(node.progress[&NodeId(2)].match_index, LogIndex(2));
+        assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(3));
     }
 
     // §5.3: ret gelince nextIndex ipucuyla bir hamlede geri çekilir ve eksik girdiler hemen yeniden
@@ -1527,11 +1638,15 @@ mod tests {
             node.step(message(2, append_reply(2, false, 1))),
             vec![send(
                 2,
-                append(2, (1, 1), vec![entry(1, 2), entry(1, 3)], 0)
+                append(2, (1, 1), vec![entry(1, 2), entry(1, 3), noop(2)], 0)
             )]
         );
         assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(2));
-        assert!(node.step(message(2, append_reply(2, true, 3))).is_empty());
+        // Eşleşme 3'e kadar bildirildi: takipçide yalnızca no-op eksik ve hemen gönderilir.
+        assert_eq!(
+            node.step(message(2, append_reply(2, true, 3))),
+            vec![send(2, append(2, (3, 1), vec![noop(2)], 0))]
+        );
         assert_eq!(node.progress[&NodeId(2)].match_index, LogIndex(3));
         assert_eq!(
             node.commit_index(),
@@ -1554,18 +1669,23 @@ mod tests {
         assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(4));
     }
 
-    // §5.4.2 (Figure 8): lider, önceki bir term'den (1) gelen girdiyi çoğunlukta olsa bile kopya
-    // sayarak commit ETMEZ. Kendi term'inden (2) bir girdi çoğunluğa ulaşınca o commit edilir ve
-    // öncesindeki girdi de dolaylı olarak commit olur; ikisi de sırayla uygulanır.
+    // §5.4.2 (Figure 8) ve §8: lider, önceki bir term'den (1) gelen girdiyi çoğunlukta olsa bile
+    // kopya sayarak commit ETMEZ. Kendi term'inden (2) bir girdi, burada term başındaki no-op,
+    // çoğunluğa ulaşınca o commit edilir ve öncesindeki girdi de dolaylı olarak commit olur; ikisi
+    // de sırayla uygulanır. No-op'un varlık nedeni budur: istemci komutu beklenmeden önceki
+    // girdilerin kaderi netleşir.
     #[test]
     fn only_current_term_entries_are_committed_by_counting_replicas() {
         let mut node = leader_with_log(1, &[1, 2, 3], 29, vec![entry(1, 1)]);
-        assert!(node.step(message(2, append_reply(2, true, 1))).is_empty());
+        assert_eq!(
+            node.step(message(2, append_reply(2, true, 1))),
+            vec![send(2, append(2, (1, 1), vec![noop(2)], 0))],
+            "the earlier-term entry is on a majority but not committed; the no-op follows"
+        );
         assert_eq!(node.commit_index(), LogIndex(0));
-        let _ = node.step(client(9));
         assert_eq!(
             node.step(message(2, append_reply(2, true, 2))),
-            vec![apply(1, 1), apply(2, 9)]
+            vec![apply(1, 1), apply_noop(2)]
         );
         assert_eq!(node.commit_index(), LogIndex(2));
     }
@@ -1659,7 +1779,8 @@ mod tests {
     }
 
     // Tek düğümlü küme: liderin kendi kopyası çoğunluktur; istemci komutu eklendiği adımda commit
-    // edilir ve uygulanır. Gönderecek eş olmadığından tek çıktılar yazma ve uygulamadır.
+    // edilir ve uygulanır (no-op, seçim adımında zaten uygulandı). Gönderecek eş olmadığından tek
+    // çıktılar yazma ve uygulamadır.
     #[test]
     fn a_single_node_cluster_commits_client_commands_at_once() {
         let mut node = node(1, &[1], 33);
@@ -1667,7 +1788,7 @@ mod tests {
         assert_eq!(node.role(), Role::Leader);
         assert_eq!(
             node.step(client(5)),
-            vec![persist_log(1, Some(1), 1, vec![entry(1, 5)]), apply(1, 5)]
+            vec![persist_log(1, Some(1), 2, vec![entry(1, 5)]), apply(2, 5)]
         );
     }
 
@@ -1803,7 +1924,10 @@ mod tests {
     // - hiçbir girdi panik attırmaz (N3);
     // - kalıcı durum değiştiyse İLK çıktı TEK bir `Persist`'tir ve farkı diske uygulamak tam olarak
     //   bellekteki durumu verir; değişmediyse hiç `Persist` yoktur (O2);
-    // - çıktı sırası: `Persist`, sonra `Send`'ler, en sonda `Apply`'lar;
+    // - çıktı sırası: `Persist`, sonra `Send`'ler, sonra `Apply`'lar, en sonda `ClientResponse`;
+    // - S1: istemci isteğine lider olmayan düğüm log'unu değiştirmeden tek bir `NotLeader` ile
+    //   (ipucu bildiği lider) cevap verir; lider cevap vermez; cevap başka hiçbir adımda çıkmaz;
+    // - S2: lider olan düğümün log'unun sonunda kendi term'inden bir no-op girdi vardır;
     // - term asla azalmaz (T1) ve aynı term içinde verilmiş oy değişmez (E1);
     // - aday ve lider kendine oy vermiştir; olumlu oy yalnızca `votedFor`'a gider;
     // - mesajlar yalnızca eşlere gider ve her zaman düğümün güncel term'ini taşır;
@@ -1828,6 +1952,7 @@ mod tests {
         let mut elections_won = 0_u32;
         let mut entries_applied = 0_u32;
         let mut truncations = 0_u32;
+        let mut not_leader_answers = 0_u32;
         for seed in 0..300 {
             let mut rng = ChaCha8Rng::from_seed(seed_bytes(1_000 + seed));
             let config = Config::new(4, 2).expect("valid config");
@@ -1841,6 +1966,7 @@ mod tests {
                 }
                 let restart = matches!(input, Input::Restart(_));
                 let tick = matches!(input, Input::Tick);
+                let client = matches!(input, Input::ClientRequest(_));
                 let sender = match &input {
                     Input::Message { from, .. } => Some(*from),
                     _ => None,
@@ -1854,6 +1980,14 @@ mod tests {
                 roles_seen.insert(node.role());
                 if !was_leader && node.role() == Role::Leader {
                     elections_won += 1;
+                    assert_eq!(
+                        node.log().last(),
+                        Some(&LogEntry {
+                            term: node.current_term(),
+                            command: Command::noop(),
+                        }),
+                        "S2: a new leader starts its term with a no-op"
+                    );
                 }
 
                 if restart {
@@ -1909,7 +2043,23 @@ mod tests {
                 }
                 let mut next_apply = applied_before.next();
                 let mut applying = false;
+                let mut responded = false;
                 for output in &outputs[persists..] {
+                    assert!(!responded, "S1: the client response is the last output");
+                    if let Output::ClientResponse(response) = output {
+                        responded = true;
+                        assert!(client, "S1: a response only answers a client request");
+                        assert_ne!(node.role(), Role::Leader, "S1: a leader accepts requests");
+                        assert_eq!(
+                            *response,
+                            ClientResponse::NotLeader {
+                                hint: node.leader_hint()
+                            },
+                            "S1: the hint is the known leader"
+                        );
+                        not_leader_answers += 1;
+                        continue;
+                    }
                     if let Output::Apply { index, command } = output {
                         applying = true;
                         assert_eq!(*index, next_apply, "entries are applied in index order");
@@ -1923,7 +2073,7 @@ mod tests {
                         continue;
                     }
                     let Output::Send { to, msg } = output else {
-                        panic!("only Sends and Applies may follow the Persist: {output:?}");
+                        panic!("only Sends, Applies and a response follow the Persist: {output:?}");
                     };
                     assert!(!applying, "Sends come before Applies");
                     assert!(node.peers().contains(to), "messages go to peers only");
@@ -1982,6 +2132,10 @@ mod tests {
                     node.last_applied().next(),
                     "every newly applied index produced exactly one Apply"
                 );
+                if client && node.role() != Role::Leader {
+                    assert!(responded, "S1: a non-leader answers every client request");
+                    assert_eq!(after, before, "S1: a rejected request changes nothing");
+                }
             }
         }
         assert_eq!(
@@ -2008,8 +2162,9 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             "every role must be reached"
         );
-        // Eşikler ölçülen değerlerin (511 liderlik, 1240 oy, 2744 uygulama, 812 kesme) çok
-        // altındadır: üretici bozulup bir tarafı seyrek görmeye başlarsa test bunu söyler.
+        // Eşikler ölçülen değerlerin (501 liderlik, 1143 oy, 3218 uygulama, 880 kesme, 8418
+        // NotLeader cevabı) çok altındadır: üretici bozulup bir tarafı seyrek görmeye başlarsa test
+        // bunu söyler.
         assert!(
             elections_won >= 100,
             "too few elections won ({elections_won}); the leader side is barely exercised"
@@ -2026,6 +2181,10 @@ mod tests {
             truncations >= 100,
             "too few conflicting suffixes replaced ({truncations}); conflict resolution is barely \
              exercised"
+        );
+        assert!(
+            not_leader_answers >= 1_000,
+            "too few NotLeader answers ({not_leader_answers}); the client side is barely exercised"
         );
     }
 }

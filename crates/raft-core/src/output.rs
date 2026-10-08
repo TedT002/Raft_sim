@@ -42,13 +42,27 @@ pub enum Output {
         /// Uygulanacak komut.
         command: Command,
     },
-    /// İstemciye bir cevap gönderilmesi istenir.
+    /// Bu adımı başlatan istemci isteğine bir cevap gönderilmesi istenir. Yalnızca bir
+    /// `Input::ClientRequest` adımında üretilir; cevabın hangi isteğe ait olduğu böylece bellidir
+    /// (çekirdek istemci kimliklerini bilmez, komutlar opaktır; C1).
     ClientResponse(ClientResponse),
 }
 
-/// İstemciye dönülecek cevabın gövdesi.
+/// Çekirdeğin bir istemci isteğine verdiği cevap.
 ///
-/// Faz 0'da yer tutucudur (boş `struct`); Faz 4'te `NotLeader { hint }` gibi varyantlar taşıyan bir
-/// `enum`'a dönüşecek (§8: liderin kim olduğuna dair ipucu ile birlikte).
+/// Başarılı bir isteğin sonucu buradan gelmez: sonucu, commit edilen komutu uygulayan durum
+/// makinesi üretir (çekirdeğin dışında; komutların anlamı oradadır, C1). Çekirdek yalnızca isteği
+/// hiç kabul etmediğini, yani log'a eklemediğini bildirir. Bu ayrım istemcinin yeniden deneme
+/// kararı için önemlidir: reddedilen istek hiçbir zaman uygulanmaz ve hemen başka bir düğüme
+/// gönderilebilir. Kabul edilmiş ama cevabı gelmeyen bir istek ise uygulanmış da olabilir; onu
+/// durum makinesinin tekilleştirmesi (§8) korur.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientResponse {}
+pub enum ClientResponse {
+    /// Bu düğüm lider değil; istek log'a eklenmedi (§8: lider olmayan düğüm isteği reddeder ve
+    /// bildiği lideri söyler). `hint`, düğümün bu term'de AppendEntries aldığı lider; bilmiyorsa
+    /// (ör. adaysa ya da term yeni başladıysa) `None`.
+    NotLeader {
+        /// Bilinen lider, varsa.
+        hint: Option<NodeId>,
+    },
+}

@@ -1,8 +1,9 @@
-//! Kaos taraması: yüzlerce seed'de rastgele çökme, yeniden başlatma, bölünme, iyileşme ve istemci
-//! komutları; kayıplı ve çoğaltmalı bir ağ; fsync penceresi ve kısmi yazmalarıyla bir disk. HER
-//! olaydan sonra Figure 3'ün beş güvenlik invariant'ı ile dayanıklılık, çıktı sırası ve commit
-//! edilmiş girdilerin korunması denetlenir (bkz. `RaftCluster`); sonda küme yeniden bir komutu
-//! bütün düğümlerde uygulayabilmelidir (canlılık).
+//! Kaos taraması: yüzlerce seed'de rastgele çökme, yeniden başlatma, bölünme ve iyileşme; kayıplı
+//! ve çoğaltmalı bir ağ; fsync penceresi ve kısmi yazmalarıyla bir disk; cevapları kaybolabilen,
+//! zaman aşımında yeniden deneyen istemciler. HER olaydan sonra Figure 3'ün beş güvenlik
+//! invariant'ı ile dayanıklılık, çıktı sırası ve commit edilmiş girdilerin korunması denetlenir
+//! (bkz. `RaftCluster`). Sonda bütün istemciler yeniden ilerleyebilmeli (canlılık), küme
+//! yakınsamalı ve istemci geçmişi linearizable olmalıdır.
 //!
 //! Testler yalnızca `sim`'in genel API'sini kullanır (raft-core'u doğrudan içe aktarmaz): Faz 5'te
 //! `cli` de bağımlılık yönü gereği yalnızca `sim`'i görecek.
@@ -11,8 +12,9 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use sim::{
-    ChaCha8Rng, ClusterConfig, ClusterError, Component, KvCommand, NetworkConfig, NodeId,
-    RaftCluster, SeedTree, TraceKind, chance, uniform_inclusive,
+    ChaCha8Rng, ClientConfig, ClientDriver, ClientStats, ClusterConfig, ClusterError, Component,
+    NetworkConfig, NodeId, OpMix, RaftCluster, SeedTree, TraceKind, chance, check_kv,
+    uniform_inclusive,
 };
 
 /// Seçim zaman aşımı tabanı (`RaftConfig::default()`): zaman aşımları `[T, 2T)` tick.
@@ -24,14 +26,23 @@ const CHAOS_NETWORK: NetworkConfig = NetworkConfig {
     min_delay: 1,
     max_delay: 5,
 };
+/// Kaos taramasının istemcileri: 4 istemci 4 anahtar üzerinde; cevapların %10'u kaybolur.
+const CHAOS_CLIENTS: ClientConfig = ClientConfig {
+    clients: 4,
+    keys: 4,
+    min_think: 2,
+    max_think: 10,
+    timeout: 2 * T,
+    max_attempts: 6,
+    reply_loss_prob: 0.1,
+    ops: OpMix::DEFAULT,
+};
 /// Taranan seed'ler.
 const CHAOS_SEEDS: Range<u64> = 0..200;
-/// Hataların ve komutların enjekte edildiği süre (tick).
+/// Hataların enjekte edildiği süre (tick).
 const CHAOS_UNTIL: u64 = 1_200;
-/// Sondaki işaret komutunun her denemede uygulanması için beklenen en uzun süre (tick).
-const SETTLE_ATTEMPT: u64 = 10 * T;
-/// İşaret komutunun en fazla kaç kez yeniden verileceği.
-const SETTLE_ATTEMPTS: u64 = 10;
+/// Sakinleşmeden sonra her istemcinin yeniden ilerlemesi için beklenen en uzun süre (tick).
+const SETTLE: u64 = 40 * T;
 
 /// Bir kaos koşusunun özeti: taramanın gerçekten bir şeyleri sınadığını gösteren sayaçlar ve
 /// koşunun kimliği olan trace özeti.
@@ -40,7 +51,8 @@ struct ChaosStats {
     crashes: u64,
     restarts: u64,
     partitions: u64,
-    commands: u64,
+    /// İstemci iş yükünün sayaçları.
+    clients: ClientStats,
     /// Kümenin sonunda commit ettiği girdi sayısı.
     committed: u64,
     /// Çökmede kaybolan (fsync'i tamamlanmamış) yazmalar ve kısmi yazmayla yine de diske ulaşanlar.
@@ -63,9 +75,8 @@ fn ids(range: Range<u64>) -> Vec<NodeId> {
     range.map(NodeId).collect()
 }
 
-/// Ayaktaki bütün düğümler aynı commitIndex'te, hepsi uygulanmış, KV tabloları aynı ve `key` her
-/// tabloda var mı?
-fn applied_everywhere(cluster: &RaftCluster, key: &[u8]) -> bool {
+/// Ayaktaki bütün düğümler aynı commitIndex'te, hepsi uygulanmış ve KV tabloları aynı mı?
+fn converged(cluster: &RaftCluster) -> bool {
     let live: Vec<NodeId> = cluster.node_ids().filter(|&id| cluster.is_up(id)).collect();
     let Some(&first) = live.first() else {
         return false;
@@ -75,20 +86,19 @@ fn applied_everywhere(cluster: &RaftCluster, key: &[u8]) -> bool {
         commit(id) == commit(first)
             && cluster.node(id).map(|node| node.last_applied()) == commit(first)
             && cluster.kv(id) == cluster.kv(first)
-            && cluster.kv(id).is_some_and(|kv| kv.get(key).is_some())
     })
 }
 
-/// Bir seed'in kaos koşusu. Hata ve komut programı kendi alt-seed akışından gelir
-/// (`Component::Scenario`): ağın, diskin ve düğümlerin akışlarından bağımsızdır; aynı seed her
-/// zaman aynı programı üretir.
+/// Bir seed'in kaos koşusu. Hata programı kendi alt-seed akışından gelir (`Component::Scenario`),
+/// istemcilerin kararları da kendi akışından (`Component::Workload`): ağın, diskin ve düğümlerin
+/// akışlarından bağımsızdırlar; aynı seed her zaman aynı koşuyu üretir.
 ///
-/// Komutlar, o an ayakta olan liderlerden rastgele birine verilir: bölünme sırasında bu, azınlıkta
-/// kalmış eski bir lider de olabilir. Onun girdileri commit edilemez ve iyileşince ezilir; bu da
-/// çakışma çözümünü (§5.3) sınar.
+/// İstemciler bölünme sırasında azınlıkta kalmış eski bir lidere de istek verebilir: onun girdileri
+/// commit edilemez, iyileşince ezilir (§5.3) ve istemci zaman aşımında yeniden dener.
 fn chaos_run(seed: u64) -> Result<ChaosStats, String> {
     let mut cluster = RaftCluster::new(seed, ClusterConfig::new(5, CHAOS_NETWORK))
         .map_err(|error| error.to_string())?;
+    let mut clients = ClientDriver::new(seed, CHAOS_CLIENTS).map_err(|error| error.to_string())?;
     let mut program = SeedTree::new(seed).rng_for(Component::Scenario);
     let all = ids(1..6);
     let mut stats = ChaosStats::default();
@@ -97,24 +107,7 @@ fn chaos_run(seed: u64) -> Result<ChaosStats, String> {
     let mut now = 0;
     while now < CHAOS_UNTIL {
         now += uniform_inclusive(&mut program, 5, 40);
-        cluster.run_until(now).map_err(violation)?;
-        let leaders: Vec<NodeId> = cluster.leaders().into_iter().map(|(id, _)| id).collect();
-        let target = pick(&mut program, &leaders);
-        // Anahtarlar, komutları alacak bir lider olsun olmasın çekilir: programın çekiliş sayısı
-        // küme durumuna bağlı olmasın (bkz. `pick`).
-        let keys: Vec<u64> = (0..uniform_inclusive(&mut program, 0, 3))
-            .map(|_| uniform_inclusive(&mut program, 0, 7))
-            .collect();
-        if let Some(leader) = target {
-            for key in keys {
-                let command = KvCommand::Put {
-                    key: format!("k{key}").into_bytes(),
-                    value: stats.commands.to_le_bytes().to_vec(),
-                };
-                cluster.submit(leader, command).map_err(violation)?;
-                stats.commands += 1;
-            }
-        }
+        clients.run_until(&mut cluster, now).map_err(violation)?;
         let up: Vec<NodeId> = all
             .iter()
             .copied()
@@ -149,10 +142,8 @@ fn chaos_run(seed: u64) -> Result<ChaosStats, String> {
         }
     }
 
-    // Sakinleşme: ağ iyileşir, herkes ayağa kalkar. Bir işaret komutu o anki lidere verilir ve
-    // bütün düğümlerde uygulanana kadar (gerekirse yeni lidere) yeniden verilir: liderliğini
-    // kaybeden bir lider onu commit edemeyebilir. İşaret, yeni liderin kendi term'inden bir girdi
-    // olarak önceki girdileri de commit eder (§5.4.2).
+    // Sakinleşme: ağ iyileşir, herkes ayağa kalkar. Her istemci en az bir işlemi daha
+    // tamamlayabilmeli: küme yeniden ilerliyor olmalı (canlılık).
     cluster.heal();
     let down: Vec<NodeId> = all
         .iter()
@@ -162,32 +153,44 @@ fn chaos_run(seed: u64) -> Result<ChaosStats, String> {
     for id in down {
         cluster.restart(id).map_err(violation)?;
     }
-    let mut attempts = 0;
+    let before = clients.completed_per_client();
+    let deadline = cluster.now() + SETTLE;
     loop {
-        if let Some(&(leader, _)) = cluster.leaders().iter().max_by_key(|(_, term)| *term) {
-            let marker = KvCommand::Put {
-                key: b"marker".to_vec(),
-                value: Vec::new(),
-            };
-            cluster.submit(leader, marker).map_err(violation)?;
-        }
-        let deadline = cluster.now() + SETTLE_ATTEMPT;
-        while cluster.now() < deadline && !applied_everywhere(&cluster, b"marker") {
-            let next = cluster.now() + 1;
-            cluster.run_until(next).map_err(violation)?;
-        }
-        if applied_everywhere(&cluster, b"marker") {
+        let progressed = clients
+            .completed_per_client()
+            .iter()
+            .zip(&before)
+            .all(|(after, before)| after > before);
+        if progressed {
             break;
         }
-        attempts += 1;
-        if attempts >= SETTLE_ATTEMPTS {
+        if cluster.now() >= deadline {
             return Err(format!(
-                "liveness: the marker command was not applied on every node after {attempts} \
-                 attempts of {SETTLE_ATTEMPT} ticks"
+                "liveness: some client completed no operation within {SETTLE} ticks after \
+                 healing ({:?} -> {:?})",
+                before,
+                clients.completed_per_client()
             ));
         }
+        let next = cluster.now() + 1;
+        clients.run_until(&mut cluster, next).map_err(violation)?;
     }
+    // Yeni işlem başlatılmaz; bekleyenler biter (cevap ya da vazgeçme) ve küme yakınsar.
+    clients.set_issuing(false);
+    let deadline = cluster.now() + SETTLE;
+    while clients.busy() || !converged(&cluster) {
+        if cluster.now() >= deadline {
+            return Err(format!(
+                "liveness: the cluster did not converge within {SETTLE} ticks (clients busy: {})",
+                clients.busy()
+            ));
+        }
+        let next = cluster.now() + 1;
+        clients.run_until(&mut cluster, next).map_err(violation)?;
+    }
+    check_kv(&clients.history()).map_err(|error| error.to_string())?;
 
+    stats.clients = clients.stats();
     stats.committed = cluster
         .node(NodeId(1))
         .map_or(0, |node| node.commit_index().0);
@@ -211,13 +214,13 @@ fn chaos_run(seed: u64) -> Result<ChaosStats, String> {
     Ok(stats)
 }
 
-// Yüzlerce seed'de güvenlik: her seed kayıplı ve çoğaltmalı bir ağda rastgele çökme, yeniden
-// başlatma, bölünme, iyileşme ve istemci komutları yaşar; disk her yazmada bir fsync penceresi açar
-// ve çökmeler bekleyen yazmaları kaybettirir ya da bir öneklerini diske ulaştırır. HER olaydan
-// sonra beş güvenlik invariant'ı ve kümenin diğer denetimleri koşar. Sonda küme bir komutu bütün
-// düğümlerde uygulayabilmelidir. Başarısız her seed, seed numarası ve tek satırlık bir yeniden
-// üretme komutuyla raporlanır (koşu deterministiktir: aynı komut aynı hatayı aynı olayda verir;
-// bkz. `the_chaos_schedule_is_reproducible`).
+// Yüzlerce seed'de güvenlik ve linearizability: her seed kayıplı ve çoğaltmalı bir ağda rastgele
+// çökme, yeniden başlatma, bölünme ve iyileşme yaşar; disk her yazmada bir fsync penceresi açar ve
+// çökmeler bekleyen yazmaları kaybettirir ya da bir öneklerini diske ulaştırır; istemcilerin
+// cevapları kaybolur ve istekler yeniden denenir. HER olaydan sonra beş güvenlik invariant'ı ve
+// kümenin diğer denetimleri koşar; sonda istemci geçmişi denetlenir. Başarısız her seed, seed
+// numarası ve tek satırlık bir yeniden üretme komutuyla raporlanır (koşu deterministiktir: aynı
+// komut aynı hatayı aynı olayda verir; bkz. `the_chaos_schedule_is_reproducible`).
 #[test]
 fn raft_safety_holds_across_hundreds_of_seeds() {
     let mut failures = Vec::new();
@@ -228,7 +231,7 @@ fn raft_safety_holds_across_hundreds_of_seeds() {
                 totals.crashes += stats.crashes;
                 totals.restarts += stats.restarts;
                 totals.partitions += stats.partitions;
-                totals.commands += stats.commands;
+                totals.clients += stats.clients;
                 totals.committed += stats.committed;
                 totals.lost_writes += stats.lost_writes;
                 totals.kept_writes += stats.kept_writes;
@@ -256,15 +259,23 @@ fn raft_safety_holds_across_hundreds_of_seeds() {
             report.join("\n")
         );
     }
-    // Tarama boş geçmemeli: hatalar gerçekten enjekte edildi, komutlar gerçekten commit edildi ve
-    // disk gerçekten yazma kaybettirdi (hem tamamen hem kısmen). Eşikler ölçülen değerlerin (2904
-    // çökme, 2354 yeniden başlatma, 2114 bölünme, 6808 komut, 5936 commit, 667 kayıp ve 77 kısmen
-    // yazılmış yazma, liderli 975 term) çok altındadır.
+    // Tarama boş geçmemeli: hatalar gerçekten enjekte edildi, işlemler gerçekten tamamlandı ve
+    // commit edildi, cevaplar kayboldu, istekler yeniden denendi ve tekilleştirildi, belirsiz ve
+    // kesin başarısız işlemler oluştu, disk gerçekten yazma kaybettirdi (hem tamamen hem kısmen).
+    // Eşikler ölçülen değerlerin (2881 çökme, 2401 yeniden başlatma, 2168 bölünme; 20244 işlemden
+    // 14982'si tamamlandı, 3299'u belirsiz, 1963'ü kesin başarısız; 1055 tekilleştirilmiş cevap,
+    // 5483 kayıp cevap, 33856 NotLeader; 19750 commit, 504 kayıp ve 66 kısmen yazılmış yazma,
+    // liderli 1042 term) çok altındadır.
     let seeds = CHAOS_SEEDS.count() as u64;
     assert!(totals.crashes >= seeds, "{totals:?}");
     assert!(totals.restarts >= seeds, "{totals:?}");
     assert!(totals.partitions >= seeds, "{totals:?}");
-    assert!(totals.commands >= 10 * seeds, "{totals:?}");
+    assert!(totals.clients.completed >= 20 * seeds, "{totals:?}");
+    assert!(totals.clients.abandoned >= seeds, "{totals:?}");
+    assert!(totals.clients.failed >= seeds, "{totals:?}");
+    assert!(totals.clients.deduplicated >= 2 * seeds, "{totals:?}");
+    assert!(totals.clients.lost_replies >= 5 * seeds, "{totals:?}");
+    assert!(totals.clients.not_leader >= 10 * seeds, "{totals:?}");
     assert!(totals.committed >= 10 * seeds, "{totals:?}");
     assert!(totals.lost_writes >= seeds, "{totals:?}");
     assert!(totals.kept_writes >= 20, "{totals:?}");

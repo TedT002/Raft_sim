@@ -101,6 +101,7 @@ struct Delivery<M> {
 enum Release<N: SimNode> {
     Send { to: NodeId, msg: N::Msg },
     Apply(N::Applied),
+    Reply(N::Response),
 }
 
 /// Tutulan bir çıktı ve bırakılabilmesi için kalıcı olması gereken yazma sayısı.
@@ -173,6 +174,7 @@ pub struct Simulation<N: SimNode, Net: Network> {
     writes: Vec<(NodeId, UpdateOf<N>)>,
     synced: Vec<(NodeId, UpdateOf<N>)>,
     applied: Vec<(NodeId, N::Applied)>,
+    replies: Vec<(NodeId, N::Response)>,
     persists_after_output: Vec<NodeId>,
 }
 
@@ -256,6 +258,7 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
             writes: Vec::new(),
             synced: Vec::new(),
             applied: Vec::new(),
+            replies: Vec::new(),
             persists_after_output: Vec::new(),
         })
     }
@@ -353,6 +356,11 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
     /// Son çağrıdan bu yana bırakılan yerel etkiler (düğüm ve etki), bırakılma sırasıyla.
     pub fn take_applied(&mut self) -> Vec<(NodeId, N::Applied)> {
         std::mem::take(&mut self.applied)
+    }
+
+    /// Son çağrıdan bu yana bırakılan istemci cevapları (düğüm ve cevap), bırakılma sırasıyla.
+    pub fn take_replies(&mut self) -> Vec<(NodeId, N::Response)> {
+        std::mem::take(&mut self.replies)
     }
 
     /// Son çağrıdan bu yana, aynı adımın bir `Send` ya da `Apply` çıktısından SONRA gelen her
@@ -722,6 +730,10 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
                     outward = true;
                     self.release_or_hold(from, Release::Apply(applied));
                 }
+                NodeOutput::Reply(reply) => {
+                    outward = true;
+                    self.release_or_hold(from, Release::Reply(reply));
+                }
             }
         }
     }
@@ -784,7 +796,7 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         }
     }
 
-    /// Bir çıktıyı bırakır: mesaj ağa çıkar, yerel etki kaydedilir.
+    /// Bir çıktıyı bırakır: mesaj ağa çıkar, yerel etki ve cevap kaydedilir.
     fn release(&mut self, id: NodeId, output: Release<N>) {
         match output {
             Release::Send { to, msg } => self.send(id, to, msg),
@@ -797,6 +809,16 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
                     },
                 });
                 self.applied.push((id, applied));
+            }
+            Release::Reply(reply) => {
+                self.trace.record(TraceEvent {
+                    time: self.now,
+                    kind: TraceKind::Reply {
+                        node: id,
+                        digest: digest(&reply),
+                    },
+                });
+                self.replies.push((id, reply));
             }
         }
     }
@@ -896,6 +918,7 @@ mod tests {
         type Durable = ();
         type Request = ();
         type Applied = ();
+        type Response = ();
 
         fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
             match input {
@@ -919,6 +942,7 @@ mod tests {
         Persist,
         Send,
         Apply,
+        Reply,
     }
 
     impl SimNode for Scripted {
@@ -926,6 +950,7 @@ mod tests {
         type Durable = ();
         type Request = ();
         type Applied = ();
+        type Response = ();
 
         fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
             match input {
@@ -939,6 +964,7 @@ mod tests {
                             msg: Blip,
                         },
                         Kind::Apply => NodeOutput::Apply(()),
+                        Kind::Reply => NodeOutput::Reply(()),
                     })
                     .collect(),
                 NodeInput::Message { .. } | NodeInput::Restart(()) | NodeInput::Client(()) => {
@@ -1077,17 +1103,18 @@ mod tests {
         assert_eq!(overflows, 2, "each send is dropped explicitly, not lost");
     }
 
-    // Çıktı sırası kaydı: aynı adımda bir Send ya da Apply'dan SONRA gelen her Persist ayrı
+    // Çıktı sırası kaydı: aynı adımda bir Send, Apply ya da Reply'dan SONRA gelen her Persist ayrı
     // kaydedilir. Persist önce gelirse (O1'in istediği sıra; birden fazla yazma da olabilir) kayıt
     // yoktur. Kayıt bir kez alınır. Senaryo iki tick koşar.
     #[test]
     fn a_persist_after_an_outward_output_is_recorded() {
-        use Kind::{Apply, Persist, Send};
+        use Kind::{Apply, Persist, Reply, Send};
         for (script, per_tick) in [
-            (vec![Persist, Send, Apply], 0),
+            (vec![Persist, Send, Apply, Reply], 0),
             (vec![Persist, Persist, Send], 0),
             (vec![Send, Persist], 1),
             (vec![Apply, Persist, Send], 1),
+            (vec![Reply, Persist], 1),
             (vec![Send, Persist, Persist], 2),
         ] {
             let nodes = [(NodeId(1), Scripted(script.clone()))];

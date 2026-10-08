@@ -63,14 +63,14 @@ use checker::{
     LogMatchingViolation, StateMachineSafety, StateMachineSafetyViolation,
 };
 use raft_core::{
-    AppendEntries, AppendEntriesResponse, Command, Config, Input, LogEntry, LogIndex, LogUpdate,
-    Message, NodeId, Output, PersistUpdate, PersistentState, RaftNode, RequestVote,
-    RequestVoteResponse, Role, Term,
+    AppendEntries, AppendEntriesResponse, ClientResponse, Command, Config, Input, LogEntry,
+    LogIndex, LogUpdate, Message, NodeId, Output, PersistUpdate, PersistentState, RaftNode,
+    RequestVote, RequestVoteResponse, Role, Term,
 };
 
 use crate::disk::{DiskConfig, SimDisk};
 use crate::error::{ConfigError, LifecycleError, PartitionError};
-use crate::kv::{KvCommand, KvStore};
+use crate::kv::{KvApplied, KvCommand, KvRequest, KvResult, KvStore};
 use crate::network::{NetworkConfig, SimNetwork};
 use crate::node::{DurableState, InputOf, NodeInput, NodeOutput, OutputOf, SimNode};
 use crate::rng::{Component, SeedTree};
@@ -86,13 +86,34 @@ pub struct AppliedEntry {
     pub command: Command,
 }
 
+/// Lider olmayan bir düğümün bir istemci isteğine cevabı (`ClientResponse::NotLeader`, §8):
+/// reddedilen istek ve düğümün bildiği lider.
+///
+/// İsteği adaptör ekler. Çekirdek istemcileri tanımaz (komutlar opaktır, C1); ama cevabı her zaman
+/// o isteği işleyen adımda üretir. Adaptör o adımın girdisini bildiği için cevabı isteğe bağlar ve
+/// sürücü, cevabın hangi `(client, seq)`'e ait olduğunu isteğin baytlarından okur. Cevap
+/// yazmaların arkasında tutulup daha sonra bırakılsa bile bu bağ kopmaz.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotLeaderReply {
+    /// Reddedilen isteğin komutu.
+    pub request: Command,
+    /// Düğümün bildiği lider.
+    pub hint: Option<NodeId>,
+}
+
 impl SimNode for RaftNode {
     type Msg = Message;
     type Durable = PersistentState;
     type Request = Command;
     type Applied = AppliedEntry;
+    type Response = NotLeaderReply;
 
     fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
+        // Cevabı isteğe bağlamak için isteğin bir kopyası (bkz. `NotLeaderReply`).
+        let request = match &input {
+            NodeInput::Client(command) => Some(command.clone()),
+            NodeInput::Tick | NodeInput::Message { .. } | NodeInput::Restart(_) => None,
+        };
         let input = match input {
             NodeInput::Tick => Input::Tick,
             NodeInput::Message { from, msg } => Input::Message { from, msg },
@@ -109,10 +130,13 @@ impl SimNode for RaftNode {
                 Output::Apply { index, command } => {
                     Some(NodeOutput::Apply(AppliedEntry { index, command }))
                 }
-                // Faz 3'te çekirdek istemci cevabı üretmez; Faz 4'te istemci geçmişine
-                // bağlanacak. `_` kolu bilerek yok: `Output`'a yeni bir varyant eklenince burası
-                // derlenmez ve adaptör bilinçli olarak güncellenir.
-                Output::ClientResponse(_) => None,
+                // Çekirdek cevabı yalnızca bir istemci isteği adımında üretir (S1); başka bir
+                // adımda üretseydi bağlanacak bir istek olmazdı ve cevap düşerdi. `_` kolu bilerek
+                // yok: `Output`'a ya da cevaba yeni bir varyant eklenince burası derlenmez ve
+                // adaptör bilinçli olarak güncellenir.
+                Output::ClientResponse(ClientResponse::NotLeader { hint }) => request
+                    .clone()
+                    .map(|request| NodeOutput::Reply(NotLeaderReply { request, hint })),
             })
             .collect()
     }
@@ -138,8 +162,8 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// Oy: 0 = yok, 1 + düğüm kimliği = var. Etiket baytı sayesinde "oy yok" ile "düğüm 0'a oy"
-/// birbirine karışmaz.
+/// Seçimlik bir düğüm (oy, lider ipucu): 0 = yok, 1 + düğüm kimliği = var. Etiket baytı sayesinde
+/// "yok" ile "düğüm 0" birbirine karışmaz.
 fn put_vote(out: &mut Vec<u8>, vote: Option<NodeId>) {
     match vote {
         None => out.push(0),
@@ -259,6 +283,14 @@ impl TraceEncode for AppliedEntry {
     }
 }
 
+impl TraceEncode for NotLeaderReply {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let NotLeaderReply { request, hint } = self;
+        put_bytes(out, request.as_bytes());
+        put_vote(out, *hint);
+    }
+}
+
 /// Bir log'un denetçiye görünen hâli (bkz. `checker::EntryView`): kopyasız bir pencere.
 fn entry_views(log: &[LogEntry]) -> Vec<EntryView<'_>> {
     log.iter()
@@ -267,6 +299,37 @@ fn entry_views(log: &[LogEntry]) -> Vec<EntryView<'_>> {
             command: entry.command.as_bytes(),
         })
         .collect()
+}
+
+/// Bir istemci isteğinin bir düğümden aldığı cevap (bkz. [`RaftCluster::submit_request`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientReply {
+    /// İstemci.
+    pub client: u64,
+    /// İsteğin oturumdaki sıra numarası.
+    pub seq: u64,
+    /// Cevabı veren düğüm (isteğin verildiği düğüm).
+    pub node: NodeId,
+    /// Cevap.
+    pub outcome: ReplyOutcome,
+}
+
+/// Bir istemci cevabının içeriği.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyOutcome {
+    /// Düğüm lider değildi; istek log'a eklenmedi (§8).
+    NotLeader {
+        /// Düğümün bildiği lider.
+        hint: Option<NodeId>,
+    },
+    /// İstek commit edildi ve düğüm onu uyguladı.
+    Done {
+        /// Sonuç.
+        result: KvResult,
+        /// Sonuç oturumdan geldi: aynı istek daha önce uygulanmıştı (yeniden denenmiş bir istek,
+        /// §8).
+        duplicate: bool,
+    },
 }
 
 /// Bir term'de gözlenen seçim: o term'de aday olan düğümler ve (varsa) kazanan.
@@ -453,6 +516,15 @@ pub struct RaftCluster {
     elections: BTreeMap<Term, Election>,
     stores: BTreeMap<NodeId, KvStore>,
     observed: BTreeMap<NodeId, Observed>,
+    // İstemci istekleri: düğüm başına, cevabı henüz verilmemiş denemeler (`(client, seq)` başına
+    // sayı). Gerçek bir sistemde bunlar istemcinin o düğüme açık bağlantılarıdır; düğüm çökünce
+    // kopar. Sayı tutulur (küme değil): aynı isteğin iki denemesi aynı düğüme gidebilir ve
+    // birinin reddi, öbürünün (kabul edilmiş olabilecek) cevabını yutmamalıdır.
+    pending: BTreeMap<NodeId, BTreeMap<(u64, u64), u32>>,
+    // Üretilen ama henüz alınmamış istemci cevapları, üretilme sırasıyla.
+    client_replies: Vec<ClientReply>,
+    // `submit`'in iç oturumunun (istemci 0) bir sonraki sıra numarası.
+    driver_seq: u64,
 }
 
 impl RaftCluster {
@@ -485,6 +557,9 @@ impl RaftCluster {
             elections: BTreeMap::new(),
             stores: ids.iter().map(|&id| (id, KvStore::default())).collect(),
             observed: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            client_replies: Vec::new(),
+            driver_seq: 0,
         })
     }
 
@@ -582,6 +657,8 @@ impl RaftCluster {
     /// invariant'ı çiğnerse [`ClusterError::Violation`].
     pub fn crash(&mut self, id: NodeId) -> Result<(), ClusterError> {
         self.sim.crash(id)?;
+        // İstemcilerin bu düğüme açık istekleri bağlantıyla birlikte kopar: cevapları hiç gelmez.
+        self.pending.remove(&id);
         self.stores.insert(id, KvStore::default());
         self.state_machine.observe_restart(id.0);
         self.completeness.observe_restart(id.0);
@@ -604,16 +681,55 @@ impl RaftCluster {
         self.check()
     }
 
-    /// Ayaktaki bir düğüme bir KV komutu verir ve invariant'ları denetler. Komutu yalnızca lider
-    /// kabul eder; lider olmayan düğüm onu yok sayar (Faz 4'te `NotLeader` cevabı gelecek).
+    /// Ayaktaki bir düğüme bir KV komutu verir ve invariant'ları denetler: "gönder ve unut". Komut
+    /// kümenin kendi iç oturumuyla (istemci 0, her çağrıda yeni bir sıra numarası) gönderilir ve
+    /// cevabı beklenmez. Komutu yalnızca lider kabul eder; lider olmayan düğümün `NotLeader`
+    /// cevabı yok sayılır. Cevapları izleyen istemciler için bkz. [`RaftCluster::submit_request`].
     ///
     /// # Errors
     ///
     /// Düğüm yoksa ya da çökmüşse [`ClusterError::Lifecycle`]; ardından bir invariant çiğnenmişse
     /// [`ClusterError::Violation`].
     pub fn submit(&mut self, id: NodeId, command: KvCommand) -> Result<(), ClusterError> {
-        self.sim.submit(id, command.encode())?;
+        self.driver_seq = self.driver_seq.saturating_add(1);
+        let request = KvRequest {
+            client: 0,
+            seq: self.driver_seq,
+            command,
+        };
+        self.sim.submit(id, request.encode())?;
         self.check()
+    }
+
+    /// Ayaktaki bir düğüme bir istemci isteği verir ve invariant'ları denetler. İsteğin cevabı
+    /// sırası gelince [`RaftCluster::take_client_replies`]'tan alınır:
+    ///
+    /// - Düğüm lider değilse `NotLeader { hint }` (istek log'a eklenmedi).
+    /// - Lider isteği kabul ettiyse, düğüm isteği uyguladığında `Done` (ilk uygulamanın sonucu;
+    ///   aynı istek daha önce uygulanmışsa oturumdaki sonuç, §8). Düğüm bu arada liderliği
+    ///   bırakmış olsa bile: commit edilmiş bir isteğin sonucu doğrudur.
+    /// - Düğüm cevap veremeden çökerse hiç cevap gelmez; istemci zaman aşımında yeniden dener.
+    ///
+    /// # Errors
+    ///
+    /// Düğüm yoksa ya da çökmüşse [`ClusterError::Lifecycle`] (istek verilmez); ardından bir
+    /// invariant çiğnenmişse [`ClusterError::Violation`].
+    pub fn submit_request(&mut self, id: NodeId, request: KvRequest) -> Result<(), ClusterError> {
+        self.sim.submit(id, request.encode())?;
+        // Cevap (reddetme) aynı adımda bırakılmış olabilir: istek, `check` cevapları işlemeden
+        // önce kaydedilir.
+        *self
+            .pending
+            .entry(id)
+            .or_default()
+            .entry((request.client, request.seq))
+            .or_default() += 1;
+        self.check()
+    }
+
+    /// Son çağrıdan bu yana üretilen istemci cevapları, üretilme sırasıyla.
+    pub fn take_client_replies(&mut self) -> Vec<ClientReply> {
+        std::mem::take(&mut self.client_replies)
     }
 
     /// Ağı gruplara böler (bkz. [`Simulation::partition`]).
@@ -646,12 +762,52 @@ impl RaftCluster {
         let synced = log_changes(self.sim.take_synced());
 
         // Bırakılan uygulamalar: State Machine Safety ve KV. Çözülemeyen bir komut KV'yi
-        // değiştirmez (bkz. `KvStore::apply`); her düğüm onu aynı biçimde yok sayar.
+        // değiştirmez (bkz. `KvStore::apply`); her düğüm onu aynı biçimde yok sayar. Uygulanan
+        // istek bu düğümde bir istemci tarafından bekleniyorsa sonucu ona döner.
         for (id, applied) in self.sim.take_applied() {
             self.state_machine
                 .observe_apply(id.0, applied.index.0, applied.command.as_bytes())
                 .map_err(|v| violation(v.into()))?;
-            let _ = self.stores.entry(id).or_default().apply(&applied.command);
+            let outcome = self.stores.entry(id).or_default().apply(&applied.command);
+            let (client, seq, done) = match outcome {
+                KvApplied::Executed {
+                    client,
+                    seq,
+                    result,
+                } => (client, seq, Some((result, false))),
+                KvApplied::Duplicate {
+                    client,
+                    seq,
+                    result,
+                } => (client, seq, Some((result, true))),
+                // Geride kalmış istek: istemci onu beklemiyor, cevap yok; ama bir deneme kapanır.
+                KvApplied::Stale { client, seq } => (client, seq, None),
+                KvApplied::Noop | KvApplied::Invalid(_) => continue,
+            };
+            if close_attempt(&mut self.pending, id, (client, seq))
+                && let Some((result, duplicate)) = done
+            {
+                self.client_replies.push(ClientReply {
+                    client,
+                    seq,
+                    node: id,
+                    outcome: ReplyOutcome::Done { result, duplicate },
+                });
+            }
+        }
+        // Reddedilen istekler: bekleyen istemciye `NotLeader` döner.
+        for (id, reply) in self.sim.take_replies() {
+            let Ok(request) = KvRequest::decode(reply.request.as_bytes()) else {
+                continue;
+            };
+            if close_attempt(&mut self.pending, id, (request.client, request.seq)) {
+                self.client_replies.push(ClientReply {
+                    client: request.client,
+                    seq: request.seq,
+                    node: id,
+                    outcome: ReplyOutcome::NotLeader { hint: reply.hint },
+                });
+            }
         }
 
         let mut newly_committed: Vec<u64> = Vec::new();
@@ -762,6 +918,26 @@ impl RaftCluster {
         }
         Ok(())
     }
+}
+
+/// `node`'daki bekleyen bir denemeyi kapatır: varsa sayısını bir düşürür (sıfırda kaydı siler) ve
+/// `true` döner; bekleyen deneme yoksa `false`.
+fn close_attempt(
+    pending: &mut BTreeMap<NodeId, BTreeMap<(u64, u64), u32>>,
+    node: NodeId,
+    request: (u64, u64),
+) -> bool {
+    let Some(waiting) = pending.get_mut(&node) else {
+        return false;
+    };
+    let Some(count) = waiting.get_mut(&request) else {
+        return false;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        waiting.remove(&request);
+    }
+    true
 }
 
 /// Yazmaların log'u değiştirdiği ilk index, düğüm başına: `Some(i)`, log `i`'den itibaren değişti;
@@ -1078,23 +1254,24 @@ mod tests {
         );
     }
 
-    // Commit edilmiş girdilerin korunması her yazmada denetlenir: liderin 1. index'i commit ettiği
-    // gözlenmiş sayılır (sahte gözlem). Liderin ilk girdisini ekleyen yazması 1. index'ten
-    // başladığı için commit edilmiş bir girdiyi yeniden yazmış sayılır.
+    // Commit edilmiş girdilerin korunması her yazmada denetlenir: liderin 2. index'i commit ettiği
+    // gözlenmiş sayılır (sahte gözlem; gerçekte yalnızca 1. index'teki no-op commit edildi).
+    // Liderin ilk istemci girdisini ekleyen yazması 2. index'ten başladığı için commit edilmiş bir
+    // girdiyi yeniden yazmış sayılır.
     #[test]
     fn rewriting_a_committed_entry_is_reported() {
         let mut cluster = quiet_cluster(7);
         let (leader, _) = elect(&mut cluster);
-        cluster.observed.entry(leader).or_default().commit_index = LogIndex(1);
+        cluster.observed.entry(leader).or_default().commit_index = LogIndex(2);
         let error = cluster
             .submit(leader, put(b"k"))
-            .expect_err("the leader's first write starts at index 1");
+            .expect_err("the leader's first client write starts at index 2");
         assert_eq!(
             violation_of(error),
             Violation::CommittedEntryRewritten {
                 node: leader,
-                from: LogIndex(1),
-                commit_index: LogIndex(1),
+                from: LogIndex(2),
+                commit_index: LogIndex(2),
             }
         );
     }
@@ -1123,26 +1300,29 @@ mod tests {
     }
 
     // Log Matching, diskteki log'u değiştiren her yazmada denetlenir (gecikmesiz diskte yazma
-    // verildiği anda kalıcıdır): kâhin, her term'in 1. index'ine sahte bir komut görmüş sayılır;
-    // liderin ilk girdisi bu kayıtla çakışır.
+    // verildiği anda kalıcıdır): kâhin, her term'in 2. index'ine (term başındaki no-op'tan sonraki
+    // ilk girdi) sahte bir komut görmüş sayılır; liderin ilk istemci girdisi bu kayıtla çakışır.
     #[test]
     fn log_matching_is_checked_on_every_durable_write() {
         let mut cluster = quiet_cluster(2);
         let fake = [0xee_u8];
         for term in 1..=20 {
-            let view = [EntryView {
-                term,
-                command: &fake,
-            }];
+            let view = [
+                EntryView { term, command: &[] },
+                EntryView {
+                    term,
+                    command: &fake,
+                },
+            ];
             cluster
                 .log_matching
-                .observe(99, &view, 1)
+                .observe(99, &view, 2)
                 .expect("a fresh entry");
         }
         let (leader, _) = elect(&mut cluster);
         let error = cluster
             .submit(leader, put(b"k"))
-            .expect_err("the leader's first entry collides with the fake one");
+            .expect_err("the leader's first client entry collides with the fake one");
         assert!(matches!(violation_of(error), Violation::LogMatching(_)));
     }
 
@@ -1170,14 +1350,19 @@ mod tests {
         ));
     }
 
-    // State Machine Safety her uygulamada denetlenir: kâhin, 1. index'te sahte bir komutun
-    // uygulandığını görmüş sayılır; kümenin ilk gerçek uygulaması bununla çakışır.
+    // State Machine Safety her uygulamada denetlenir: kâhin, 1. index'te no-op'un ve 2. index'te
+    // sahte bir komutun uygulandığını görmüş sayılır; kümenin ilk istemci komutunun uygulaması
+    // bununla çakışır.
     #[test]
     fn state_machine_safety_is_checked_on_every_apply() {
         let mut cluster = quiet_cluster(4);
         cluster
             .state_machine
-            .observe_apply(99, 1, &[0xee])
+            .observe_apply(99, 1, &[])
+            .expect("a fresh index");
+        cluster
+            .state_machine
+            .observe_apply(99, 2, &[0xee])
             .expect("a fresh index");
         let (leader, _) = elect(&mut cluster);
         cluster.submit(leader, put(b"k")).expect("no violation yet");
@@ -1200,10 +1385,17 @@ mod tests {
         let mut cluster = cluster_with_disk(5, slow_disk(0.0));
         let (leader, term) = elect(&mut cluster);
         let fake = [0xee_u8];
-        let view = [EntryView {
-            term: term.0,
-            command: &fake,
-        }];
+        // Gözlenen log'un (term başındaki no-op) devamı gibi görünen sahte bir görüntü.
+        let view = [
+            EntryView {
+                term: term.0,
+                command: &[],
+            },
+            EntryView {
+                term: term.0,
+                command: &fake,
+            },
+        ];
         cluster
             .append_only
             .observe(term.0, leader.0, &view)
@@ -1217,10 +1409,10 @@ mod tests {
         ));
     }
 
-    // Çökmede diske ulaşan önek de, çökmenin kendisinde denetlenir: kâhin 1. index'te sahte bir
-    // komut görmüş sayılır ve liderin ilk girdisi fsync penceresindeyken lider çöker. Kısmi yazma
-    // girdiyi diske ulaştırırsa çakışma çökmede bildirilir; yazma kaybolursa ihlal yoktur. Seed
-    // taraması iki durumu da görür.
+    // Çökmede diske ulaşan önek de, çökmenin kendisinde denetlenir: kâhin 2. index'te (no-op'tan
+    // sonra) sahte bir komut görmüş sayılır ve liderin ilk istemci girdisi fsync penceresindeyken
+    // lider çöker. Kısmi yazma girdiyi diske ulaştırırsa çakışma çökmede bildirilir; yazma
+    // kaybolursa ihlal yoktur. Seed taraması iki durumu da görür.
     #[test]
     fn a_prefix_kept_by_a_crash_is_checked_at_the_crash() {
         let mut kept_counts = BTreeSet::new();
@@ -1228,13 +1420,19 @@ mod tests {
             let mut cluster = cluster_with_disk(seed, slow_disk(1.0));
             let (leader, term) = elect(&mut cluster);
             let fake = [0xee_u8];
-            let view = [EntryView {
-                term: term.0,
-                command: &fake,
-            }];
+            let view = [
+                EntryView {
+                    term: term.0,
+                    command: &[],
+                },
+                EntryView {
+                    term: term.0,
+                    command: &fake,
+                },
+            ];
             cluster
                 .log_matching
-                .observe(99, &view, 1)
+                .observe(99, &view, 2)
                 .expect("a fresh entry");
             cluster
                 .submit(leader, put(b"k"))

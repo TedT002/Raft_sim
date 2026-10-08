@@ -22,12 +22,13 @@
 //! - Rastgelelik (seçim zaman aşımı) `rand::thread_rng()` gibi sistem entropisine dayanan
 //!   kaynaklardan DEĞİL, kurucuya verilen bir `seed`'den kurulan `ChaCha8Rng`'den gelir.
 //!
-//! Çekirdek şu an (Faz 3) **lider seçimini** (§5.2: roller ([`Role`]), term'ler, `[T, 2T)`
-//! aralığından rastgele seçim zaman aşımı, oy verme ve seçim kısıtı §5.4.1) ve **log
-//! replikasyonunu** uygular (§5.3: tutarlılık denetimli `AppendEntries`, çakışan kuyruğun
-//! değiştirilmesi, `nextIndex`/`matchIndex`; §5.4.2 commit kuralı; commit edilen girdilerin sırayla
-//! uygulanması). İstemci arayüzünün geri kalanı (Faz 4) henüz yoktur: lider olmayan düğüm istemci
-//! isteğini yok sayar ve `Output::ClientResponse` hiç üretilmez.
+//! Çekirdek **lider seçimini** (§5.2: roller ([`Role`]), term'ler, `[T, 2T)` aralığından rastgele
+//! seçim zaman aşımı, oy verme ve seçim kısıtı §5.4.1), **log replikasyonunu** (§5.3: tutarlılık
+//! denetimli `AppendEntries`, çakışan kuyruğun değiştirilmesi, `nextIndex`/`matchIndex`; §5.4.2
+//! commit kuralı; commit edilen girdilerin sırayla uygulanması) ve **istemci arayüzünün
+//! çekirdekteki kısmını** uygular (§8: lider olmayan düğümün [`ClientResponse::NotLeader`] cevabı
+//! ve yeni liderin term başında eklediği no-op girdi). Aynı isteğin bir kez uygulanması (oturumlar
+//! ve tekilleştirme) durum makinesinin işidir: komutlar çekirdek için opaktır (C1).
 //!
 //! Yorumlarda geçen etiketler bu crate'in sözleşme maddeleridir (değişmezler ve kenar durumlar):
 //!
@@ -35,13 +36,21 @@
 //! - **N2:** `id()`, `peers()` ve `config()`, kurucuya verilen (normalize edilmiş) değerleri
 //!   döndürür.
 //! - **N3:** `step` tam (total) bir fonksiyondur: hiçbir girdide panik atmaz.
-//! - **C1:** `Command` baytları olduğu gibi taşır; çekirdek onları hiç yorumlamaz.
+//! - **C1:** `Command` baytları olduğu gibi taşır; çekirdek onları hiç yorumlamaz. Tek istisna
+//!   boş komuttur: no-op'a ayrılmıştır ([`Command::noop`]).
+//! - **S1:** Lider olmayan düğüm bir istemci isteğini log'a eklemez ve aynı adımda tek bir
+//!   `ClientResponse::NotLeader { hint }` üretir; `hint`, bu term'de AppendEntries aldığı lider
+//!   (bilinmiyorsa `None`). Lider isteği kabul eder ve cevap üretmez: sonuç, komut commit edilip
+//!   uygulandığında durum makinesinden gelir.
+//! - **S2:** Lider olan düğüm, term'inin başında log'una kendi term'inden bir no-op girdi ekler
+//!   (§8) ve onu ilk AppendEntries'le gönderir.
 //! - **O1:** `step` çıktıları sırayla yürütülür; bir `Persist`, aynı adımın sonraki tüm
 //!   çıktılarından önce kalıcı hâle getirilmelidir.
 //! - **O2:** Bir adım kalıcı durumu (`currentTerm`, `votedFor` ya da log) değiştirdiyse İLK
 //!   çıktısı, değişikliği (farkı) taşıyan tek bir `Persist`'tir; değiştirmediyse hiç `Persist`
 //!   yoktur. Farkı diskteki duruma uygulamak (`PersistentState::apply`) tam olarak bellekteki
-//!   durumu verir. Ardından `Send`'ler, en sonda `Apply`'lar gelir.
+//!   durumu verir. Ardından `Send`'ler, sonra `Apply`'lar, en sonda (varsa) `ClientResponse`
+//!   gelir.
 //! - **R1:** `Input::Restart` yalnızca diskte kalıcı olan durumu taşır; kurtarma ondan başlar.
 //!   Düğüm Follower olarak açılır ve bu adım hiç çıktı üretmez.
 //! - **T1:** Term asla azalmaz. Daha yüksek term taşıyan herhangi bir mesaj görülünce düğüm o

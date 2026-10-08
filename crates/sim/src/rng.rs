@@ -29,6 +29,8 @@ pub enum Component {
     Node(NodeId),
     /// Simülatörün kendi zamanlama kararları (ör. aynı anda tick alan düğümlerin sırası).
     Schedule,
+    /// Simüle istemcilerin kararları: işlem seçimi, hedef düğüm, cevap kaybı.
+    Workload,
 }
 
 impl Component {
@@ -45,6 +47,7 @@ impl Component {
                 hasher.write_u64(id);
             }
             Component::Schedule => hasher.write_u8(5),
+            Component::Workload => hasher.write_u8(6),
         }
     }
 }
@@ -193,6 +196,7 @@ mod tests {
             tree.seed_for(Component::Disk),
             tree.seed_for(Component::Scenario),
             tree.seed_for(Component::Schedule),
+            tree.seed_for(Component::Workload),
             SeedTree::new(8).seed_for(Component::Network),
         ];
         seeds.extend((1..=16).map(|id| tree.seed_for(Component::Node(NodeId(id)))));

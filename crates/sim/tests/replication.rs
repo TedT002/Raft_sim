@@ -11,8 +11,8 @@
 use std::num::NonZeroUsize;
 
 use sim::{
-    ClusterConfig, Command, DiskConfig, KvCommand, KvStore, LogIndex, NetworkConfig, NodeId,
-    RaftCluster, RaftConfig, Role, Term, TraceKind,
+    ClusterConfig, DiskConfig, KvApplied, KvCommand, KvRequest, KvStore, LogIndex, NetworkConfig,
+    NodeId, RaftCluster, RaftConfig, Role, Term, TraceKind,
 };
 
 /// Seçim zaman aşımı tabanı (`RaftConfig::default()`).
@@ -80,9 +80,23 @@ fn sole_leader(cluster: &mut RaftCluster, context: &str) -> (NodeId, Term) {
     cluster.leaders()[0]
 }
 
-/// Ayaktaki bütün düğümler aynı commitIndex'te, onu `at_least` ya da ötesinde ve aynı KV
-/// tablosunda mı?
-fn converged(cluster: &RaftCluster, at_least: u64) -> bool {
+/// `id`'nin commit ettiği istemci komutlarının sayısı. No-op girdiler sayılmaz: her lider term
+/// başında bir tane ekler ve sayıları seçim sayısına bağlıdır (§8).
+fn committed_commands(cluster: &RaftCluster, id: NodeId) -> Option<usize> {
+    let node = cluster.node(id)?;
+    let commit = usize::try_from(node.commit_index().0).unwrap_or(usize::MAX);
+    Some(
+        node.log()
+            .iter()
+            .take(commit)
+            .filter(|entry| !entry.command.is_noop())
+            .count(),
+    )
+}
+
+/// Ayaktaki bütün düğümler aynı commitIndex'te, hepsi uygulanmış, aynı KV tablosunda ve en az
+/// `at_least` istemci komutu commit edilmiş mi?
+fn converged(cluster: &RaftCluster, at_least: usize) -> bool {
     let live: Vec<NodeId> = cluster.node_ids().filter(|&id| cluster.is_up(id)).collect();
     let Some(&first) = live.first() else {
         return false;
@@ -93,16 +107,40 @@ fn converged(cluster: &RaftCluster, at_least: u64) -> bool {
         commit(id) == commit(first)
             && applied(id) == commit(first)
             && cluster.kv(id) == cluster.kv(first)
-    }) && commit(first).is_some_and(|commit| commit >= at_least)
+    }) && committed_commands(cluster, first).is_some_and(|count| count >= at_least)
 }
 
-/// Bir komut dizisini sırayla uygulayan referans tablo.
+/// Bir komut dizisini sırayla uygulayan referans tablo. Komutlar, `RaftCluster::submit`'in iç
+/// oturumuyla (istemci 0, sıra numaraları 1'den) verilmiş gibi uygulanır: kümenin tablosuyla
+/// oturumlar dahil karşılaştırılabilsin.
 fn reference(commands: &[KvCommand]) -> KvStore {
     let mut store = KvStore::default();
-    for command in commands {
-        store.apply(&command.encode()).expect("a valid command");
+    for (seq, command) in (1_u64..).zip(commands) {
+        let request = KvRequest {
+            client: 0,
+            seq,
+            command: command.clone(),
+        };
+        let applied = store.apply(&request.encode());
+        assert!(matches!(applied, KvApplied::Executed { .. }), "{applied:?}");
     }
     store
+}
+
+/// Bir düğümün log'undaki istemci komutları, sırasıyla (no-op girdiler atlanır).
+fn logged_commands(cluster: &RaftCluster, id: NodeId) -> Vec<KvCommand> {
+    cluster
+        .node(id)
+        .expect("node exists")
+        .log()
+        .iter()
+        .filter(|entry| !entry.command.is_noop())
+        .map(|entry| {
+            KvRequest::decode(entry.command.as_bytes())
+                .expect("a valid request")
+                .command
+        })
+        .collect()
 }
 
 /// Ayaktaki bütün düğümler aynı commitIndex ve aynı KV tablosundalar ve `key` her tabloda var mı?
@@ -152,15 +190,7 @@ fn commands_are_applied_in_the_same_order_on_every_node() {
                 converged(c, 30)
             });
             assert_eq!(cluster.kv(leader), Some(&reference(&commands)), "{context}");
-            let logged: Vec<Command> = cluster
-                .node(leader)
-                .expect("node exists")
-                .log()
-                .iter()
-                .map(|entry| entry.command.clone())
-                .collect();
-            let submitted: Vec<Command> = commands.iter().map(KvCommand::encode).collect();
-            assert_eq!(logged, submitted, "{context}");
+            assert_eq!(logged_commands(&cluster, leader), commands, "{context}");
             for id in ids(size) {
                 assert!(same_log(&cluster, leader, id), "{context}: node {id:?}");
             }
@@ -325,14 +355,11 @@ fn a_lagging_follower_catches_up_in_batches() {
             &context,
             10 * T,
             "committing without the follower",
-            |c| {
-                c.node(leader)
-                    .is_some_and(|node| node.commit_index().0 == 40)
-            },
+            |c| committed_commands(c, leader) == Some(40),
         );
         assert!(
-            cluster.node(lagging).expect("node exists").log().is_empty(),
-            "{context}: the partitioned follower must not have the entries"
+            logged_commands(&cluster, lagging).is_empty(),
+            "{context}: the partitioned follower must not have the commands"
         );
         cluster.heal();
         wait_for(
@@ -456,9 +483,10 @@ fn a_single_node_cluster_never_counts_an_unsynced_commit() {
             if let Err(error) = cluster.submit(leader, put("lost", 1)) {
                 panic!("{context}: {error}");
             }
+            // No-op 1. index'tedir (seçim adımında commit edildi), komut 2. index'te.
             assert_eq!(
                 cluster.node(leader).map(|node| node.commit_index()),
-                Some(LogIndex(1)),
+                Some(LogIndex(2)),
                 "{context}: a single node advances its commit index at once"
             );
             if let Err(error) = cluster.crash(leader) {

@@ -151,8 +151,8 @@ pub enum TraceKind {
         node: NodeId,
     },
     /// Bir çökmenin kaybettirdikleri: bekleyen yazmalardan kaçı yine de diske ulaştı, kaçı kayboldu
-    /// ve fsync bekleyen kaç çıktı (mesaj ya da uygulama) hiç bırakılamadan yok oldu. Yalnızca
-    /// kaybolacak bir şey varken kaydedilir.
+    /// ve fsync bekleyen kaç çıktı (mesaj, uygulama ya da cevap) hiç bırakılamadan yok oldu.
+    /// Yalnızca kaybolacak bir şey varken kaydedilir.
     CrashLoss {
         /// Çöken düğüm.
         node: NodeId,
@@ -176,6 +176,13 @@ pub enum TraceKind {
         /// İsteği alan düğüm.
         node: NodeId,
         /// İsteğin özeti.
+        digest: u64,
+    },
+    /// Bir düğüm sırası gelen bir istemci cevabını bıraktı.
+    Reply {
+        /// Cevabı veren düğüm.
+        node: NodeId,
+        /// Cevabın özeti.
         digest: u64,
     },
 }
@@ -292,6 +299,11 @@ impl TraceEvent {
                 hasher.write_u64(node.0);
                 hasher.write_u64(*digest);
             }
+            TraceKind::Reply { node, digest } => {
+                hasher.write_u8(14);
+                hasher.write_u64(node.0);
+                hasher.write_u64(*digest);
+            }
         }
     }
 }
@@ -404,6 +416,7 @@ mod tests {
             },
             TraceKind::Apply { node, digest: 1 },
             TraceKind::Client { node, digest: 1 },
+            TraceKind::Reply { node, digest: 1 },
         ];
         let count = kinds.len();
         let mut hashes: Vec<u64> = kinds

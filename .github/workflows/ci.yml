@@ -68,6 +68,9 @@ jobs:
         run: ./scripts/check_deps.sh
       - name: Format
         run: cargo fmt --all -- --check
+      # rustfmt yorumları sarmaz; Türkçe yorumlar karakterle (bayt değil) 100 sütunu aşmamalı.
+      - name: Line length (100 characters)
+        run: ./scripts/check_line_length.sh
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test

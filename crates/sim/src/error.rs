@@ -42,6 +42,17 @@ pub enum ConfigError {
     /// Aynı düğüm kimliği birden fazla kez verildi.
     #[error("node {0:?} was added more than once")]
     DuplicateNode(NodeId),
+    /// Sıfır olamayacak bir ayar sıfır (ör. istemci ya da anahtar sayısı, zaman aşımı).
+    #[error("{0} must be at least 1")]
+    ZeroSetting(&'static str),
+    /// `min_think`, `max_think`'ten büyük.
+    #[error("min_think ({min}) must not exceed max_think ({max})")]
+    ThinkRange {
+        /// En kısa düşünme süresi (tick).
+        min: u64,
+        /// En uzun düşünme süresi (tick).
+        max: u64,
+    },
 }
 
 /// Geçersiz bir bölünme tanımı. Hata durumunda ne ağ ne trace değişir.

@@ -29,7 +29,7 @@ impl DurableState for Count {
 /// Her tick'te sayacını artırıp diske yazdıran, ardından yeni değeri eşine gönderen ve "uygulayan"
 /// düğüm. Doğru bir sans-IO düğümün yaptığı gibi yazma, ona bağlı çıktılardan önce gelir (O1).
 /// `send_first` bu sırayı bilerek bozar: mesaj yazmadan ÖNCE verilir. İstemci isteği sayacı
-/// verilen değere getirir.
+/// verilen değere getirir ve istemciye bir cevap (`Reply`) verir.
 #[derive(Debug, Default)]
 struct Ledger {
     count: u64,
@@ -43,6 +43,7 @@ impl SimNode for Ledger {
     type Durable = Count;
     type Request = Count;
     type Applied = Count;
+    type Response = ();
 
     fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
         match input {
@@ -75,6 +76,7 @@ impl SimNode for Ledger {
                 vec![
                     NodeOutput::Persist(Count(count)),
                     NodeOutput::Apply(Count(count)),
+                    NodeOutput::Reply(()),
                 ]
             }
         }
@@ -428,6 +430,31 @@ fn an_instant_disk_syncs_and_releases_at_once() {
             .events()
             .iter()
             .any(|event| matches!(event.kind, TraceKind::CrashLoss { .. }))
+    );
+}
+
+// İstemci cevabı (`Reply`) da dışarıya dönük bir çıktıdır: kendisinden önce verilmiş yazmalar
+// kalıcı olana kadar tutulur (O1). fsync 3 tick sürerken düğüm 2'nin t=1, 2, 3'teki yazmaları t=4,
+// 5, 6'da kalıcı olur. t=3'te verilen isteğin yazması da onların arkasında, t=6'da kalıcı olur;
+// cevap ancak o an bırakılır ve trace'e girer.
+#[test]
+fn a_reply_waits_for_the_writes_before_it() {
+    let mut sim = ledger(4, fixed(3));
+    sim.run_until(3);
+    sim.submit(NodeId(2), Count(42)).expect("node 2 is up");
+    sim.run_until(5);
+    assert!(sim.take_replies().is_empty(), "the reply is held");
+    sim.run_until(6);
+    assert_eq!(sim.take_replies(), vec![(NodeId(2), ())]);
+    assert_eq!(
+        times_of(&sim, |kind| matches!(
+            kind,
+            TraceKind::Reply {
+                node: NodeId(2),
+                ..
+            }
+        )),
+        vec![6]
     );
 }
 

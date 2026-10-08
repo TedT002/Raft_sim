@@ -44,8 +44,8 @@ impl LogIndex {
 /// İstemcinin durum makinesine uygulanmasını istediği komutun opak bayt gösterimi.
 ///
 /// `raft-core` bu baytların içeriğini asla yorumlamaz/ayrıştırmaz: KV durum makinesi (Put/Delete
-/// gibi semantik) Faz 3'te `raft-core`'un DIŞINDA, `Output::Apply` çıktısını tüketen tarafta
-/// yaşayacak. Çekirdek yalnızca bu baytları log'a yazar ve sırayla iletir. Bu ayrım çekirdeği
+/// gibi semantik) `raft-core`'un DIŞINDA, `Output::Apply` çıktısını tüketen tarafta (simülatörde)
+/// yaşar. Çekirdek yalnızca bu baytları log'a yazar ve sırayla iletir. Bu ayrım çekirdeği
 /// uygulamadan (KV anlamından) bağımsız tutar: Raft yalnızca hangi komutun hangi sırayla
 /// uygulanacağına karar verir, komutun ne yaptığına değil.
 ///
@@ -72,6 +72,25 @@ impl Command {
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.0
+    }
+
+    /// No-op komutu: boş bayt dizisi (§8).
+    ///
+    /// Yeni lider, term'inin başında log'una bu komutu taşıyan bir girdi ekler: kendi term'inden
+    /// bir girdi commit edilince önceki term'lerin girdileri de dolaylı olarak commit olur
+    /// (§5.4.2), yani commit durumları beklemeden netleşir. Boş komut bu iş için ayrılmıştır:
+    /// çekirdek başka hiçbir komutu yorumlamaz (C1), ama bu konvansiyonu durum makinesiyle
+    /// paylaşır. Durum makinesi boş komutu uygular ve hiçbir şey yapmaz; istemci komutları hiçbir
+    /// zaman boş olmamalıdır. (etcd de aynı yolu seçer: liderin ilk girdisi boş veridir.)
+    #[must_use]
+    pub fn noop() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Bu komut no-op mu (boş mu)?
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.0.is_empty()
     }
 }
 

@@ -35,9 +35,9 @@ pub enum NodeInput<M, D, R> {
 }
 
 /// Bir düğümün simülatörden yapmasını istediği eylem. `M` mesaj tipi, `U` diske yazılan farkın
-/// tipi, `A` sırayla bırakılan yerel etkinin tipidir.
+/// tipi, `A` sırayla bırakılan yerel etkinin, `R` istemciye verilen cevabın tipidir.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NodeOutput<M, U, A> {
+pub enum NodeOutput<M, U, A, R> {
     /// `to` düğümüne mesaj gönder. Mesajın kaderine (kayıp, gecikme, çoğaltma, bölünme) ağ karar
     /// verir.
     Send {
@@ -54,6 +54,12 @@ pub enum NodeOutput<M, U, A> {
     /// Sırası geldiğinde bırakılacak yerel bir etki: ör. commit edilmiş bir girdinin durum
     /// makinesine uygulanması. Ağa gitmez; simülatör onu kaydeder ve sürücüye verir.
     Apply(A),
+    /// İstemciye bir cevap: ör. Raft'ta lider olmayan düğümün "lider değilim" cevabı. Ağa gitmez
+    /// (istemciler simülasyonda düğümlere doğrudan bağlıdır); simülatör onu kaydeder ve sürücüye
+    /// verir. Dışarıya dönük bir çıktıdır: `Send` ve `Apply` gibi kendisinden önce verilmiş
+    /// yazmalar kalıcı olana kadar tutulur (O1); cevap, kalıcı olmayan bir durumu dışarıya
+    /// sızdırmamalıdır.
+    Reply(R),
 }
 
 /// Diskte tutulan kalıcı durum ve ona uygulanan fark.
@@ -95,6 +101,9 @@ pub trait SimNode {
     /// kullanır.
     type Applied: Clone + std::fmt::Debug + TraceEncode;
 
+    /// İstemciye verilen cevap (`NodeOutput::Reply`). İstemcisi olmayan düğümler `()` kullanır.
+    type Response: Clone + std::fmt::Debug + TraceEncode;
+
     /// Bir girdiyi işler ve istenen eylemleri döndürür. Çıktılar verildikleri sırayla uygulanır.
     ///
     /// Düğüm kendi rastgeleliğini kendi RNG'sinden almalıdır (ör. `SeedTree::rng_for` ile kurulan
@@ -111,4 +120,5 @@ pub type InputOf<N> =
 pub type UpdateOf<N> = <<N as SimNode>::Durable as DurableState>::Update;
 
 /// `N` düğümünün çıktı tipi.
-pub type OutputOf<N> = NodeOutput<<N as SimNode>::Msg, UpdateOf<N>, <N as SimNode>::Applied>;
+pub type OutputOf<N> =
+    NodeOutput<<N as SimNode>::Msg, UpdateOf<N>, <N as SimNode>::Applied, <N as SimNode>::Response>;

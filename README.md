@@ -8,13 +8,16 @@ pinned toolchain and `Cargo.lock`).
 
 ## Status
 
-Work in progress — Phase 3: log replication runs in the simulator. A leader replicates client
-commands with consistency-checked `AppendEntries`, commits only entries of its own term by counting
-replicas (§5.4.2, the Figure 8 trap) and every node applies committed commands to a key-value state
-machine in the same order. All five safety properties of Figure 3 (Election Safety, Leader
-Append-Only, Log Matching, Leader Completeness, State Machine Safety) are checked after every
-simulated event across hundreds of seeds with message loss, duplication, partitions, crashes and a
-disk that loses unsynced writes. The client interface and linearizability checking are next.
+Work in progress — Phase 4: clients and linearizability. A leader replicates client commands with
+consistency-checked `AppendEntries`, starts every term with a no-op entry and commits only entries
+of its own term by counting replicas (§5.4.2, the Figure 8 trap); followers answer clients with
+`NotLeader` and a hint. Every request carries a client session `(client, seq)`, so a retried request
+is applied at most once (§8). Simulated clients retry on timeouts, follow leader hints and lose some
+replies on purpose, and every run's client history is checked for linearizability. All five safety
+properties of Figure 3 (Election Safety, Leader Append-Only, Log Matching, Leader Completeness,
+State Machine Safety) are checked after every simulated event across hundreds of seeds with message
+loss, duplication, partitions, crashes and a disk that loses unsynced writes. The chaos CLI
+(`fuzz`/`replay`), seed shrinking and mutation testing are next.
 
 ## Why
 
@@ -73,13 +76,25 @@ must match what it wrote, so a state change that was not persisted is caught at 
 waiting for an unlucky crash; a step must persist before it sends or applies anything; and no node
 may rewrite its log at or below the commit index the checker has seen for it.
 
+Clients reach nodes directly (not through the simulated network), but a seeded fraction of replies
+is lost, so a committed request often goes unanswered and is retried under the same `(client, seq)`.
+The key-value state machine keeps the last sequence number and result of every client session and
+answers a duplicate from the session instead of applying it again (§8). Operations are `Put`, `Get`,
+`Delete` and `Append`; reads go through the log. `Append` is not idempotent, so a request applied
+twice is visible to a later read, which is exactly what the linearizability checker looks for. The
+history records the first call and the first reply of every operation; an operation whose client
+gave up is indeterminate (it may or may not have taken effect), and one whose attempts were all
+rejected is known to have failed and is left out. The checker follows Wing & Gong's search with
+Lowe's just-in-time linearization and memoization, splits the history per key (P-compositionality)
+and skips indeterminate writes whose values no read ever saw, which cannot change the verdict.
+
 Crates and their dependency direction (`raft-core` depends on no workspace crate):
 
 | Crate | Responsibility |
 |---|---|
-| `raft-core` | Pure, sans-IO Raft state machine (Figure 2): leader election and log replication |
-| `sim` | Deterministic simulator: virtual clock, event queue, seeded network and disk, crash/restart, trace hash; Raft adapter with a key-value state machine, checking invariants after every event |
-| `checker` | The five Raft safety properties of Figure 3 (linearizability planned), independent of `raft-core`'s types |
+| `raft-core` | Pure, sans-IO Raft state machine (Figure 2): leader election, log replication, `NotLeader` replies and the leader's no-op entry (§8) |
+| `sim` | Deterministic simulator: virtual clock, event queue, seeded network and disk, crash/restart, trace hash; Raft adapter with a session-aware key-value state machine, checking invariants after every event; simulated clients that record their history |
+| `checker` | The five Raft safety properties of Figure 3 and a linearizability checker for key-value histories, independent of `raft-core`'s types |
 | `cli` | `raftsim` binary: planned `fuzz` and `replay --seed N` subcommands |
 
 ```
@@ -98,7 +113,8 @@ sim -> checker
       crash/restart
 - [x] Phase 3 — Log replication: `AppendEntries`, commit rule, state machine application, simulated
       disk (writes pending until fsync)
-- [ ] Phase 4 — Client interface: request dedup, `NotLeader` responses, linearizability checking
+- [x] Phase 4 — Client interface: request dedup, `NotLeader` responses, leader no-op,
+      linearizability checking
 - [ ] Phase 5 — Chaos and proof: `raftsim fuzz`/`replay --seed N`, seed shrinking, mutation testing
 - [ ] Phase 6 (optional) — Snapshots, cluster membership changes, a real network runner
 
@@ -120,6 +136,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ./scripts/check_forbidden.sh crates/sim
 ./scripts/test_check_forbidden.sh
 ./scripts/check_deps.sh
+./scripts/check_line_length.sh
 ```
 
 ## License
