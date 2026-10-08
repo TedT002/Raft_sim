@@ -1,7 +1,7 @@
 //! `RaftNode::step`'in ürettiği, sürücünün sırayla yürütmesi gereken tek çıktı tipi.
 
 use crate::message::Message;
-use crate::persist::PersistentState;
+use crate::persist::PersistUpdate;
 use crate::types::{Command, LogIndex, NodeId};
 
 /// Bir `step` çağrısının sonucunda yapılması istenen eylemlerden biri.
@@ -22,11 +22,14 @@ pub enum Output {
         /// Gönderilecek RPC/cevap.
         msg: Message,
     },
-    /// Verilen durumun diske kalıcı biçimde (fsync ile) yazılması istenir; bu, aynı adımdaki
-    /// sonraki `Output`'lardan (özellikle `Send`'lerden) ÖNCE tamamlanmış olmalıdır (O1).
-    Persist(PersistentState),
-    /// Verilen komutun durum makinesine uygulanması istenir (yalnızca commit edilmiş girdiler için;
-    /// Faz 3'te `commitIndex`/`lastApplied` mantığıyla üretilecek).
+    /// Verilen farkın diske kalıcı biçimde (fsync ile) yazılması istenir; bu, aynı adımdaki
+    /// sonraki `Output`'lardan (özellikle `Send`'lerden) ÖNCE tamamlanmış olmalıdır (O1). Fark
+    /// diskteki duruma `PersistentState::apply` ile uygulanır.
+    Persist(PersistUpdate),
+    /// Verilen komutun durum makinesine uygulanması istenir: yalnızca commit edilmiş girdiler için,
+    /// index sırasıyla ve her index bir kez (`commitIndex`/`lastApplied`, Figure 2). Yeniden
+    /// başlatmadan sonra `lastApplied` 0'dan başladığı için girdiler baştan yeniden uygulanır;
+    /// durum makinesi de çökmeyle kaybolan geçici bir yapı olarak baştan kurulmalıdır.
     ///
     /// `index`, girdinin log'daki yeridir. Neden komutla birlikte taşınıyor: State Machine Safety
     /// ("hiçbir iki düğüm aynı index'te farklı komut uygulamaz") doğrudan bu index üzerinden

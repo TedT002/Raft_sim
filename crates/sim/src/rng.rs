@@ -27,6 +27,8 @@ pub enum Component {
     Scenario,
     /// Tek bir düğümün kendi kararları (ör. Raft'ta seçim zaman aşımı).
     Node(NodeId),
+    /// Simülatörün kendi zamanlama kararları (ör. aynı anda tick alan düğümlerin sırası).
+    Schedule,
 }
 
 impl Component {
@@ -42,6 +44,7 @@ impl Component {
                 hasher.write_u8(4);
                 hasher.write_u64(id);
             }
+            Component::Schedule => hasher.write_u8(5),
         }
     }
 }
@@ -189,6 +192,7 @@ mod tests {
             tree.seed_for(Component::Network),
             tree.seed_for(Component::Disk),
             tree.seed_for(Component::Scenario),
+            tree.seed_for(Component::Schedule),
             SeedTree::new(8).seed_for(Component::Network),
         ];
         seeds.extend((1..=16).map(|id| tree.seed_for(Component::Node(NodeId(id)))));

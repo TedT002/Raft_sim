@@ -1,4 +1,12 @@
-//! Düğümün zamanlama ayarları: seçim zaman aşımı ve heartbeat aralığı (tick cinsinden).
+//! Düğümün ayarları: seçim zaman aşımı ve heartbeat aralığı (tick cinsinden) ve bir AppendEntries
+//! mesajının taşıyabileceği en fazla girdi sayısı.
+
+use std::num::NonZeroUsize;
+
+/// Bir AppendEntries'in varsayılan en fazla girdi sayısı. `expect` derleme zamanında (const)
+/// değerlendirilir: değer sıfır olsaydı bu bir derleme hatası olurdu, çalışma zamanında panik
+/// imkânsızdır.
+const DEFAULT_MAX_ENTRIES: NonZeroUsize = NonZeroUsize::new(64).expect("64 is not zero");
 
 /// Raft'ın zamanlama ayarları. Bütün değerler mantıksal tick cinsindendir; gerçek saatle ilgileri
 /// yoktur (sans-IO: zaman yalnızca `Input::Tick` ile ilerler).
@@ -10,6 +18,7 @@
 pub struct Config {
     election_timeout: u64,
     heartbeat_interval: u64,
+    max_entries: NonZeroUsize,
 }
 
 impl Config {
@@ -40,7 +49,19 @@ impl Config {
         Ok(Self {
             election_timeout,
             heartbeat_interval,
+            max_entries: DEFAULT_MAX_ENTRIES,
         })
+    }
+
+    /// Bir AppendEntries'in taşıyabileceği en fazla girdi sayısını değiştirir (varsayılan 64).
+    ///
+    /// Sınır neden var: geride kalmış bir takipçiye bütün eksik log'u tek mesajda göndermek,
+    /// kayıplı bir ağda her kayıpta hepsini yeniden göndermek demektir. Sıfır kabul edilmez (tip
+    /// garanti eder): girdi taşıyamayan bir lider eksik girdileri hiç gönderemezdi.
+    #[must_use]
+    pub const fn with_max_entries(mut self, max_entries: NonZeroUsize) -> Self {
+        self.max_entries = max_entries;
+        self
     }
 
     /// Seçim zaman aşımı tabanı T (tick). Zaman aşımı `[T, 2T)` aralığından çekilir.
@@ -54,6 +75,12 @@ impl Config {
     pub const fn heartbeat_interval(&self) -> u64 {
         self.heartbeat_interval
     }
+
+    /// Bir AppendEntries'in taşıyabileceği en fazla girdi sayısı (en az 1).
+    #[must_use]
+    pub const fn max_entries(&self) -> usize {
+        self.max_entries.get()
+    }
 }
 
 impl Default for Config {
@@ -63,6 +90,7 @@ impl Default for Config {
         Self {
             election_timeout: 20,
             heartbeat_interval: 4,
+            max_entries: DEFAULT_MAX_ENTRIES,
         }
     }
 }

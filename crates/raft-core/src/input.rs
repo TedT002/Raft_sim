@@ -21,8 +21,10 @@ pub enum Input {
         /// İletilen RPC/cevap.
         msg: Message,
     },
-    /// Bir istemci, durum makinesine uygulanmak üzere bir komut gönderdi. İstemci arayüzü Faz
-    /// 3/4'ün kapsamıdır; Faz 2'de bu girdi yok sayılır (hiç çıktı üretmez).
+    /// Bir istemci, durum makinesine uygulanmak üzere bir komut gönderdi. Yalnızca lider kabul
+    /// eder: komutu kendi term'iyle log'una ekler ve takipçilere gönderir (Figure 2, Leaders).
+    /// Lider olmayan bir düğüm isteği yok sayar; liderin kim olduğunu bildiren cevap (`NotLeader`)
+    /// Faz 4'te gelecek.
     ClientRequest(Command),
     /// Düğüm çöktü ve yeniden başlatıldı; sürücü, simüle diskte `fsync` olmuş (dolayısıyla çökmeden
     /// sağ çıkan) kalıcı durumu geri veriyor. Çekirdek diski kendisi okuyamadığı için (sans-IO)

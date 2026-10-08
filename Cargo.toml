@@ -33,6 +33,10 @@ checker = { path = "crates/checker" }
 # ihtiyacımız olmadığı için varsayılan özellikler kapalı (daha küçük bağımlılık yüzeyi).
 rand_chacha = { version = "0.10", default-features = false }
 thiserror = "2"
+# proptest: yalnızca test bağımlılığı (checker). Varsayılan özellikler kapalı: süreç çatallama
+# (`fork`), zaman aşımı ve geçici dosyalar gerekmiyor; `std` yeterli. Testler sabit bir RNG seed'iyle
+# koşar ve hata dosyası yazmaz, böylece CI'da sonuç her koşuda aynıdır.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 # `#![forbid(unsafe_code)]` yalnızca yazıldığı crate kökünü kapsar; `tests/*.rs` entegrasyon
 # testleri AYRI crate'lerdir ve bu özniteliği miras almaz. Workspace lint'i her hedefi

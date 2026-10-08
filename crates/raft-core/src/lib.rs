@@ -22,11 +22,12 @@
 //! - Rastgelelik (seçim zaman aşımı) `rand::thread_rng()` gibi sistem entropisine dayanan
 //!   kaynaklardan DEĞİL, kurucuya verilen bir `seed`'den kurulan `ChaCha8Rng`'den gelir.
 //!
-//! Çekirdek şu an (Faz 2) **lider seçimini** uygular (§5.2): roller ([`Role`]), term'ler,
-//! `[T, 2T)` aralığından rastgele seçim zaman aşımı, oy verme ve seçim kısıtı (§5.4.1), heartbeat
-//! ve çökme sonrası yeniden başlatma. Log replikasyonu (Faz 3) ve istemci arayüzü (Faz 4) henüz
-//! yoktur: `Input::ClientRequest` yok sayılır, `Output::Apply` ve `Output::ClientResponse` hiç
-//! üretilmez.
+//! Çekirdek şu an (Faz 3) **lider seçimini** (§5.2: roller ([`Role`]), term'ler, `[T, 2T)`
+//! aralığından rastgele seçim zaman aşımı, oy verme ve seçim kısıtı §5.4.1) ve **log
+//! replikasyonunu** uygular (§5.3: tutarlılık denetimli `AppendEntries`, çakışan kuyruğun
+//! değiştirilmesi, `nextIndex`/`matchIndex`; §5.4.2 commit kuralı; commit edilen girdilerin sırayla
+//! uygulanması). İstemci arayüzünün geri kalanı (Faz 4) henüz yoktur: lider olmayan düğüm istemci
+//! isteğini yok sayar ve `Output::ClientResponse` hiç üretilmez.
 //!
 //! Yorumlarda geçen etiketler bu crate'in sözleşme maddeleridir (değişmezler ve kenar durumlar):
 //!
@@ -37,8 +38,10 @@
 //! - **C1:** `Command` baytları olduğu gibi taşır; çekirdek onları hiç yorumlamaz.
 //! - **O1:** `step` çıktıları sırayla yürütülür; bir `Persist`, aynı adımın sonraki tüm
 //!   çıktılarından önce kalıcı hâle getirilmelidir.
-//! - **O2:** Bir adım kalıcı durumu (`currentTerm`/`votedFor`) değiştirdiyse İLK çıktısı, yeni
-//!   durumu taşıyan tek bir `Persist`'tir; değiştirmediyse hiç `Persist` yoktur.
+//! - **O2:** Bir adım kalıcı durumu (`currentTerm`, `votedFor` ya da log) değiştirdiyse İLK
+//!   çıktısı, değişikliği (farkı) taşıyan tek bir `Persist`'tir; değiştirmediyse hiç `Persist`
+//!   yoktur. Farkı diskteki duruma uygulamak (`PersistentState::apply`) tam olarak bellekteki
+//!   durumu verir. Ardından `Send`'ler, en sonda `Apply`'lar gelir.
 //! - **R1:** `Input::Restart` yalnızca diskte kalıcı olan durumu taşır; kurtarma ondan başlar.
 //!   Düğüm Follower olarak açılır ve bu adım hiç çıktı üretmez.
 //! - **T1:** Term asla azalmaz. Daha yüksek term taşıyan herhangi bir mesaj görülünce düğüm o
@@ -49,6 +52,14 @@
 //!   değişmez (§5.2).
 //! - **E2:** Oylar küme olarak sayılır: yalnızca eşlerden ve yalnızca mevcut term'e ait olumlu
 //!   cevaplar; aynı düğümün tekrarlanan oyu bir kez sayılır.
+//! - **L1:** Takipçi log'unu yalnızca gerçek bir çakışmada (aynı index, farklı term) keser;
+//!   gecikmiş ya da tekrarlanmış bir AppendEntries log'u kısaltmaz (§5.3).
+//! - **L2:** Lider, lider olduğu term boyunca kendi log'unu yalnızca uzatır (Leader Append-Only).
+//! - **M1:** commitIndex yalnızca artar. Lider yalnızca kendi term'indeki bir girdiyi kopyalarını
+//!   sayarak commit eder; önceki term'lerin girdileri dolaylı olarak commit olur (§5.4.2, Figure
+//!   8).
+//! - **A1:** Commit edilen girdiler index sırasıyla, her biri bir kez `Apply` olarak verilir;
+//!   yeniden başlatmadan sonra (lastApplied geçici olduğu için) baştan yeniden verilir.
 //!
 //! Aşağıdaki örnek, gerçek bir sürücünün (ör. simülatör) çekirdekle nasıl konuşacağını gösterir:
 //! üç düğümlü bir kümenin bir düğümünü kurar, seçim zaman aşımı dolana kadar `Tick` verir ve dönen
@@ -104,6 +115,7 @@
 
 mod config;
 mod input;
+mod log;
 mod message;
 mod node;
 mod output;
@@ -116,11 +128,12 @@ mod types;
 // message.rs, ...) ileride yeniden düzenlenebilir/bölünebilir; dış API imzası değişmez.
 pub use config::{Config, ConfigError};
 pub use input::Input;
+pub use log::LogEntry;
 pub use message::{
     AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
 };
 pub use node::RaftNode;
 pub use output::{ClientResponse, Output};
-pub use persist::PersistentState;
+pub use persist::{LogUpdate, PersistUpdate, PersistentState};
 pub use role::Role;
 pub use types::{Command, LogIndex, NodeId, Term};

@@ -26,6 +26,21 @@ pub struct Term(pub u64);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LogIndex(pub u64);
 
+impl LogIndex {
+    /// Bir sonraki index. `u64` uzayının sonunda doygun kalır (2^64 girdilik bir log imkânsızdır;
+    /// panik yerine doygunluk, N3).
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Bir önceki index; 0'ın öncesi yine 0'dır ("log'un öncesi").
+    #[must_use]
+    pub const fn prev(self) -> Self {
+        Self(self.0.saturating_sub(1))
+    }
+}
+
 /// İstemcinin durum makinesine uygulanmasını istediği komutun opak bayt gösterimi.
 ///
 /// `raft-core` bu baytların içeriğini asla yorumlamaz/ayrıştırmaz: KV durum makinesi (Put/Delete

@@ -23,7 +23,10 @@ env:
 jobs:
   gates:
     name: Phase gates
-    runs-on: ubuntu-latest
+    # Runner imajı sabit bir sürüme bağlanır: `ubuntu-latest` etiketi zaman zaman yeni bir sürüme
+    # taşınır (ör. Ubuntu 26) ve shellcheck, jq gibi araçların sürümleri habersizce değişebilir.
+    # Sürüm yükseltmek bilinçli bir değişiklik olmalı.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       # Eylem, değiştirilebilir bir sürüm etiketine (v7) değil tam bir commit SHA'sına sabitlenir:

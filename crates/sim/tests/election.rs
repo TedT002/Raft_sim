@@ -1,20 +1,17 @@
-//! Lider seçimi testleri (Faz 2): hatasız ağda tek ve kararlı lider, liderin çökmesi, azınlık
-//! bölünmesi, bölünmüş oylar ve yüzlerce seed'de Election Safety.
+//! Lider seçimi testleri: hatasız ağda tek ve kararlı lider, liderin çökmesi, azınlık bölünmesi,
+//! bölünmüş oylar. Yüzlerce seed'lik kaos taraması `chaos.rs`'tedir.
 //!
-//! Bütün senaryolar `RaftCluster` üzerinden koşar: HER olaydan sonra Election Safety ve
-//! dayanıklılık (disk = bellekteki kalıcı durum) denetlenir. Senaryodaki bir ihlal, testin kendi
-//! iddialarından önce `ClusterError::Violation` olarak yüzeye çıkar.
+//! Bütün senaryolar `RaftCluster` üzerinden koşar: HER olaydan sonra beş güvenlik invariant'ı ve
+//! dayanıklılık (bellek = diske yazdırılan durum) denetlenir. Senaryodaki bir ihlal, testin kendi
+//! iddialarından önce `ClusterError::Violation` olarak yüzeye çıkar. Disk varsayılan ayarlarındadır
+//! (fsync 1..3 tick): oy ve term yazmaları, onlara bağlı mesajları bu kadar geciktirir.
 //!
 //! Testler yalnızca `sim`'in genel API'sini kullanır (raft-core'u doğrudan içe aktarmaz): Faz 5'te
 //! `cli` de bağımlılık yönü gereği yalnızca `sim`'i görecek.
 
-use std::collections::BTreeSet;
 use std::ops::Range;
 
-use sim::{
-    ChaCha8Rng, ClusterError, Component, NetworkConfig, NodeId, RaftCluster, RaftConfig, Role,
-    SeedTree, Term, chance, uniform_inclusive,
-};
+use sim::{ClusterConfig, NetworkConfig, NodeId, RaftCluster, Role, Term};
 
 /// Seçim zaman aşımı tabanı (`RaftConfig::default()`): zaman aşımları `[T, 2T)` tick.
 const T: u64 = 20;
@@ -29,7 +26,7 @@ const JITTERY: NetworkConfig = NetworkConfig {
 };
 
 fn cluster(seed: u64, size: u64, network: NetworkConfig) -> RaftCluster {
-    RaftCluster::new(seed, size, network, RaftConfig::default()).expect("valid config")
+    RaftCluster::new(seed, ClusterConfig::new(size, network)).expect("valid config")
 }
 
 /// Başarısız bir seed'in bağlamı: seed (ve varsa ayrıntı) ile tek satırlık yeniden üretme komutu.
@@ -253,7 +250,7 @@ fn a_partitioned_leader_is_replaced_by_the_majority() {
 // Bölünmüş oylar rastgele zaman aşımlarıyla çözülür. 4 düğümlü kümede (çoğunluk 3) değişken
 // gecikmeli bir ağda iki aday oyları ikişer ikişer bölüşebilir. Bu, en az iki adayın görüldüğü ama
 // kimsenin kazanamadığı bir term'dir. Taramada bölünmüş oylar yeterince sık görülmeli (senaryo
-// gerçekten sınanıyor; ölçülen: 100 seed'in 20'si) ve her seed'de küme sonunda tek bir lidere
+// gerçekten sınanıyor; ölçülen: 100 seed'in 23'ü) ve her seed'de küme sonunda tek bir lidere
 // ulaşmalı. Adayların zaman aşımları her turda yeniden çekildiği için bölünme kendini sonsuza dek
 // tekrarlamaz.
 #[test]
@@ -278,192 +275,4 @@ fn split_votes_are_resolved_by_randomized_timeouts() {
         seeds_with_a_split.len() >= 5,
         "the sweep must exercise split votes, saw them only for seeds {seeds_with_a_split:?}"
     );
-}
-
-/// Kaos taramasının ağı: arada bir kayıp ve çoğaltma, 1..5 tick gecikme.
-const CHAOS_NETWORK: NetworkConfig = NetworkConfig {
-    drop_prob: 0.05,
-    duplicate_prob: 0.05,
-    min_delay: 1,
-    max_delay: 5,
-};
-/// Taranan seed'ler.
-const CHAOS_SEEDS: Range<u64> = 0..200;
-/// Hataların enjekte edildiği süre (tick).
-const CHAOS_UNTIL: u64 = 1_200;
-/// Hatalar bittikten sonra kümenin toparlanmasına verilen süre (tick).
-const SETTLE: u64 = 25 * T;
-
-/// Bir kaos koşusunun özeti: taramanın gerçekten bir şeyleri sınadığını gösteren sayaçlar ve
-/// koşunun kimliği olan trace özeti.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ChaosStats {
-    crashes: u64,
-    restarts: u64,
-    partitions: u64,
-    terms_with_a_leader: usize,
-    trace_hash: u64,
-}
-
-/// `items` içinden rastgele biri. Her çağrıda TAM OLARAK bir çekiliş yapılır (liste boş olsa
-/// bile): hata programının çekiliş sayısı küme durumuna göre değişmesin.
-fn pick(rng: &mut ChaCha8Rng, items: &[NodeId]) -> Option<NodeId> {
-    let draw = uniform_inclusive(rng, 0, u64::MAX);
-    let len = u64::try_from(items.len()).ok()?;
-    let index = usize::try_from(draw.checked_rem(len)?).ok()?;
-    items.get(index).copied()
-}
-
-/// Bir seed'in kaos koşusu: rastgele çökme, yeniden başlatma, bölünme ve iyileşme. Her olaydan
-/// sonra invariant'lar denetlenir. Sonda herkes ayağa kalkar, ağ iyileşir ve küme yeniden tek bir
-/// lidere yakınsamalıdır (canlılık).
-///
-/// Hata programı kendi alt-seed akışından gelir (`Component::Scenario`): ağın ve düğümlerin
-/// akışlarından bağımsızdır, aynı seed her zaman aynı programı üretir.
-fn chaos_run(seed: u64) -> Result<ChaosStats, String> {
-    let mut cluster = RaftCluster::new(seed, 5, CHAOS_NETWORK, RaftConfig::default())
-        .map_err(|error| error.to_string())?;
-    let mut faults = SeedTree::new(seed).rng_for(Component::Scenario);
-    let all = ids(1..6);
-    let mut stats = ChaosStats::default();
-    let violation = |error: ClusterError| error.to_string();
-
-    let mut now = 0;
-    while now < CHAOS_UNTIL {
-        now += uniform_inclusive(&mut faults, 5, 40);
-        cluster.run_until(now).map_err(violation)?;
-        let up: Vec<NodeId> = all
-            .iter()
-            .copied()
-            .filter(|&id| cluster.is_up(id))
-            .collect();
-        let down: Vec<NodeId> = all
-            .iter()
-            .copied()
-            .filter(|&id| !cluster.is_up(id))
-            .collect();
-        match uniform_inclusive(&mut faults, 0, 9) {
-            0..=2 => {
-                if let Some(id) = pick(&mut faults, &up) {
-                    cluster.crash(id).map_err(violation)?;
-                    stats.crashes += 1;
-                }
-            }
-            3..=5 => {
-                if let Some(id) = pick(&mut faults, &down) {
-                    cluster.restart(id).map_err(violation)?;
-                    stats.restarts += 1;
-                }
-            }
-            6 | 7 => {
-                let (left, right): (Vec<NodeId>, Vec<NodeId>) =
-                    all.iter().partition(|_| chance(&mut faults, 0.5));
-                cluster.partition(&[&left, &right]).map_err(violation)?;
-                stats.partitions += 1;
-            }
-            8 => cluster.heal(),
-            _ => {}
-        }
-    }
-
-    cluster.heal();
-    let down: Vec<NodeId> = all
-        .iter()
-        .copied()
-        .filter(|&id| !cluster.is_up(id))
-        .collect();
-    for id in down {
-        cluster.restart(id).map_err(violation)?;
-    }
-    // Canlılık: son 5T içinde en az bir anda küme yakınsamış olmalı (tam olarak bir lider var ve
-    // herkes onun term'inde). Tek bir an yeterli sayılır, çünkü kayıplı ağda arka arkaya kaybolan
-    // heartbeat'ler tam sonda kısa bir seçime denk gelebilir; bu bir hata değildir.
-    let settle_end = cluster.now() + SETTLE;
-    let mut converged = false;
-    for time in settle_end - 5 * T..=settle_end {
-        cluster.run_until(time).map_err(violation)?;
-        if let [(_, term)] = cluster.leaders()[..] {
-            converged |= all.iter().all(|&id| {
-                cluster
-                    .node(id)
-                    .is_some_and(|node| node.current_term() == term)
-            });
-        }
-    }
-    if !converged {
-        return Err(format!(
-            "liveness: the cluster did not converge on a single leader during the last {} ticks \
-             after healing and restarting every node",
-            5 * T
-        ));
-    }
-    stats.terms_with_a_leader = cluster
-        .elections()
-        .values()
-        .filter(|election| election.leader.is_some())
-        .count();
-    stats.trace_hash = cluster.sim().trace_hash();
-    Ok(stats)
-}
-
-// Yüzlerce seed'de Election Safety: her seed kayıplı ve çoğaltmalı bir ağda rastgele çökme, yeniden
-// başlatma, bölünme ve iyileşme yaşar; HER olaydan sonra Election Safety ve dayanıklılık
-// denetlenir. Sonda küme yeniden tek bir lidere yakınsamalıdır. Başarısız her seed, seed numarası
-// ve tek satırlık bir yeniden üretme komutuyla raporlanır (koşu deterministiktir: aynı komut aynı
-// hatayı aynı olayda verir; bkz. `the_chaos_schedule_is_reproducible`).
-#[test]
-fn election_safety_holds_across_hundreds_of_seeds() {
-    let mut failures = Vec::new();
-    let mut totals = ChaosStats::default();
-    for seed in CHAOS_SEEDS {
-        match chaos_run(seed) {
-            Ok(stats) => {
-                totals.crashes += stats.crashes;
-                totals.restarts += stats.restarts;
-                totals.partitions += stats.partitions;
-                totals.terms_with_a_leader += stats.terms_with_a_leader;
-            }
-            Err(error) => failures.push((seed, error)),
-        }
-    }
-    if !failures.is_empty() {
-        let report: Vec<String> = failures
-            .iter()
-            .take(5)
-            .map(|(seed, error)| {
-                format!(
-                    "seed {seed}: {error}\n  reproduce: cargo test -p sim --test election -- \
-                     election_safety_holds_across_hundreds_of_seeds --exact\n  replay (from \
-                     phase 5): cargo run -p cli -- replay --seed {seed}"
-                )
-            })
-            .collect();
-        panic!(
-            "{} of {} seeds failed:\n{}",
-            failures.len(),
-            CHAOS_SEEDS.count(),
-            report.join("\n")
-        );
-    }
-    // Tarama boş geçmemeli: hatalar gerçekten enjekte edildi ve seçimler gerçekten yapıldı. Eşikler
-    // ölçülen değerlerin (2881 çökme, 2401 yeniden başlatma, 2168 bölünme, liderli 1221 term) çok
-    // altındadır.
-    let seeds = CHAOS_SEEDS.count();
-    assert!(totals.crashes >= seeds as u64, "{totals:?}");
-    assert!(totals.restarts >= seeds as u64, "{totals:?}");
-    assert!(totals.partitions >= seeds as u64, "{totals:?}");
-    assert!(totals.terms_with_a_leader >= 2 * seeds, "{totals:?}");
-}
-
-// Taramanın hata programı seed'e bağlıdır ve tekrarlanabilir: aynı seed iki kez koşulunca aynı
-// sayaçlar ve aynı trace özeti çıkar (olay olay aynı koşu). Farklı seed'ler farklı koşular üretir.
-#[test]
-fn the_chaos_schedule_is_reproducible() {
-    let first = chaos_run(7).expect("seed 7 passes");
-    let second = chaos_run(7).expect("seed 7 passes");
-    assert_eq!(first, second);
-    let hashes: BTreeSet<u64> = (0..5)
-        .map(|seed| chaos_run(seed).expect("seed passes").trace_hash)
-        .collect();
-    assert_eq!(hashes.len(), 5, "{hashes:?}");
 }

@@ -10,8 +10,9 @@
 #![allow(dead_code)]
 
 use sim::{
-    ChaCha8Rng, Component, DropReason, NetworkConfig, NodeId, NodeInput, NodeOutput, SeedTree,
-    SimConfig, SimNetwork, SimNode, Simulation, TraceEncode, TraceKind, uniform_inclusive,
+    ChaCha8Rng, Component, DropReason, InputOf, NetworkConfig, NodeId, NodeInput, NodeOutput,
+    OutputOf, SeedTree, SimConfig, SimNetwork, SimNode, Simulation, TraceEncode, TraceKind,
+    uniform_inclusive,
 };
 
 /// Ping/Pong mesajları. `nonce`, gönderenin her Ping'e verdiği artan numaradır.
@@ -73,10 +74,13 @@ impl PingPongNode {
 
 impl SimNode for PingPongNode {
     type Msg = PingPong;
-    // Ping/Pong'un kalıcı durumu yoktur; yeniden başlatmada yapacak bir şeyi de yok.
+    // Ping/Pong'un kalıcı durumu yoktur; yeniden başlatmada yapacak bir şeyi de yok. İstemcisi ve
+    // durum makinesi de yoktur.
     type Durable = ();
+    type Request = ();
+    type Applied = ();
 
-    fn step(&mut self, input: NodeInput<PingPong, ()>) -> Vec<NodeOutput<PingPong, ()>> {
+    fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
         match input {
             NodeInput::Tick => {
                 let Some(last) = self.peers.len().checked_sub(1) else {
@@ -108,7 +112,7 @@ impl SimNode for PingPongNode {
                 self.pongs_received += 1;
                 Vec::new()
             }
-            NodeInput::Restart(()) => Vec::new(),
+            NodeInput::Restart(()) | NodeInput::Client(()) => Vec::new(),
         }
     }
 }

@@ -20,11 +20,12 @@
 //! - **Makineler:** her düğümün bir diski vardır (`Persist` ile yazılır). Düğüm çökebilir ve
 //!   diskindeki durumla yeniden başlatılabilir (`Simulation::crash`/`Simulation::restart`); çökmüş
 //!   düğüm tick almaz, ona gelen mesajlar düşer.
-//! - **Raft adaptörü** ([`RaftCluster`]): her olaydan sonra Election Safety ve dayanıklılık (disk
-//!   = bellekteki kalıcı durum) denetimi.
-//!
-//! Sonraki fazda eklenecek: `fsync` olana kadar "beklemede" kalan, çökmede kaybolabilen
-//! yazmalarıyla simüle disk (Faz 3). Faz 2'de disk anında kalıcıdır.
+//! - **Disk** ([`SimDisk`]): yazmalar `fsync` tamamlanana kadar bekler; bir yazmadan sonraki
+//!   çıktılar (mesajlar, uygulamalar) o yazma kalıcı olana kadar tutulur. Çökme bekleyen yazmaları
+//!   kaybettirir, istenirse bir öneklerini diske ulaştırır ("kısmen yazılır").
+//! - **Raft adaptörü** ([`RaftCluster`]): istemci komutları ([`KvCommand`]), düğüm başına KV
+//!   durum makinesi ([`KvStore`]) ve her olaydan sonra Figure 3'ün beş güvenlik özelliğiyle
+//!   dayanıklılık (bellek = diske yazdırılan durum) denetimi.
 //!
 //! Bu crate `raft-core`'a ve `checker`'a bağımlıdır (bağımlılık yönü: `sim -> raft-core`,
 //! `sim -> checker`); tersi asla olmaz. Sans-IO çekirdek hiçbir workspace crate'ini bilmemelidir.
@@ -34,8 +35,8 @@
 //! ```
 //! use raft_core::NodeId;
 //! use sim::{
-//!     Component, NetworkConfig, NodeInput, NodeOutput, SeedTree, SimConfig, SimNetwork, SimNode,
-//!     Simulation, TraceEncode,
+//!     Component, InputOf, NetworkConfig, NodeInput, NodeOutput, OutputOf, SeedTree, SimConfig,
+//!     SimNetwork, SimNode, Simulation, TraceEncode,
 //! };
 //!
 //! #[derive(Debug, Clone)]
@@ -53,13 +54,18 @@
 //!
 //! impl SimNode for Greeter {
 //!     type Msg = Hello;
-//!     // Kalıcı durumu yok: çöküp kalktığında hatırlayacağı bir şey de yok.
+//!     // Kalıcı durumu yok: çöküp kalktığında hatırlayacağı bir şey de yok. İstemcisi ve
+//!     // durum makinesi de yok.
 //!     type Durable = ();
+//!     type Request = ();
+//!     type Applied = ();
 //!
-//!     fn step(&mut self, input: NodeInput<Hello, ()>) -> Vec<NodeOutput<Hello, ()>> {
+//!     fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
 //!         match input {
 //!             NodeInput::Tick => vec![NodeOutput::Send { to: self.peer, msg: Hello }],
-//!             NodeInput::Message { .. } | NodeInput::Restart(()) => Vec::new(),
+//!             NodeInput::Message { .. } | NodeInput::Restart(()) | NodeInput::Client(()) => {
+//!                 Vec::new()
+//!             }
 //!         }
 //!     }
 //! }
@@ -87,8 +93,10 @@
 // Doctest'ler de uyarısız olmalı (clippy doctest'leri görmez).
 #![doc(test(attr(deny(warnings))))]
 
+mod disk;
 mod error;
 mod fnv;
+mod kv;
 mod network;
 mod node;
 mod queue;
@@ -100,20 +108,25 @@ mod trace;
 // Genel API düz (flat) olarak kökten dışa aktarılır; modüller ileride yeniden düzenlenebilir.
 // `NodeId` burada da dışa aktarılır: sim'i kullanan crate'ler (ör. Faz 5'te `cli`) düğüm
 // kimliklerine raft-core'a doğrudan bağımlı olmadan ulaşabilsin.
+pub use disk::{DiskConfig, SimDisk};
 pub use error::{ConfigError, LifecycleError, PartitionError};
 pub use fnv::{Fnv1a64, fnv1a64};
+pub use kv::{KvCommand, KvDecodeError, KvStore};
 pub use network::{Fate, Network, NetworkConfig, SimNetwork};
-pub use node::{NodeInput, NodeOutput, SimNode};
+pub use node::{DurableState, InputOf, NodeInput, NodeOutput, OutputOf, SimNode, UpdateOf};
 pub use queue::{EventQueue, Scheduled};
-pub use raft::{ClusterError, Election, RaftCluster, Violation};
+pub use raft::{
+    AppliedEntry, ClusterConfig, ClusterError, DurabilityMismatch, Election, RaftCluster, Violation,
+};
 pub use raft_core::NodeId;
 // `RaftCluster`'ın genel API'sinde görünen raft-core tipleri de aynı gerekçeyle buradan dışa
 // aktarılır. Bağımlılık yönü gereği `cli` raft-core'u göremez (cli -> sim); Faz 5'te kümeyi
 // kurabilmeli (`RaftConfig`) ve sonuçlarını adlandırabilmelidir (`Term`, `Role`, ...). `Config` ve
 // `ConfigError` takma adla verilir: sim'in kendi `ConfigError`'ıyla karışmasınlar.
 pub use raft_core::{
-    Config as RaftConfig, ConfigError as RaftConfigError, PersistentState, RaftNode, Role, Term,
+    Command, Config as RaftConfig, ConfigError as RaftConfigError, LogEntry, LogIndex, LogUpdate,
+    PersistUpdate, PersistentState, RaftNode, Role, Term,
 };
 pub use rng::{ChaCha8Rng, Component, SeedTree, chance, uniform_inclusive};
-pub use simulation::{HostView, SimConfig, Simulation};
+pub use simulation::{HostView, SimConfig, SimOptions, Simulation, TickOrder};
 pub use trace::{DropReason, Trace, TraceEncode, TraceEvent, TraceKind, digest};

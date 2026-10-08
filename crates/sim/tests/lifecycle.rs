@@ -3,8 +3,9 @@
 mod support;
 
 use sim::{
-    Component, DropReason, LifecycleError, NetworkConfig, NodeId, NodeInput, NodeOutput, SeedTree,
-    SimConfig, SimNetwork, SimNode, Simulation, TraceEncode, TraceKind, digest,
+    Component, DropReason, DurableState, InputOf, LifecycleError, NetworkConfig, NodeId, NodeInput,
+    NodeOutput, OutputOf, SeedTree, SimConfig, SimNetwork, SimNode, Simulation, TraceEncode,
+    TraceKind, digest,
 };
 use support::{PingPongSim, cluster, deliveries, drops};
 
@@ -156,11 +157,22 @@ struct Journal {
     restarted_with: Vec<u64>,
 }
 
+/// Sayacın diskteki hâli: her yazma yeni değeri bütünüyle taşır.
+impl DurableState for Count {
+    type Update = Count;
+
+    fn apply(&mut self, update: &Count) {
+        *self = update.clone();
+    }
+}
+
 impl SimNode for Journal {
     type Msg = Count;
     type Durable = Count;
+    type Request = ();
+    type Applied = ();
 
-    fn step(&mut self, input: NodeInput<Count, Count>) -> Vec<NodeOutput<Count, Count>> {
+    fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
         match input {
             NodeInput::Tick => {
                 self.count += 1;
@@ -170,7 +182,7 @@ impl SimNode for Journal {
                     Vec::new()
                 }
             }
-            NodeInput::Message { .. } => Vec::new(),
+            NodeInput::Message { .. } | NodeInput::Client(()) => Vec::new(),
             NodeInput::Restart(Count(count)) => {
                 self.count = count;
                 self.restarted_with.push(count);

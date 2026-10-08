@@ -6,8 +6,8 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sim::{
-    Component, DropReason, NodeId, RaftCluster, RaftConfig, SeedTree, TraceEvent, TraceKind,
-    uniform_inclusive,
+    ClusterConfig, Component, DropReason, KvCommand, NodeId, RaftCluster, SeedTree, TraceEvent,
+    TraceKind, uniform_inclusive,
 };
 use support::{LOSSY, cluster, cluster_with_ghost_peers, cluster_with_network_rng, count_drops};
 
@@ -133,14 +133,36 @@ fn golden_trace_hash_is_stable() {
     );
 }
 
-/// Sabit bir Raft senaryosu: 5 düğüm kayıplı ağda; 80. tick'te düğüm 2 çöker, 120'de ağ {1,3} |
-/// {4,5} diye bölünür (düğüm 2 kapalı ve hiçbir grupta değil), 200'de iyileşir, 220'de düğüm 2
-/// yeniden başlar, koşu 400'e kadar sürer. Her olaydan sonra invariant'lar denetlenir.
+/// Ayaktaki lidere (birden fazla varsa en yüksek term'liye) KV komutları verir ve lideri döndürür;
+/// lider yoksa hiçbir şey yapmaz.
+fn submit_to_leader(cluster: &mut RaftCluster, keys: &[&str]) -> Option<NodeId> {
+    let (leader, _) = cluster
+        .leaders()
+        .into_iter()
+        .max_by_key(|&(_, term)| term)?;
+    for key in keys {
+        let command = KvCommand::Put {
+            key: key.as_bytes().to_vec(),
+            value: b"v".to_vec(),
+        };
+        cluster.submit(leader, command).expect("no violation");
+    }
+    Some(leader)
+}
+
+/// Sabit bir Raft senaryosu: 5 düğüm kayıplı ağda ve varsayılan diskle (fsync 1..3 tick). 60.
+/// tick'te lidere üç komut verilir. 80'de lidere bir komut daha verilir ve lider, o komutun yazması
+/// fsync'i beklerken çöker (bekleyen yazma ve tutulan mesajlar kaybolur). 120'de ağ {1,3} | {4,5}
+/// diye bölünür, 200'de iyileşir, 220'de çökmüş düğümler yeniden başlar, 300'de iki komut daha
+/// verilir ve koşu 400'e kadar sürer. Her olaydan sonra invariant'lar denetlenir.
 fn raft_scenario(seed: u64) -> RaftCluster {
-    let mut cluster =
-        RaftCluster::new(seed, 5, LOSSY, RaftConfig::default()).expect("valid config");
+    let mut cluster = RaftCluster::new(seed, ClusterConfig::new(5, LOSSY)).expect("valid config");
+    cluster.run_until(60).expect("no violation");
+    let _ = submit_to_leader(&mut cluster, &["a", "b", "c"]);
     cluster.run_until(80).expect("no violation");
-    cluster.crash(NodeId(2)).expect("node 2 is up");
+    if let Some(leader) = submit_to_leader(&mut cluster, &["d"]) {
+        cluster.crash(leader).expect("the leader is up");
+    }
     cluster.run_until(120).expect("no violation");
     cluster
         .partition(&[&[NodeId(1), NodeId(3)], &[NodeId(4), NodeId(5)]])
@@ -148,7 +170,13 @@ fn raft_scenario(seed: u64) -> RaftCluster {
     cluster.run_until(200).expect("no violation");
     cluster.heal();
     cluster.run_until(220).expect("no violation");
-    cluster.restart(NodeId(2)).expect("node 2 is down");
+    for id in (1..=5).map(NodeId) {
+        if !cluster.is_up(id) {
+            cluster.restart(id).expect("the node is down");
+        }
+    }
+    cluster.run_until(300).expect("no violation");
+    let _ = submit_to_leader(&mut cluster, &["e", "f"]);
     cluster.run_until(400).expect("no violation");
     cluster
 }
@@ -172,16 +200,22 @@ fn raft_runs_are_deterministic() {
 // Değişiklik bilinçliyse değer bilinçli olarak güncellenir (yayımlanmış seed'ler artık başka
 // koşular üretir).
 //
-// Senaryo Faz 2'nin yeni trace olaylarının hepsine dokunur: Persist, Crash, Restart ve kapalı
-// düğüme giden mesajların düşüşü (NodeDown).
+// Senaryo Faz 2 ve Faz 3'ün trace olaylarının hepsine dokunur: yazma (Persist) ve fsync (Sync),
+// çökme ve çökmenin kaybettirdikleri (CrashLoss), yeniden başlatma, kapalı düğüme giden mesajların
+// düşüşü (NodeDown), istemci komutları (Client) ve uygulamalar (Apply). Komutlar commit edilip
+// uygulanmış olmalı: aksi hâlde senaryo log replikasyonunu sabitlemezdi.
 #[test]
 fn golden_raft_trace_hash_is_stable() {
     let cluster = raft_scenario(1);
     let events = cluster.sim().trace().events();
     let has = |wanted: fn(&TraceEvent) -> bool| events.iter().any(wanted);
     assert!(has(|e| matches!(e.kind, TraceKind::Persist { .. })));
+    assert!(has(|e| matches!(e.kind, TraceKind::Sync { .. })));
     assert!(has(|e| matches!(e.kind, TraceKind::Crash { .. })));
+    assert!(has(|e| matches!(e.kind, TraceKind::CrashLoss { .. })));
     assert!(has(|e| matches!(e.kind, TraceKind::Restart { .. })));
+    assert!(has(|e| matches!(e.kind, TraceKind::Client { .. })));
+    assert!(has(|e| matches!(e.kind, TraceKind::Apply { .. })));
     assert!(has(|e| matches!(
         e.kind,
         TraceKind::Drop {
@@ -190,10 +224,10 @@ fn golden_raft_trace_hash_is_stable() {
         }
     )));
     assert!(!cluster.elections().is_empty());
-    assert_eq!(cluster.sim().trace().len(), 3298);
+    assert_eq!(cluster.sim().trace().len(), 3366);
     assert_eq!(
         cluster.sim().trace_hash(),
-        0x105e_a8b0_6ce0_ae32,
+        0x0810_0570_05c8_1a9a,
         "trace hash of the pinned Raft scenario changed"
     );
 }

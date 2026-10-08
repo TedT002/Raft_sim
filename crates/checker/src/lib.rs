@@ -3,13 +3,14 @@
 //! Bu crate, bir simülasyon koşusunun Raft'ın güvenlik özelliklerini (Election Safety, Leader
 //! Append-Only, Log Matching, Leader Completeness, State Machine Safety) ve istemci geçmişinin
 //! linearizability'sini (Wing & Gong yaklaşımı, KV modeli üzerinde) ihlal edip etmediğini
-//! bağımsız biçimde denetler. Şu an (Faz 2) yalnızca [`ElectionSafety`] vardır; log invariant'ları
-//! Faz 3'te, linearizability kontrolcüsü Faz 4'te eklenecek.
+//! bağımsız biçimde denetler. Şu an (Faz 3) Figure 3'ün beş güvenlik özelliğinin hepsi vardır:
+//! [`ElectionSafety`], [`LeaderAppendOnly`], [`LogMatching`], [`LeaderCompleteness`] ve
+//! [`StateMachineSafety`]. Linearizability kontrolcüsü Faz 4'te eklenecek.
 //!
 //! **Kasıtlı olarak `raft-core`'a bağımlı DEĞİLDİR.** Bir "kâhin" (oracle) her zaman denetlediği
 //! uygulamadan bağımsız tipler ve mantık üzerinde çalışmalıdır: `checker` düz değerlerle (ör. term
-//! ve düğüm kimliği için `u64`) ve kendi nötr görünüm (view) tipleriyle çalışır (ör. ileride bir
-//! düğümün log'unun basit bir izdüşümü).
+//! ve düğüm kimliği için `u64`) ve kendi nötr görünüm (view) tipleriyle çalışır (ör. bir düğümün
+//! log girdisinin basit bir izdüşümü olan [`EntryView`]).
 //! Eğer `checker`, `raft-core`'un tiplerini doğrudan kullansaydı, `raft-core`'daki bir tasarım
 //! hatası (ör. yanlış bir alan) hem uygulamaya hem denetleyiciye aynen sızabilir ve invariant
 //! testleri o hatayı yakalayamayabilirdi.
@@ -19,7 +20,17 @@
 // Doctest'ler de uyarısız olmalı (clippy doctest'leri görmez).
 #![doc(test(attr(deny(warnings))))]
 
+mod append_only;
+mod completeness;
 mod election;
+mod log_matching;
+mod state_machine;
+mod view;
 
 // Genel API düz (flat) olarak kökten dışa aktarılır; modüller ileride yeniden düzenlenebilir.
+pub use append_only::{LeaderAppendOnly, LeaderAppendOnlyViolation};
+pub use completeness::{LeaderCompleteness, LeaderCompletenessViolation};
 pub use election::{ElectionSafety, ElectionSafetyViolation};
+pub use log_matching::{LogMatching, LogMatchingViolation};
+pub use state_machine::{StateMachineSafety, StateMachineSafetyViolation};
+pub use view::EntryView;

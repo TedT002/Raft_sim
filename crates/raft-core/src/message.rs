@@ -1,5 +1,6 @@
 //! Düğümler arası protokol mesajları: Raft makalesinin Figure 2'sindeki RPC'ler.
 
+use crate::log::LogEntry;
 use crate::types::{LogIndex, Term};
 
 /// İki düğüm arasında değiş tokuş edilen Raft RPC'si.
@@ -20,12 +21,13 @@ pub enum Message {
     /// §5.2: `RequestVote`'a verilen cevap: `term` ve `voteGranted` (Figure 2).
     RequestVoteResponse(RequestVoteResponse),
     /// §5.3: Lider, log girdilerini çoğaltmak için gönderir; girdisi boş olanı heartbeat'tir
-    /// (§5.2). Faz 2'de yalnızca heartbeat vardır.
+    /// (§5.2).
     AppendEntries(AppendEntries),
     /// §5.3: `AppendEntries`'e verilen cevap: `term` ve `success` (heartbeat cevabı: cevapta daha
-    /// yüksek bir term gören lider Follower'a düşer, §5.1). Faz 3'te ek olarak kabul edilen son log
-    /// index'ini taşıması planlanıyor: mesajlar çoğaltılıp gecikebildiği için bir cevap, hangi
-    /// isteğe ait olduğu bilinerek eşlenemez (Figure 2'de yalnızca `term` ve `success` vardır).
+    /// yüksek bir term gören lider Follower'a düşer, §5.1). Figure 2'de yalnızca `term` ve
+    /// `success` vardır; ek olarak bir index taşır (bkz. `AppendEntriesResponse::match_index`):
+    /// mesajlar çoğaltılıp gecikebildiği için bir cevap, hangi isteğe ait olduğu bilinerek
+    /// eşlenemez.
     AppendEntriesResponse(AppendEntriesResponse),
 }
 
@@ -65,21 +67,40 @@ pub struct RequestVoteResponse {
     pub vote_granted: bool,
 }
 
-/// `AppendEntries` argümanları (Figure 2). Faz 2'de yalnızca girdisiz heartbeat gönderilir;
-/// `prevLogIndex`, `prevLogTerm`, `entries[]` ve `leaderCommit` log replikasyonuyla (Faz 3)
-/// gelecek.
+/// `AppendEntries` argümanları (Figure 2). Girdisi boş olanı heartbeat'tir (§5.2); tutarlılık
+/// denetimi (`prev_log_index`/`prev_log_term`) ve commit bilgisi (`leader_commit`) heartbeat'te de
+/// taşınır.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendEntries {
     /// Liderin term'i.
     pub term: Term,
+    /// Yeni girdilerden hemen önceki girdinin index'i (boş log için 0).
+    pub prev_log_index: LogIndex,
+    /// `prev_log_index`'teki girdinin term'i. Takipçi, kendi log'unda bu (index, term) çiftini
+    /// bulamazsa isteği reddeder; Log Matching özelliği bu tümevarımsal denetime dayanır (§5.3).
+    pub prev_log_term: Term,
+    /// Eklenecek girdiler (heartbeat'te boş). Verimlilik için bir mesajda birden fazla girdi
+    /// gönderilebilir.
+    pub entries: Vec<LogEntry>,
+    /// Liderin `commitIndex`'i: takipçi, kendi commitIndex'ini buna göre ilerletir.
+    pub leader_commit: LogIndex,
 }
 
-/// `AppendEntries` cevabı (Figure 2).
+/// `AppendEntries` cevabı (Figure 2'deki `term` ve `success`, ek olarak `match_index`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendEntriesResponse {
     /// Cevaplayanın güncel term'i: eski bir lider bunu görüp Follower'a döner.
     pub term: Term,
-    /// İstek kabul edildi mi? Faz 2'de yalnızca term'e bağlıdır (eski term'li istek reddedilir);
-    /// log tutarlılık kontrolü (`prevLogIndex`/`prevLogTerm`) Faz 3'te eklenecek.
+    /// İstek kabul edildi mi? Term eskiyse ya da `prev_log_index`'te `prev_log_term`'lü bir girdi
+    /// yoksa hayır.
     pub success: bool,
+    /// Takipçinin log'unun liderinkiyle eşleşmesine dair bir index.
+    ///
+    /// - Başarılıysa: eşleşmenin KESİN olduğu son index (`prev_log_index + entries.len()`). Lider
+    ///   bunu doğrudan `matchIndex` yapar; cevap isteği yeniden göndermeye gerek kalmadan anlatır.
+    /// - Başarısızsa: eşleşmenin OLABİLECEĞİ en büyük index (takipçinin son index'i, en fazla
+    ///   `prev_log_index - 1`). Lider `nextIndex`'i birer birer azaltmak yerine bir hamlede buraya
+    ///   çeker; geride kalmış bir takipçi yüzlerce tur yerine tek turda yakalanır. Bu, §5.3'ün
+    ///   sonunda anlatılan iyileştirmenin basit bir hâlidir.
+    pub match_index: LogIndex,
 }

@@ -1,28 +1,40 @@
 //! Sans-IO Raft düğümü: tek genel API `step(Input) -> Vec<Output>`.
 //!
-//! Faz 2 kapsamı lider seçimidir (§5.2): roller, term'ler, rastgele seçim zaman aşımı, oy verme
-//! (seçim kısıtı dahil, §5.4.1), heartbeat ve çökme sonrası yeniden başlatma. Log replikasyonu
-//! (Faz 3) ve istemci arayüzü (Faz 4) henüz yoktur.
+//! Kapsam: lider seçimi (§5.2, seçim kısıtı §5.4.1), log replikasyonu (§5.3), commit kuralı
+//! (§5.4.2), commit edilen girdilerin sırayla uygulanması ve çökme sonrası yeniden başlatma.
+//! İstemci arayüzünün geri kalanı (Faz 4: `NotLeader` cevabı, tekrarlanan isteklerin ayıklanması,
+//! liderliğin başında no-op girdi) henüz yoktur.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
 use crate::config::Config;
 use crate::input::Input;
+use crate::log::{Log, LogEntry};
 use crate::message::{
     AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
 };
 use crate::output::Output;
-use crate::persist::PersistentState;
+use crate::persist::{PersistUpdate, PersistentState};
 use crate::role::Role;
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{Command, LogIndex, NodeId, Term};
 
 /// Bir adımda gönderilecek mesajlar, üretildikleri sırayla. İşleyiciler yalnızca buraya yazar;
 /// `Persist` kararını `step` tek bir yerde verir (O2). Böylece hiçbir işleyici `Persist`'i yanlış
 /// yere koyamaz ya da unutamaz.
 type Outbox = Vec<(NodeId, Message)>;
+
+/// Liderin bir takipçi için tuttuğu ilerleme (Figure 2, "Volatile state on leaders"). Her seçimden
+/// sonra yeniden kurulur; lider olmayan bir düğümde boştur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Progress {
+    /// O takipçiye gönderilecek bir sonraki girdinin index'i (`nextIndex`).
+    next_index: LogIndex,
+    /// O takipçinin log'unun liderinkiyle eşleştiği bilinen en yüksek index (`matchIndex`).
+    match_index: LogIndex,
+}
 
 /// Bir Raft düğümünün durum makinesi.
 ///
@@ -47,22 +59,32 @@ pub struct RaftNode {
     // adımın bütün `Send`'lerinden önce tek bir `Output::Persist` ile diske yazdırılır (O1, O2).
     current_term: Term,
     voted_for: Option<NodeId>,
+    log: Log,
 
     // --- Geçici durum: çökmede kaybolur, `Restart` onu sıfırdan kurar (R1).
     role: Role,
     // Bu term'deki adaylıkta oy veren düğümler (kendisi dahil). Sayaç değil küme: aynı düğümün
     // çoğaltılmış ya da tekrarlanmış cevabı iki kez sayılmasın (E2).
     votes: BTreeSet<NodeId>,
+    // Commit edildiği bilinen en yüksek index ve durum makinesine uygulanmış en yüksek index
+    // (Figure 2, "Volatile state on all servers"). İkisi de yalnızca artar; yeniden başlatmada
+    // 0'dan başlar. Commit bilgisi kaybolmaz: lider onu bir sonraki AppendEntries'le yeniden
+    // bildirir.
+    commit_index: LogIndex,
+    last_applied: LogIndex,
     // Son sıfırlamadan bu yana geçen tick sayısı ve bu tur için çekilen zaman aşımı. Lider bu
     // sayacı işletmez (liderin seçim zaman aşımı yoktur).
     election_elapsed: u64,
     election_timeout: u64,
     // Liderin son heartbeat'ten bu yana geçen tick sayısı.
     heartbeat_elapsed: u64,
+    // Lider olunan term'de her takipçinin ilerlemesi. BTreeMap: takipçiler her koşuda aynı sırayla
+    // gezilir.
+    progress: BTreeMap<NodeId, Progress>,
 }
 
 impl RaftNode {
-    /// Yeni bir düğüm oluşturur: boş diskle ilk kez açılan bir Follower (term 0, oy yok).
+    /// Yeni bir düğüm oluşturur: boş diskle ilk kez açılan bir Follower (term 0, oy yok, boş log).
     ///
     /// N1: `id`, `peers` kümesinde varsa çıkarılır ("kendi kendinin eşi olamaz"). Gerekçe: çoğunluk
     /// sayımı `peers().len() + 1` (kendisi + eşler) biçiminde yapılır; `peers` içinde yanlışlıkla
@@ -95,18 +117,27 @@ impl RaftNode {
         state: PersistentState,
     ) -> Self {
         let election_timeout = draw_election_timeout(&mut rng, config);
+        let PersistentState {
+            current_term,
+            voted_for,
+            log,
+        } = state;
         Self {
             id,
             peers,
             config,
             rng,
-            current_term: state.current_term,
-            voted_for: state.voted_for,
+            current_term,
+            voted_for,
+            log: Log::new(log),
             role: Role::Follower,
             votes: BTreeSet::new(),
+            commit_index: LogIndex(0),
+            last_applied: LogIndex(0),
             election_elapsed: 0,
             election_timeout,
             heartbeat_elapsed: 0,
+            progress: BTreeMap::new(),
         }
     }
 
@@ -122,7 +153,7 @@ impl RaftNode {
         &self.peers
     }
 
-    /// Kurucuya verilen zamanlama ayarları (N2).
+    /// Kurucuya verilen ayarlar (N2).
     #[must_use]
     pub fn config(&self) -> Config {
         self.config
@@ -146,14 +177,34 @@ impl RaftNode {
         self.voted_for
     }
 
-    /// Düğümün bellekteki kalıcı durumu: diskte bulunması GEREKEN değer. Her adımın `Persist`
-    /// çıktısı tam olarak bunu taşır; sürücü, her adımdan sonra diskin bununla aynı olduğunu
-    /// denetleyerek "değişti ama persist edilmedi" hatalarını hemen yakalayabilir.
+    /// Log girdileri; dilimdeki 0. konum 1. index'tir.
+    #[must_use]
+    pub fn log(&self) -> &[LogEntry] {
+        self.log.entries()
+    }
+
+    /// Commit edildiği bilinen en yüksek index (Figure 2: `commitIndex`).
+    #[must_use]
+    pub fn commit_index(&self) -> LogIndex {
+        self.commit_index
+    }
+
+    /// Durum makinesine uygulanmış en yüksek index (Figure 2: `lastApplied`).
+    #[must_use]
+    pub fn last_applied(&self) -> LogIndex {
+        self.last_applied
+    }
+
+    /// Düğümün bellekteki kalıcı durumu: diskte bulunması GEREKEN değer. Sürücü, diskine
+    /// uyguladığı farkların toplamının bununla aynı olduğunu denetleyerek "değişti ama persist
+    /// edilmedi" hatalarını hemen yakalayabilir. Log'u kopyaladığı için maliyeti log boyutuyla
+    /// orantılıdır; sık denetimlerde `current_term`, `voted_for` ve `log` erişimcileri yeterlidir.
     #[must_use]
     pub fn persistent_state(&self) -> PersistentState {
         PersistentState {
             current_term: self.current_term,
             voted_for: self.voted_for,
+            log: self.log.entries().to_vec(),
         }
     }
 
@@ -164,24 +215,24 @@ impl RaftNode {
     /// sırasız ya da eksik yürütmek (O1 ihlali) ise derleyicinin göremeyeceği, sürücünün
     /// sorumluluğundaki bir hatadır.
     ///
+    /// Çıktıların sırası: varsa tek bir `Persist`, sonra `Send`'ler, en sonda `Apply`'lar.
+    ///
     /// N3: `step` tam (total) bir fonksiyondur: her `Input` değeri için panik atmadan döner.
     /// Simülatör her düğümü her tick'te adımlar; tek bir panik bütün koşuyu ve determinizm
     /// testlerini çökertirdi. Bu yüzden imkânsız sayılan durumlar bile (ör. term uzayının sonu,
     /// aynı term'de ikinci bir lider) panikle değil güvenli bir cevapla ele alınır.
     #[must_use = "outputs must be executed in order: Persist before the Sends that depend on it"]
     pub fn step(&mut self, input: Input) -> Vec<Output> {
-        // O2: kalıcı durumun adımdan önceki hâli. Adım sonunda değişmişse çıktıların BAŞINA tek bir
+        // O2: term ve oyun adımdan önceki hâli. Adım sonunda değişmişse çıktıların BAŞINA tek bir
         // `Persist` konur. Bu "önce/sonra" karşılaştırması, durumu değiştiren her noktaya ayrı ayrı
         // persist eklemekten daha güvenlidir: yeni bir kod yolu durumu değiştirip persist'i
-        // unutamaz.
+        // unutamaz. Log için aynı güvenceyi `Log`'un kendi değişiklik takibi verir.
         let before = (self.current_term, self.voted_for);
         let mut outbox = Outbox::new();
         match input {
             Input::Tick => self.on_tick(&mut outbox),
             Input::Message { from, msg } => self.on_message(from, msg, &mut outbox),
-            // İstemci arayüzü Faz 3/4'ün kapsamı: Faz 2'de hiçbir sürücü istek göndermez, gelen
-            // istek de yok sayılır (cevap tipi `ClientResponse` henüz bir yer tutucudur).
-            Input::ClientRequest(_) => {}
+            Input::ClientRequest(command) => self.on_client_request(command, &mut outbox),
             Input::Restart(state) => {
                 self.restart(state);
                 // R1: yüklenen durum zaten diskteki durumdur; yeniden yazmaya gerek yok. Yeniden
@@ -189,11 +240,21 @@ impl RaftNode {
                 return Vec::new();
             }
         }
-        let persist = ((self.current_term, self.voted_for) != before)
-            .then(|| Output::Persist(self.persistent_state()));
+        let log_update = self.log.take_update();
+        let persist = if (self.current_term, self.voted_for) != before || log_update.is_some() {
+            Some(Output::Persist(PersistUpdate {
+                current_term: self.current_term,
+                voted_for: self.voted_for,
+                log: log_update,
+            }))
+        } else {
+            None
+        };
+        let applies = self.apply_committed();
         persist
             .into_iter()
             .chain(outbox.into_iter().map(|(to, msg)| Output::Send { to, msg }))
+            .chain(applies)
             .collect()
     }
 
@@ -203,7 +264,7 @@ impl RaftNode {
             Role::Leader => {
                 self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(1);
                 if self.heartbeat_elapsed >= self.config.heartbeat_interval() {
-                    self.broadcast_heartbeat(outbox);
+                    self.broadcast_append_entries(outbox);
                 }
             }
             // Figure 2: Follower, zaman aşımı boyunca mevcut liderden AppendEntries almaz ya da bir
@@ -245,8 +306,8 @@ impl RaftNode {
         }
         let request = RequestVote {
             term: self.current_term,
-            last_log_index: self.last_log_index(),
-            last_log_term: self.last_log_term(),
+            last_log_index: self.log.last_index(),
+            last_log_term: self.log.last_term(),
         };
         for &peer in &self.peers {
             outbox.push((peer, Message::RequestVote(request.clone())));
@@ -257,20 +318,75 @@ impl RaftNode {
     fn become_leader(&mut self, outbox: &mut Outbox) {
         self.role = Role::Leader;
         self.votes.clear();
-        // §5.2: lider seçilir seçilmez boş AppendEntries (heartbeat) gönderir. Böylece aynı term'in
+        // Figure 2 ("Volatile state on leaders", seçimden sonra yeniden kurulur): nextIndex = son
+        // log index'i + 1, matchIndex = 0. Lider takipçilerin log'larını bilmez; iyimser başlar.
+        // Tutarsızlık AppendEntries reddiyle ortaya çıkar ve nextIndex geri çekilir (§5.3).
+        let next_index = self.log.last_index().next();
+        self.progress = self
+            .peers
+            .iter()
+            .map(|&peer| {
+                let progress = Progress {
+                    next_index,
+                    match_index: LogIndex(0),
+                };
+                (peer, progress)
+            })
+            .collect();
+        // §5.2: lider seçilir seçilmez AppendEntries (heartbeat) gönderir. Böylece aynı term'in
         // diğer adayları liderliği öğrenip Follower'a döner, takipçiler de yeni seçim başlatmaz.
-        self.broadcast_heartbeat(outbox);
+        self.broadcast_append_entries(outbox);
     }
 
-    /// Bütün eşlere heartbeat (girdisiz `AppendEntries`) gönderir ve heartbeat sayacını sıfırlar.
-    fn broadcast_heartbeat(&mut self, outbox: &mut Outbox) {
+    /// Bütün eşlere AppendEntries gönderir ve heartbeat sayacını sıfırlar. Her mesaj, o takipçinin
+    /// `nextIndex`'inden başlayan eksik girdileri taşır; eksik girdisi olmayan takipçiye giden
+    /// mesaj, girdisiz bir heartbeat'tir (Figure 2, Leaders). Onaylanmamış girdiler böylece her
+    /// heartbeat'te yeniden gönderilir: kaybolan mesajlar için ayrı bir yeniden gönderim
+    /// zamanlayıcısı gerekmez.
+    fn broadcast_append_entries(&mut self, outbox: &mut Outbox) {
         self.heartbeat_elapsed = 0;
-        let heartbeat = AppendEntries {
-            term: self.current_term,
-        };
         for &peer in &self.peers {
-            outbox.push((peer, Message::AppendEntries(heartbeat.clone())));
+            outbox.push((peer, self.append_entries_for(peer)));
         }
+    }
+
+    /// `peer` için bir AppendEntries: `nextIndex`'ten başlayan en fazla `max_entries` girdi, hemen
+    /// öncesindeki girdinin index'i ve term'i (tutarlılık denetimi için) ve liderin
+    /// `commitIndex`'i.
+    fn append_entries_for(&self, peer: NodeId) -> Message {
+        let next_index = self
+            .progress
+            .get(&peer)
+            .map_or(self.log.last_index().next(), |progress| progress.next_index);
+        let prev_log_index = next_index.prev();
+        Message::AppendEntries(AppendEntries {
+            term: self.current_term,
+            prev_log_index,
+            // `nextIndex` hiçbir zaman son index + 1'i aşmaz, yani önceki girdi her zaman
+            // log'dadır. Olmasaydı (bir hata), term 0 gönderilir: takipçi büyük olasılıkla reddeder
+            // ve lider geri çekilir; panik atılmaz (N3).
+            prev_log_term: self.log.term_at(prev_log_index).unwrap_or(Term(0)),
+            entries: self.log.entries_from(next_index, self.config.max_entries()),
+            leader_commit: self.commit_index,
+        })
+    }
+
+    /// İstemciden bir komut geldi.
+    fn on_client_request(&mut self, command: Command, outbox: &mut Outbox) {
+        // Komutu yalnızca lider kabul eder (Figure 2, Leaders: "If command received from client:
+        // append entry to local log"). Lider olmayan düğüm isteği yok sayar; liderin kim olduğunu
+        // bildiren `NotLeader` cevabı Faz 4'te gelecek.
+        if self.role != Role::Leader {
+            return;
+        }
+        self.log.append(LogEntry {
+            term: self.current_term,
+            command,
+        });
+        // Tek düğümlü küme: girdi liderin kendi kopyasıyla zaten çoğunluktadır.
+        self.advance_commit_index();
+        // Girdiyi bir sonraki heartbeat'i beklemeden gönder; bu gönderim heartbeat yerine de geçer.
+        self.broadcast_append_entries(outbox);
     }
 
     /// Bir eşten gelen RPC'yi ya da cevabı işler.
@@ -293,10 +409,10 @@ impl RaftNode {
             Message::RequestVoteResponse(response) => {
                 self.on_vote_response(from, &response, outbox)
             }
-            Message::AppendEntries(request) => self.on_append_entries(from, &request, outbox),
-            // Faz 2'de lider cevaptan yalnızca term'i öğrenir; o da yukarıda işlendi. Faz 3'te
-            // `nextIndex`/`matchIndex` buradan güncellenecek.
-            Message::AppendEntriesResponse(_) => {}
+            Message::AppendEntries(request) => self.on_append_entries(from, request, outbox),
+            Message::AppendEntriesResponse(response) => {
+                self.on_append_entries_response(from, &response, outbox)
+            }
         }
     }
 
@@ -308,6 +424,8 @@ impl RaftNode {
         self.voted_for = None;
         self.role = Role::Follower;
         self.votes.clear();
+        // Liderlik bitti: takipçi ilerlemesi yalnızca lider olunan term için anlamlıdır.
+        self.progress.clear();
         // Seçim zamanlayıcısını Figure 2'ye göre yalnızca üç şey sıfırlar: mevcut liderden
         // AppendEntries almak, bir adaya oy vermek ve seçim başlatmak. Yüksek term'i görmek tek
         // başına bunlardan biri değildir; bu yüzden Follower ve Candidate'ın zamanlayıcısına
@@ -330,7 +448,7 @@ impl RaftNode {
             && self.voted_for.is_none_or(|candidate| candidate == from)
             && candidate_is_up_to_date(
                 (request.last_log_term, request.last_log_index),
-                (self.last_log_term(), self.last_log_index()),
+                (self.log.last_term(), self.log.last_index()),
             );
         if vote_granted {
             self.voted_for = Some(from);
@@ -369,44 +487,201 @@ impl RaftNode {
         }
     }
 
-    /// `AppendEntries` alıcısı (Figure 2). Faz 2'de yalnızca heartbeat'tir.
-    fn on_append_entries(&mut self, from: NodeId, request: &AppendEntries, outbox: &mut Outbox) {
-        // §5.1: eski term'li bir liderin isteği reddedilir. Cevaptaki güncel term sayesinde eski
-        // lider geride kaldığını öğrenip Follower'a döner.
-        let success = if request.term < self.current_term {
-            false
-        } else if self.role == Role::Leader {
-            // Buradan sonra istek bizim term'imizdedir (daha yükseği `on_message`'da benimsendi).
-            // Aynı term'de ikinci bir lider Election Safety'ye göre imkânsızdır. Olursa (ör. bir
-            // hata), lider isteği reddeder ve liderliği bırakmaz: rolü yalnızca daha yüksek bir
-            // term değiştirir. İhlali raporlamak denetçinin (checker) işidir; çekirdek panik atmaz
-            // (N3).
-            false
-        } else {
-            // §5.2: aday, aynı term'de seçilmiş bir liderden AppendEntries alırsa onun liderliğini
-            // tanır ve Follower'a döner. `votedFor` değişmez: bu term'deki oy zaten kullanıldı.
-            self.role = Role::Follower;
-            self.votes.clear();
-            // Figure 2: mevcut liderden AppendEntries almak seçim zamanlayıcısını sıfırlar.
-            self.reset_election_timer();
-            // Faz 2'de log yok: log tutarlılık kontrolü (Figure 2, AppendEntries madde 2-5) Faz
-            // 3'te gelecek.
-            true
-        };
+    /// `AppendEntries` alıcısı (Figure 2): isteği işler ve cevabını gönderir.
+    fn on_append_entries(&mut self, from: NodeId, request: AppendEntries, outbox: &mut Outbox) {
+        let (success, match_index) = self.accept_append_entries(request);
         outbox.push((
             from,
             Message::AppendEntriesResponse(AppendEntriesResponse {
                 term: self.current_term,
                 success,
+                match_index,
             }),
         ));
+    }
+
+    /// AppendEntries'i Figure 2'nin beş kuralıyla uygular; cevabın `success` ve `match_index`
+    /// alanlarını döndürür.
+    fn accept_append_entries(&mut self, request: AppendEntries) -> (bool, LogIndex) {
+        // Madde 1, §5.1: eski term'li bir liderin isteği reddedilir. Cevaptaki güncel term
+        // sayesinde eski lider geride kaldığını öğrenip Follower'a döner; ipucu anlamsızdır.
+        if request.term < self.current_term {
+            return (false, LogIndex(0));
+        }
+        if self.role == Role::Leader {
+            // Buradan sonra istek bizim term'imizdedir (daha yükseği `on_message`'da benimsendi).
+            // Aynı term'de ikinci bir lider Election Safety'ye göre imkânsızdır. Olursa (ör. bir
+            // hata), lider isteği reddeder ve liderliği bırakmaz: rolü yalnızca daha yüksek bir
+            // term değiştirir. İhlali raporlamak denetçinin (checker) işidir; çekirdek panik atmaz
+            // (N3).
+            return (false, LogIndex(0));
+        }
+        // §5.2: aday, aynı term'de seçilmiş bir liderden AppendEntries alırsa onun liderliğini
+        // tanır ve Follower'a döner. `votedFor` değişmez: bu term'deki oy zaten kullanıldı.
+        self.role = Role::Follower;
+        self.votes.clear();
+        // Figure 2: mevcut liderden AppendEntries almak seçim zamanlayıcısını sıfırlar.
+        self.reset_election_timer();
+
+        let AppendEntries {
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+            ..
+        } = request;
+        // Madde 2: log'da `prev_log_index`'te term'i `prev_log_term` olan bir girdi yoksa reddet.
+        // Log Matching'in tümevarım adımı budur: kabul edilen her girdinin öncesi liderinkiyle
+        // aynıdır. İpucu, eşleşmenin olabileceği en büyük index'tir: log'umuz kısaysa son
+        // index'imiz, değilse `prev_log_index`'in bir öncesi.
+        if self.log.term_at(prev_log_index) != Some(prev_log_term) {
+            let hint = self.log.last_index().min(prev_log_index.prev());
+            return (false, hint);
+        }
+        // Madde 3 ve 4: girdileri tek tek karşılaştır. Aynı index'te farklı term'li bir girdi
+        // (çakışma) varsa o girdi ve sonrası silinir ve yenileri eklenir; log'da zaten aynısı olan
+        // girdilere dokunulmaz. ÇAKIŞMA YOKSA HİÇBİR ŞEY SİLİNMEZ: gecikmiş ya da çoğaltılmış eski
+        // bir istek (örneğin yalnızca ilk girdiyi taşıyan) log'u o isteğin boyuna kısaltsaydı,
+        // takipçinin zaten onayladığı (belki commit edilmiş) girdiler kaybolurdu.
+        let mut index = prev_log_index;
+        for entry in entries {
+            index = index.next();
+            match self.log.term_at(index) {
+                Some(term) if term == entry.term => {}
+                Some(_) => {
+                    self.log.truncate_from(index);
+                    self.log.append(entry);
+                }
+                None => self.log.append(entry),
+            }
+        }
+        // `index` artık bu isteğin doğruladığı son girdidir (`prev_log_index` + girdi sayısı);
+        // log'da ondan sonra gelen girdiler bu istekle doğrulanmamıştır.
+        //
+        // Madde 5: commitIndex = min(leaderCommit, son yeni girdinin index'i). Doğrulanmamış
+        // girdiler bu yüzden commit edilmez. `max` ile yalnızca ileri gidilir: sırası değişmiş eski
+        // bir istek daha kısa bir önek taşıyabilir ve commitIndex'i geri çekmemelidir.
+        if leader_commit > self.commit_index {
+            self.commit_index = self.commit_index.max(leader_commit.min(index));
+        }
+        (true, index)
+    }
+
+    /// `AppendEntries` cevabını işler (Figure 2, Leaders).
+    fn on_append_entries_response(
+        &mut self,
+        from: NodeId,
+        response: &AppendEntriesResponse,
+        outbox: &mut Outbox,
+    ) {
+        // Yalnızca bu term'in lideri cevapları işler; başka bir term'in (geciken ya da çoğaltılmış)
+        // cevabı başka bir liderliğe aittir. Daha yüksek term `on_message`'da zaten işlendi.
+        if self.role != Role::Leader || response.term != self.current_term {
+            return;
+        }
+        let last_index = self.log.last_index();
+        let Some(progress) = self.progress.get_mut(&from) else {
+            return;
+        };
+        if response.success {
+            // Eşleşme noktası yalnızca ileri gider: sırası değişmiş ya da çoğaltılmış eski bir
+            // başarı cevabı ilerlemeyi geri almaz. Liderin log'unun ötesini gösteren bir cevap
+            // (imkânsız) log'un sonuna kırpılır.
+            let matched = response.match_index.min(last_index);
+            progress.match_index = progress.match_index.max(matched);
+            progress.next_index = progress.next_index.max(matched.next());
+            let lagging = progress.next_index <= last_index;
+            self.advance_commit_index();
+            // Takipçide hâlâ eksik girdi varsa bir sonraki heartbeat'i beklemeden devam et.
+            if lagging {
+                outbox.push((from, self.append_entries_for(from)));
+            }
+        } else {
+            // §5.3: tutarsızlık → nextIndex'i geri çek ve hemen yeniden dene. İpucu sayesinde birer
+            // birer değil bir hamlede geri çekilir. Ama asla matchIndex + 1'in altına inilmez
+            // (orası eşleştiği bilinen kısım) ve asla ileri gidilmez: eski bir ret cevabı
+            // nextIndex'i büyütmemeli.
+            let floor = progress.match_index.next();
+            let backed_off = progress.next_index.prev().min(response.match_index.next());
+            progress.next_index = floor.max(backed_off);
+            outbox.push((from, self.append_entries_for(from)));
+        }
+    }
+
+    /// Liderin commitIndex'ini ilerletir (Figure 2, Leaders; §5.3, §5.4.2).
+    fn advance_commit_index(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        // N > commitIndex, çoğunluğun matchIndex'i ≥ N ve log[N].term == currentTerm ise
+        // commitIndex = N. En büyük N'den aşağı doğru aranır; ilk uyan N commit edilir ve ondan
+        // önceki bütün girdiler de dolaylı olarak commit olur (Log Matching).
+        let mut candidate = self.log.last_index();
+        while candidate > self.commit_index {
+            match self.log.term_at(candidate) {
+                Some(term) if term == self.current_term => {
+                    if self.replicated_on_majority(candidate) {
+                        self.commit_index = candidate;
+                        return;
+                    }
+                }
+                // §5.4.2: önceki term'lerden gelen bir girdi, kopyaları sayılarak commit EDİLEMEZ
+                // (Figure 8): çoğunlukta bulunsa bile daha güncel log'lu bir aday onu ezebilir.
+                // Log'da term'ler index'le birlikte azalmadığı için buradan aşağısı da önceki
+                // term'lerdendir; aramaya devam etmek boşunadır. Bu girdiler, kendi term'imizden
+                // bir girdi commit edilince dolaylı olarak commit olur.
+                _ => return,
+            }
+            candidate = candidate.prev();
+        }
+    }
+
+    /// `index`'e kadar olan girdiler kümenin çoğunluğunda (lider dahil) var mı?
+    fn replicated_on_majority(&self, index: LogIndex) -> bool {
+        // Lider kendini de sayar. Girdisi, onu taşıyan AppendEntries'ten önce persist edildi (O1)
+        // ve sürücü o mesajları yazma kalıcı olana kadar göndermez; yani hiçbir takipçinin onayı
+        // liderin kendi kopyası diske ulaşmadan gelemez.
+        //
+        // Tek düğümlü bir kümede beklenecek onay yoktur: lider girdiyi eklediği adımda, kopyası
+        // henüz diske ulaşmadan commitIndex'ini ilerletir. Bu da güvenlidir. Commit'in dışarıya
+        // görünen tek etkisi `Apply`'dır; o, aynı adımın `Persist`'inden sonra gelir (O1) ve
+        // sürücü onu yazma kalıcı olana kadar tutar. Düğüm arada çökerse girdi hiç commit
+        // edilmemiş olur ve dışarıdan hiçbir iz kalmaz.
+        let replicas = 1 + self
+            .progress
+            .values()
+            .filter(|progress| progress.match_index >= index)
+            .count();
+        replicas >= self.quorum()
+    }
+
+    /// Commit edilmiş ama henüz uygulanmamış girdileri, index sırasıyla `Apply` çıktılarına çevirir
+    /// (Figure 2, All Servers: "If commitIndex > lastApplied: increment lastApplied, apply
+    /// log[lastApplied] to state machine").
+    fn apply_committed(&mut self) -> Vec<Output> {
+        let mut applies = Vec::new();
+        while self.last_applied < self.commit_index {
+            let index = self.last_applied.next();
+            // commitIndex log'un sonunu aşamaz: lider kendi log'undan, takipçi bu istekte
+            // doğrulanan son girdiye kadar commit eder. Aşsaydı (bir hata) girdi uydurulmaz,
+            // uygulama orada durur ve denetçi eksik uygulamayı görür (N3: panik yok).
+            let Some(entry) = self.log.entry(index) else {
+                break;
+            };
+            applies.push(Output::Apply {
+                index,
+                command: entry.command.clone(),
+            });
+            self.last_applied = index;
+        }
+        applies
     }
 
     /// Çökme sonrası yeniden başlatma (R1).
     fn restart(&mut self, state: PersistentState) {
         // Figure 2: çökme bütün geçici durumu siler; yalnızca diskteki durum kalır. Düğüm alan alan
-        // sıfırlanmak yerine `boot` ile baştan kurulur: ileride eklenecek bir geçici alanın (Faz 3:
-        // commitIndex, nextIndex, ...) sıfırlanması böylece unutulamaz.
+        // sıfırlanmak yerine `boot` ile baştan kurulur: geçici bir alanın (commitIndex,
+        // lastApplied, takipçi ilerlemesi, ...) sıfırlanması böylece unutulamaz.
         //
         // RNG bilerek sürdürülür (yeniden tohumlanmaz): gerçek bir düğüm açılışta taze rastgelelik
         // alır; aynı akışın devamı da taze ama deterministik değerler verir. Baştaki seed'le
@@ -430,16 +705,6 @@ impl RaftNode {
     /// Adaylıkta toplanan oylar çoğunluğa ulaştı mı?
     fn has_majority(&self) -> bool {
         self.votes.len() >= self.quorum()
-    }
-
-    /// Son log girdisinin index'i. Faz 2'de log henüz yok (Faz 3): boş log için 0 (Figure 2).
-    fn last_log_index(&self) -> LogIndex {
-        LogIndex(0)
-    }
-
-    /// Son log girdisinin term'i. Faz 2'de log henüz yok (Faz 3): boş log için 0.
-    fn last_log_term(&self) -> Term {
-        Term(0)
     }
 }
 
@@ -474,16 +739,18 @@ mod tests {
     use super::{RaftNode, candidate_is_up_to_date};
     use crate::config::Config;
     use crate::input::Input;
+    use crate::log::LogEntry;
     use crate::message::{
         AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
     };
     use crate::output::Output;
-    use crate::persist::PersistentState;
+    use crate::persist::{LogUpdate, PersistUpdate, PersistentState};
     use crate::role::Role;
     use crate::types::{Command, LogIndex, NodeId, Term};
     use rand_chacha::ChaCha8Rng;
     use rand_chacha::rand_core::{Rng, SeedableRng};
     use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
 
     /// Varsayılan seçim zaman aşımı tabanı (`Config::default()`).
     const T: u64 = 20;
@@ -533,22 +800,100 @@ mod tests {
         })
     }
 
-    fn heartbeat(term: u64) -> Message {
-        Message::AppendEntries(AppendEntries { term: Term(term) })
+    /// Tek baytlık komutlu bir log girdisi.
+    fn entry(term: u64, byte: u8) -> LogEntry {
+        LogEntry {
+            term: Term(term),
+            command: Command::new(vec![byte]),
+        }
     }
 
-    fn heartbeat_reply(term: u64, success: bool) -> Message {
+    fn append(term: u64, prev: (u64, u64), entries: Vec<LogEntry>, leader_commit: u64) -> Message {
+        Message::AppendEntries(AppendEntries {
+            term: Term(term),
+            prev_log_index: LogIndex(prev.0),
+            prev_log_term: Term(prev.1),
+            entries,
+            leader_commit: LogIndex(leader_commit),
+        })
+    }
+
+    /// Boş log'a gönderilen girdisiz AppendEntries (önceki girdi yok, commit yok).
+    fn heartbeat(term: u64) -> Message {
+        append(term, (0, 0), Vec::new(), 0)
+    }
+
+    fn append_reply(term: u64, success: bool, match_index: u64) -> Message {
         Message::AppendEntriesResponse(AppendEntriesResponse {
             term: Term(term),
             success,
+            match_index: LogIndex(match_index),
         })
     }
 
+    /// Boş log'lu bir takipçinin heartbeat cevabı (eşleşme index'i 0).
+    fn heartbeat_reply(term: u64, success: bool) -> Message {
+        append_reply(term, success, 0)
+    }
+
+    /// Yalnızca term/oy değişen bir adımın yazması.
     fn persist(term: u64, voted_for: Option<u64>) -> Output {
-        Output::Persist(PersistentState {
+        Output::Persist(PersistUpdate {
             current_term: Term(term),
             voted_for: voted_for.map(NodeId),
+            log: None,
         })
+    }
+
+    /// Log'u da değişen bir adımın yazması: `from` ve sonrası `entries` ile değişir.
+    fn persist_log(term: u64, voted_for: Option<u64>, from: u64, entries: Vec<LogEntry>) -> Output {
+        Output::Persist(PersistUpdate {
+            current_term: Term(term),
+            voted_for: voted_for.map(NodeId),
+            log: Some(LogUpdate {
+                from: LogIndex(from),
+                entries,
+            }),
+        })
+    }
+
+    fn apply(index: u64, byte: u8) -> Output {
+        Output::Apply {
+            index: LogIndex(index),
+            command: Command::new(vec![byte]),
+        }
+    }
+
+    fn client(byte: u8) -> Input {
+        Input::ClientRequest(Command::new(vec![byte]))
+    }
+
+    /// Diskinde `state` olan bir düğüm (yeni düğüm + yeniden başlatma).
+    fn node_with_state(id: u64, cluster: &[u64], seed: u64, state: PersistentState) -> RaftNode {
+        let mut node = node(id, cluster, seed);
+        assert!(node.step(Input::Restart(state)).is_empty());
+        node
+    }
+
+    /// Log'u `log` olan (term'i son girdinin term'i) bir düğümün bir sonraki term'de lider olmuş
+    /// hâli: zaman aşımında aday olur ve eşlerinden çoğunluğa yetecek kadar oy alır.
+    fn leader_with_log(id: u64, cluster: &[u64], seed: u64, log: Vec<LogEntry>) -> RaftNode {
+        let term = log.last().map_or(0, |entry| entry.term.0);
+        let state = PersistentState {
+            current_term: Term(term),
+            voted_for: None,
+            log,
+        };
+        let mut node = node_with_state(id, cluster, seed, state);
+        let _ = tick_until_output(&mut node);
+        for &peer in cluster.iter().filter(|&&peer| peer != id) {
+            if node.role() == Role::Leader {
+                break;
+            }
+            let _ = node.step(message(peer, vote(term + 1, true)));
+        }
+        assert_eq!(node.role(), Role::Leader);
+        node
     }
 
     fn send(to: u64, msg: Message) -> Output {
@@ -610,6 +955,9 @@ mod tests {
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.current_term(), Term(0));
         assert_eq!(node.voted_for(), None);
+        assert!(node.log().is_empty());
+        assert_eq!(node.commit_index(), LogIndex(0));
+        assert_eq!(node.last_applied(), LogIndex(0));
         assert_eq!(node.persistent_state(), PersistentState::default());
     }
 
@@ -689,7 +1037,7 @@ mod tests {
 
     // O1/O2 ve Figure 2 (Candidates): zaman aşımında düğüm term'i artırır ve kendine oy verir; bu
     // ikisi, oy istekleri ağa çıkmadan ÖNCE diske yazdırılır. İstekler adayın son log girdisini
-    // taşır (Faz 2'de log boş: 0/0).
+    // taşır (burada log boş: 0/0).
     #[test]
     fn a_timeout_starts_an_election_and_persists_before_sending() {
         let mut node = node(1, &[1, 2, 3], 1);
@@ -783,7 +1131,8 @@ mod tests {
     }
 
     // §5.4.1: log'u bizimkinden eski bir adaya oy verilmez: önce son girdinin term'i, eşitse log
-    // uzunluğu karşılaştırılır. Faz 2'de log boş olduğu için kısıt saf fonksiyon düzeyinde sınanır.
+    // uzunluğu karşılaştırılır. Kısıt burada saf fonksiyon düzeyinde sınanır; düğüm düzeyindeki iki
+    // yönü (güncel log'a evet, eski log'a hayır) ayrı testlerdedir.
     #[test]
     fn the_election_restriction_compares_last_term_then_length() {
         let last = |term, index| (Term(term), LogIndex(index));
@@ -812,7 +1161,7 @@ mod tests {
     // §5.4.1, düğüm düzeyinde: log'u boş olan takipçi, log'u daha güncel bir adaya (son girdi term
     // 3, index 7) oyunu VERİR. Saf fonksiyonun argümanları çağrı yerinde yer değiştirseydi (aday
     // ile kendi log'u), bu oy reddedilirdi; bu test o kablolama hatasını yakalar. Ters yön (eski
-    // log'lu adaya ret) log'un geldiği Faz 3'te düğüm düzeyinde sınanacak.
+    // log'lu adaya ret) `a_candidate_with_a_stale_log_is_denied_the_vote` testindedir.
     #[test]
     fn a_candidate_with_a_more_up_to_date_log_gets_the_vote() {
         let mut node = node(1, &[1, 2, 3], 19);
@@ -991,6 +1340,7 @@ mod tests {
         let exhausted = PersistentState {
             current_term: Term(u64::MAX),
             voted_for: Some(NodeId(2)),
+            log: Vec::new(),
         };
         assert!(node.step(Input::Restart(exhausted.clone())).is_empty());
         for _ in 0..10 * T {
@@ -1000,16 +1350,325 @@ mod tests {
         assert_eq!(node.role(), Role::Follower);
     }
 
-    // Faz 2'de istemci arayüzü yok: istek yok sayılır ve düğüm birebir aynı kalır.
+    // Lider olmayan düğüm istemci isteğini yok sayar (Faz 4'te `NotLeader` cevabı gelecek): ne
+    // takipçi ne aday isteği log'una ekler; düğüm birebir aynı kalır.
     #[test]
-    fn client_requests_are_ignored_for_now() {
-        let mut node = leader(1, &[1, 2, 3], 18);
-        let before = node.clone();
-        assert!(
-            node.step(Input::ClientRequest(Command::new(vec![1, 2, 3])))
-                .is_empty()
+    fn non_leaders_ignore_client_requests() {
+        for mut node in [node(1, &[1, 2, 3], 18), candidate(1, &[1, 2, 3], 18)] {
+            let before = node.clone();
+            assert!(node.step(client(7)).is_empty());
+            assert_eq!(node, before);
+        }
+    }
+
+    // Figure 2, AppendEntries madde 3-4 ve 2: takipçi yeni girdileri ekler, bunları cevaptan ÖNCE
+    // diske yazdırır (log farkı ve yeni term tek bir Persist'te) ve cevapta eşleşmenin kesin olduğu
+    // son index'i bildirir. Devam eden bir istek yalnızca yeni girdiyi yazdırır.
+    #[test]
+    fn a_follower_appends_new_entries_and_reports_the_match_index() {
+        let mut node = node(1, &[1, 2, 3], 20);
+        assert_eq!(
+            node.step(message(
+                2,
+                append(1, (0, 0), vec![entry(1, 10), entry(1, 11)], 0)
+            )),
+            vec![
+                persist_log(1, None, 1, vec![entry(1, 10), entry(1, 11)]),
+                send(2, append_reply(1, true, 2)),
+            ]
         );
-        assert_eq!(node, before);
+        assert_eq!(
+            node.step(message(2, append(1, (2, 1), vec![entry(1, 12)], 0))),
+            vec![
+                persist_log(1, None, 3, vec![entry(1, 12)]),
+                send(2, append_reply(1, true, 3)),
+            ]
+        );
+        assert_eq!(node.log(), &[entry(1, 10), entry(1, 11), entry(1, 12)]);
+    }
+
+    // Figure 2, AppendEntries madde 2: `prev_log_index`'te `prev_log_term`'lü girdi yoksa istek
+    // reddedilir; log'a dokunulmaz ve Persist yoktur. Cevap, eşleşmenin olabileceği en büyük
+    // index'i ipucu olarak taşır: log kısaysa son index, değilse `prev_log_index - 1`.
+    #[test]
+    fn a_mismatched_previous_entry_is_rejected_with_a_hint() {
+        let mut node = node(1, &[1, 2, 3], 21);
+        let _ = node.step(message(
+            2,
+            append(1, (0, 0), vec![entry(1, 10), entry(1, 11)], 0),
+        ));
+        assert_eq!(
+            node.step(message(2, append(1, (5, 1), vec![entry(1, 15)], 0))),
+            vec![send(2, append_reply(1, false, 2))],
+            "the log is too short: the hint is its last index"
+        );
+        assert_eq!(
+            node.step(message(2, append(1, (2, 9), vec![entry(9, 15)], 0))),
+            vec![send(2, append_reply(1, false, 1))],
+            "the term at index 2 differs: the hint is the index before it"
+        );
+        assert_eq!(node.log(), &[entry(1, 10), entry(1, 11)]);
+    }
+
+    // Figure 2, AppendEntries madde 3: aynı index'te farklı term'li bir girdi (çakışma) varsa o
+    // girdi ve sonrası silinir, yerine liderin girdileri yazılır. Persist, değişen kuyruğu çakışma
+    // index'inden itibaren taşır.
+    #[test]
+    fn a_conflicting_suffix_is_replaced() {
+        let mut node = node(1, &[1, 2, 3], 22);
+        let old = vec![entry(1, 10), entry(1, 11), entry(1, 12)];
+        let _ = node.step(message(2, append(1, (0, 0), old, 0)));
+        assert_eq!(
+            node.step(message(
+                3,
+                append(2, (1, 1), vec![entry(2, 20), entry(2, 21)], 0)
+            )),
+            vec![
+                persist_log(2, None, 2, vec![entry(2, 20), entry(2, 21)]),
+                send(3, append_reply(2, true, 3)),
+            ]
+        );
+        assert_eq!(node.log(), &[entry(1, 10), entry(2, 20), entry(2, 21)]);
+    }
+
+    // ÇAKIŞMA YOKSA SİLME YOK (Figure 2, madde 3): gecikmiş ya da çoğaltılmış eski bir istek
+    // (burada yalnızca ilk girdiyi ya da girdilerin tamamını yeniden taşıyan) log'u kısaltmaz,
+    // hiçbir şey yazdırmaz ve kendi doğruladığı öneki bildirir. Kısaltsaydı, takipçinin zaten
+    // onayladığı (belki commit edilmiş) girdiler kaybolurdu.
+    #[test]
+    fn stale_or_duplicate_requests_never_truncate_the_log() {
+        let mut node = node(1, &[1, 2, 3], 23);
+        let full = vec![entry(1, 10), entry(1, 11), entry(1, 12)];
+        let _ = node.step(message(2, append(1, (0, 0), full.clone(), 0)));
+        assert_eq!(
+            node.step(message(2, append(1, (0, 0), vec![entry(1, 10)], 0))),
+            vec![send(2, append_reply(1, true, 1))]
+        );
+        assert_eq!(
+            node.step(message(2, append(1, (0, 0), full.clone(), 0))),
+            vec![send(2, append_reply(1, true, 3))]
+        );
+        assert_eq!(node.log(), full.as_slice());
+    }
+
+    // Figure 2, madde 5: takipçinin commitIndex'i min(leaderCommit, bu istekte doğrulanan son
+    // girdi) olur ve yalnızca ileri gider; commit edilen girdiler index sırasıyla, her biri bir kez
+    // uygulanır. Kısa bir önek taşıyan eski bir istek, yüksek bir leaderCommit taşısa bile ne
+    // commitIndex'i geri çeker ne de doğrulamadığı girdileri commit eder.
+    #[test]
+    fn the_follower_commit_index_follows_the_leader_within_the_verified_prefix() {
+        let mut node = node(1, &[1, 2, 3], 24);
+        let full = vec![entry(1, 10), entry(1, 11), entry(1, 12)];
+        assert_eq!(
+            node.step(message(2, append(1, (0, 0), full.clone(), 2))),
+            vec![
+                persist_log(1, None, 1, full),
+                send(2, append_reply(1, true, 3)),
+                apply(1, 10),
+                apply(2, 11),
+            ]
+        );
+        assert_eq!(node.commit_index(), LogIndex(2));
+        assert_eq!(
+            node.step(message(2, append(1, (1, 1), Vec::new(), 3))),
+            vec![send(2, append_reply(1, true, 1))],
+            "only index 1 was verified: index 3 is not committed, nothing goes backwards"
+        );
+        assert_eq!(node.commit_index(), LogIndex(2));
+        assert_eq!(
+            node.step(message(2, append(1, (3, 1), Vec::new(), 3))),
+            vec![send(2, append_reply(1, true, 3)), apply(3, 12)]
+        );
+        assert_eq!(node.last_applied(), LogIndex(3));
+    }
+
+    // Figure 2, Leaders: lider istemci komutunu kendi term'iyle log'una ekler, ekleneni cevaptan
+    // önce diske yazdırır ve heartbeat'i beklemeden bütün takipçilere gönderir.
+    #[test]
+    fn a_leader_appends_client_commands_and_replicates_them_at_once() {
+        let mut node = leader(1, &[1, 2, 3], 25);
+        let replicate = append(1, (0, 0), vec![entry(1, 7)], 0);
+        assert_eq!(
+            node.step(client(7)),
+            vec![
+                persist_log(1, Some(1), 1, vec![entry(1, 7)]),
+                send(2, replicate.clone()),
+                send(3, replicate),
+            ]
+        );
+    }
+
+    // Figure 2, Leaders: başarılı cevap matchIndex/nextIndex'i ilerletir; kendi term'indeki girdi
+    // çoğunluğa (lider + 1 takipçi) ulaşınca commit edilir ve uygulanır. Takipçinin eksiği
+    // kalmadığından ek bir gönderim yoktur.
+    #[test]
+    fn a_majority_of_matches_commits_a_current_term_entry() {
+        let mut node = leader(1, &[1, 2, 3], 26);
+        let _ = node.step(client(7));
+        assert_eq!(
+            node.step(message(2, append_reply(1, true, 1))),
+            vec![apply(1, 7)]
+        );
+        assert_eq!(node.commit_index(), LogIndex(1));
+        assert_eq!(node.progress[&NodeId(2)].match_index, LogIndex(1));
+        assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(2));
+    }
+
+    // §5.3: ret gelince nextIndex ipucuyla bir hamlede geri çekilir ve eksik girdiler hemen yeniden
+    // gönderilir. Eşleşme bildirilince ilerleme güncellenir. Burada girdiler önceki term'den (1)
+    // olduğu için çoğunlukta olsalar bile commit edilmez (§5.4.2).
+    #[test]
+    fn a_rejection_backs_off_next_index_and_retries_at_once() {
+        let log = vec![entry(1, 1), entry(1, 2), entry(1, 3)];
+        let mut node = leader_with_log(1, &[1, 2, 3], 27, log);
+        assert_eq!(node.current_term(), Term(2));
+        assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(4));
+        assert_eq!(
+            node.step(message(2, append_reply(2, false, 1))),
+            vec![send(
+                2,
+                append(2, (1, 1), vec![entry(1, 2), entry(1, 3)], 0)
+            )]
+        );
+        assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(2));
+        assert!(node.step(message(2, append_reply(2, true, 3))).is_empty());
+        assert_eq!(node.progress[&NodeId(2)].match_index, LogIndex(3));
+        assert_eq!(
+            node.commit_index(),
+            LogIndex(0),
+            "earlier-term entries are not counted"
+        );
+    }
+
+    // Sırası değişmiş ya da çoğaltılmış eski cevaplar ilerlemeyi geri almaz: eski bir başarı
+    // matchIndex'i küçültmez, eski bir ret nextIndex'i matchIndex + 1'in altına indirmez.
+    #[test]
+    fn stale_responses_do_not_move_progress_backwards() {
+        let log = vec![entry(1, 1), entry(1, 2), entry(1, 3)];
+        let mut node = leader_with_log(1, &[1, 2, 3], 28, log);
+        let _ = node.step(message(2, append_reply(2, true, 3)));
+        let _ = node.step(message(2, append_reply(2, true, 1)));
+        assert_eq!(node.progress[&NodeId(2)].match_index, LogIndex(3));
+        assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(4));
+        let _ = node.step(message(2, append_reply(2, false, 0)));
+        assert_eq!(node.progress[&NodeId(2)].next_index, LogIndex(4));
+    }
+
+    // §5.4.2 (Figure 8): lider, önceki bir term'den (1) gelen girdiyi çoğunlukta olsa bile kopya
+    // sayarak commit ETMEZ. Kendi term'inden (2) bir girdi çoğunluğa ulaşınca o commit edilir ve
+    // öncesindeki girdi de dolaylı olarak commit olur; ikisi de sırayla uygulanır.
+    #[test]
+    fn only_current_term_entries_are_committed_by_counting_replicas() {
+        let mut node = leader_with_log(1, &[1, 2, 3], 29, vec![entry(1, 1)]);
+        assert!(node.step(message(2, append_reply(2, true, 1))).is_empty());
+        assert_eq!(node.commit_index(), LogIndex(0));
+        let _ = node.step(client(9));
+        assert_eq!(
+            node.step(message(2, append_reply(2, true, 2))),
+            vec![apply(1, 1), apply(2, 9)]
+        );
+        assert_eq!(node.commit_index(), LogIndex(2));
+    }
+
+    // Mesaj başına girdi sınırı: geride kalmış bir takipçiye eksik girdiler en fazla `max_entries`
+    // girdilik parçalar hâlinde gider; her başarılı cevap bir sonraki parçayı hemen gönderir.
+    #[test]
+    fn missing_entries_are_sent_in_batches_of_max_entries() {
+        let log = (1..=5).map(|byte| entry(1, byte)).collect();
+        let state = PersistentState {
+            current_term: Term(1),
+            voted_for: None,
+            log,
+        };
+        let config = Config::default().with_max_entries(NonZeroUsize::new(2).expect("not zero"));
+        let mut node = RaftNode::new(NodeId(1), ids(&[1, 2, 3]), config, seed_bytes(30));
+        let _ = node.step(Input::Restart(state));
+        let _ = tick_until_output(&mut node);
+        let _ = node.step(message(2, vote(2, true)));
+        assert_eq!(node.role(), Role::Leader);
+        assert_eq!(
+            node.step(message(2, append_reply(2, false, 0))),
+            vec![send(
+                2,
+                append(2, (0, 0), vec![entry(1, 1), entry(1, 2)], 0)
+            )]
+        );
+        assert_eq!(
+            node.step(message(2, append_reply(2, true, 2))),
+            vec![send(
+                2,
+                append(2, (2, 1), vec![entry(1, 3), entry(1, 4)], 0)
+            )]
+        );
+    }
+
+    // §5.4.1, düğüm düzeyinde ters yön: log'unun son girdisi term 2'de olan düğüm, son girdisi term
+    // 1'de olan bir adaya (log'u daha uzun olsa bile) oy VERMEZ; son term'i eşit ve log'u en az
+    // bizimki kadar uzun bir adaya verir. Yeni term her durumda benimsenir ve yazılır.
+    #[test]
+    fn a_candidate_with_a_stale_log_is_denied_the_vote() {
+        let state = PersistentState {
+            current_term: Term(2),
+            voted_for: None,
+            log: vec![entry(2, 1)],
+        };
+        let mut node = node_with_state(1, &[1, 2, 3], 31, state);
+        let stale = Message::RequestVote(RequestVote {
+            term: Term(3),
+            last_log_index: LogIndex(5),
+            last_log_term: Term(1),
+        });
+        assert_eq!(
+            node.step(message(2, stale)),
+            vec![persist(3, None), send(2, vote(3, false))]
+        );
+        let current = Message::RequestVote(RequestVote {
+            term: Term(3),
+            last_log_index: LogIndex(1),
+            last_log_term: Term(2),
+        });
+        assert_eq!(
+            node.step(message(3, current)),
+            vec![persist(3, Some(3)), send(3, vote(3, true))]
+        );
+    }
+
+    // R1 ve Figure 2: commitIndex ve lastApplied geçicidir; yeniden başlatmada 0'dan başlar. Log
+    // kalır; lider commit bilgisini bir sonraki AppendEntries'le yeniden bildirince girdiler
+    // baştan, sırasıyla yeniden uygulanır (durum makinesi de çökmede kaybolduğu için doğru davranış
+    // budur).
+    #[test]
+    fn a_restart_forgets_the_commit_index_and_reapplies_after_learning_it() {
+        let mut node = node(1, &[1, 2, 3], 32);
+        let entries = vec![entry(1, 10), entry(1, 11)];
+        let _ = node.step(message(2, append(1, (0, 0), entries.clone(), 2)));
+        assert_eq!(node.last_applied(), LogIndex(2));
+        let disk = node.persistent_state();
+        assert!(node.step(Input::Restart(disk)).is_empty());
+        assert_eq!(node.commit_index(), LogIndex(0));
+        assert_eq!(node.last_applied(), LogIndex(0));
+        assert_eq!(node.log(), entries.as_slice());
+        assert_eq!(
+            node.step(message(2, append(1, (2, 1), Vec::new(), 2))),
+            vec![
+                send(2, append_reply(1, true, 2)),
+                apply(1, 10),
+                apply(2, 11)
+            ]
+        );
+    }
+
+    // Tek düğümlü küme: liderin kendi kopyası çoğunluktur; istemci komutu eklendiği adımda commit
+    // edilir ve uygulanır. Gönderecek eş olmadığından tek çıktılar yazma ve uygulamadır.
+    #[test]
+    fn a_single_node_cluster_commits_client_commands_at_once() {
+        let mut node = node(1, &[1], 33);
+        let _ = tick_until_output(&mut node);
+        assert_eq!(node.role(), Role::Leader);
+        assert_eq!(
+            node.step(client(5)),
+            vec![persist_log(1, Some(1), 1, vec![entry(1, 5)]), apply(1, 5)]
+        );
     }
 
     // Kapsama bekçisi: `Input`'in her varyantı için ayrık bir isim döndürür. Kasıtlı olarak `_`
@@ -1046,20 +1705,29 @@ mod tests {
     /// dahil. Term'ler düğümün term'i civarındadır (bir eksik, aynı, bir fazla); aynı term daha
     /// sıktır. `Restart`, sürücünün diskindeki durumu verir.
     ///
-    /// Aday iken üretilen mesajların yarısı, güncel term'e ait bir oy cevabıdır. Neden: tamamen
-    /// tekdüze girdilerle bir adaylık, çoğunluk oyunu toplamadan (daha yüksek bir term, bir
-    /// heartbeat ya da bir yeniden başlatma yüzünden) neredeyse her zaman biter ve sözleşmenin
-    /// lider tarafı hiç sınanmazdı. Kapsama denetimi bunu yakalar.
+    /// Aday iken üretilen mesajların yarısı, güncel term'e ait bir oy cevabıdır; lider iken yarısı
+    /// güncel term'e ait başarılı bir AppendEntries cevabıdır. Neden: tamamen tekdüze girdilerle
+    /// bir adaylık çoğunluğu toplamadan, bir liderlik de commit görmeden (daha yüksek bir term, bir
+    /// heartbeat ya da bir yeniden başlatma yüzünden) neredeyse her zaman biter; sözleşmenin lider
+    /// ve commit tarafı hiç sınanmazdı. Kapsama denetimi bunu yakalar.
     fn random_input(rng: &mut ChaCha8Rng, node: &RaftNode, disk: &PersistentState) -> Input {
         match below(rng, 20) {
-            0..=9 => Input::Tick,
-            10..=17 => {
+            0..=8 => Input::Tick,
+            9..=16 => {
                 let from = NodeId(1 + below(rng, 5));
                 let current = node.current_term().0;
                 if node.role() == Role::Candidate && below(rng, 2) == 0 {
                     let msg = Message::RequestVoteResponse(RequestVoteResponse {
                         term: Term(current),
                         vote_granted: below(rng, 4) != 0,
+                    });
+                    return Input::Message { from, msg };
+                }
+                if node.role() == Role::Leader && below(rng, 2) == 0 {
+                    let msg = Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: Term(current),
+                        success: true,
+                        match_index: LogIndex(below(rng, node.log.last_index().0 + 1)),
                     });
                     return Input::Message { from, msg };
                 }
@@ -1071,43 +1739,86 @@ mod tests {
                 let msg = match below(rng, 4) {
                     0 => Message::RequestVote(RequestVote {
                         term,
-                        last_log_index: LogIndex(below(rng, 2)),
-                        last_log_term: Term(below(rng, 2)),
+                        last_log_index: LogIndex(below(rng, 4)),
+                        last_log_term: Term(below(rng, current + 2)),
                     }),
                     1 => Message::RequestVoteResponse(RequestVoteResponse {
                         term,
                         vote_granted: below(rng, 4) != 0,
                     }),
-                    2 => Message::AppendEntries(AppendEntries { term }),
+                    2 => Message::AppendEntries(random_append(rng, node, term)),
                     _ => Message::AppendEntriesResponse(AppendEntriesResponse {
                         term,
                         success: below(rng, 2) == 0,
+                        match_index: LogIndex(below(rng, node.log.last_index().0 + 2)),
                     }),
                 };
                 Input::Message { from, msg }
             }
-            18 => Input::Restart(disk.clone()),
-            _ => Input::ClientRequest(Command::new(Vec::new())),
+            17 => Input::Restart(disk.clone()),
+            _ => Input::ClientRequest(Command::new(vec![random_byte(rng)])),
+        }
+    }
+
+    fn random_byte(rng: &mut ChaCha8Rng) -> u8 {
+        u8::try_from(below(rng, 256)).unwrap_or(0)
+    }
+
+    /// Rastgele bir AppendEntries. Önceki girdi çoğunlukla düğümün kendi log'uyla tutarlıdır
+    /// (tutarlılık denetimi geçsin, log gerçekten büyüsün ve çakışmalar çözülsün); bazen
+    /// tutarsızdır (ret yolu). Girdilerin term'leri önceki girdinin term'i ile mesajın term'i
+    /// arasında artan sıradadır; leaderCommit doğrulanan önekin biraz ötesine kadar rastgeledir.
+    fn random_append(rng: &mut ChaCha8Rng, node: &RaftNode, term: Term) -> AppendEntries {
+        let prev_log_index = LogIndex(below(rng, node.log.last_index().0 + 2));
+        let prev_log_term = match node.log.term_at(prev_log_index) {
+            Some(own) if below(rng, 4) != 0 => own,
+            _ => Term(below(rng, term.0 + 1)),
+        };
+        let low = prev_log_term.0.min(term.0);
+        let mut terms: Vec<u64> = (0..below(rng, 4))
+            .map(|_| low + below(rng, term.0 - low + 1))
+            .collect();
+        terms.sort_unstable();
+        let entries: Vec<LogEntry> = terms
+            .into_iter()
+            .map(|entry_term| LogEntry {
+                term: Term(entry_term),
+                command: Command::new(vec![random_byte(rng)]),
+            })
+            .collect();
+        let verified = prev_log_index.0 + u64::try_from(entries.len()).unwrap_or(0);
+        AppendEntries {
+            term,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit: LogIndex(below(rng, verified + 2)),
         }
     }
 
     // Sözleşme testi: 300 rastgele girdi dizisinin (her biri 300 adım) her adımından sonra `step`
-    // sözleşmesi denetlenir. Test bir sürücü gibi davranır: her `Persist`'i "diske" yazar ve
-    // `Restart`'ta diski geri verir. Kısa bir zaman aşımı (T = 4, heartbeat = 2) kullanılır:
+    // sözleşmesi denetlenir. Test bir sürücü gibi davranır: her `Persist` farkını "diskine" uygular
+    // ve `Restart`'ta diski geri verir. Kısa bir zaman aşımı (T = 4, heartbeat = 2) kullanılır:
     // seçimler birkaç tick'te başlasın ve bir dizide rol geçişleri sık görülsün. Denetlenenler:
     // - hiçbir girdi panik attırmaz (N3);
-    // - kalıcı durum değiştiyse İLK çıktı, yeni durumu taşıyan TEK `Persist`'tir; değişmediyse hiç
-    //   `Persist` yoktur (O2);
+    // - kalıcı durum değiştiyse İLK çıktı TEK bir `Persist`'tir ve farkı diske uygulamak tam olarak
+    //   bellekteki durumu verir; değişmediyse hiç `Persist` yoktur (O2);
+    // - çıktı sırası: `Persist`, sonra `Send`'ler, en sonda `Apply`'lar;
     // - term asla azalmaz (T1) ve aynı term içinde verilmiş oy değişmez (E1);
     // - aday ve lider kendine oy vermiştir; olumlu oy yalnızca `votedFor`'a gider;
     // - mesajlar yalnızca eşlere gider ve her zaman düğümün güncel term'ini taşır;
-    // - oy isteği yalnızca tick'te seçim başlatan adaydan, heartbeat yalnızca liderden çıkar,
-    //   cevaplar yalnızca isteği gönderene gider;
-    // - `Restart` hiç çıktı üretmez ve düğümü diskteki durumla Follower olarak açar (R1).
+    // - oy isteği yalnızca tick'te seçim başlatan adaydan, AppendEntries yalnızca liderden çıkar,
+    //   cevaplar yalnızca isteği gönderene gider; liderin AppendEntries'i kendi log'unun bir
+    //   dilimini ve kendi commitIndex'ini taşır;
+    // - commitIndex yalnızca artar, lastApplied onu aşmaz; `Apply`'lar ardışık index'lerle ve
+    //   log'daki komutlarla gelir;
+    // - aynı term'de lider kalan düğümün log'u yalnızca uzar (Leader Append-Only);
+    // - `Restart` hiç çıktı üretmez ve düğümü diskteki durumla, commitIndex ve lastApplied 0 olan
+    //   bir Follower olarak açar (R1).
     //
-    // Kapsama: her girdi ve mesaj varyantı üretilmeli, her role ulaşılmalı; seçim kazanma ve oy
-    // verme yeterince sık görülmeli. Aksi hâlde test, sözleşmenin bir kısmını hiç sınamadan
-    // geçerdi.
+    // Kapsama: her girdi ve mesaj varyantı üretilmeli, her role ulaşılmalı; seçim kazanma, oy
+    // verme, uygulama ve log kesme yeterince sık görülmeli. Aksi hâlde test, sözleşmenin bir
+    // kısmını hiç sınamadan geçerdi.
     #[test]
     fn random_inputs_preserve_the_step_contract() {
         let mut inputs_seen = BTreeSet::new();
@@ -1115,6 +1826,8 @@ mod tests {
         let mut roles_seen = BTreeSet::new();
         let mut votes_granted = 0_u32;
         let mut elections_won = 0_u32;
+        let mut entries_applied = 0_u32;
+        let mut truncations = 0_u32;
         for seed in 0..300 {
             let mut rng = ChaCha8Rng::from_seed(seed_bytes(1_000 + seed));
             let config = Config::new(4, 2).expect("valid config");
@@ -1134,6 +1847,8 @@ mod tests {
                 };
                 let before = node.persistent_state();
                 let was_leader = node.role() == Role::Leader;
+                let commit_before = node.commit_index();
+                let applied_before = node.last_applied();
                 let outputs = node.step(input);
                 let after = node.persistent_state();
                 roles_seen.insert(node.role());
@@ -1145,6 +1860,8 @@ mod tests {
                     assert!(outputs.is_empty(), "R1: a restart produces no outputs");
                     assert_eq!(after, disk, "R1: a restart loads the disk");
                     assert_eq!(node.role(), Role::Follower);
+                    assert_eq!(node.commit_index(), LogIndex(0));
+                    assert_eq!(node.last_applied(), LogIndex(0));
                     continue;
                 }
                 let persists = outputs
@@ -1155,12 +1872,30 @@ mod tests {
                     assert_eq!(persists, 0, "O2: no Persist without a change");
                 } else {
                     assert_eq!(persists, 1, "O2: exactly one Persist per changing step");
-                    assert_eq!(
-                        outputs[0],
-                        Output::Persist(after.clone()),
-                        "O2: the Persist comes first and carries the new state"
+                    let Output::Persist(update) = &outputs[0] else {
+                        panic!("O2: the Persist must come first: {outputs:?}");
+                    };
+                    if let Some(log) = &update.log
+                        && log.from.0 <= u64::try_from(before.log.len()).unwrap_or(u64::MAX)
+                    {
+                        truncations += 1;
+                    }
+                    disk.apply(update);
+                    assert_eq!(disk, after, "O2: replaying the update gives the new state");
+                }
+                assert!(
+                    node.commit_index() >= commit_before,
+                    "the commit index never goes backwards"
+                );
+                assert!(node.last_applied() <= node.commit_index());
+                if was_leader
+                    && node.role() == Role::Leader
+                    && after.current_term == before.current_term
+                {
+                    assert!(
+                        after.log.starts_with(&before.log),
+                        "Leader Append-Only: a leader only appends to its log"
                     );
-                    disk = after.clone();
                 }
                 assert!(
                     after.current_term >= before.current_term,
@@ -1172,10 +1907,25 @@ mod tests {
                 if node.role() != Role::Follower {
                     assert_eq!(node.voted_for(), Some(node.id()));
                 }
+                let mut next_apply = applied_before.next();
+                let mut applying = false;
                 for output in &outputs[persists..] {
+                    if let Output::Apply { index, command } = output {
+                        applying = true;
+                        assert_eq!(*index, next_apply, "entries are applied in index order");
+                        assert_eq!(
+                            Some(command),
+                            node.log.entry(*index).map(|entry| &entry.command),
+                            "an applied command is the logged one"
+                        );
+                        next_apply = next_apply.next();
+                        entries_applied += 1;
+                        continue;
+                    }
                     let Output::Send { to, msg } = output else {
-                        panic!("only Sends may follow the Persist: {output:?}");
+                        panic!("only Sends and Applies may follow the Persist: {output:?}");
                     };
+                    assert!(!applying, "Sends come before Applies");
                     assert!(node.peers().contains(to), "messages go to peers only");
                     assert_eq!(
                         msg.term(),
@@ -1190,11 +1940,26 @@ mod tests {
                             tick && node.role() == Role::Candidate,
                             "RequestVote only from a candidate starting an election on a tick"
                         ),
-                        Message::AppendEntries(_) => assert_eq!(
-                            node.role(),
-                            Role::Leader,
-                            "AppendEntries only from a leader"
-                        ),
+                        Message::AppendEntries(request) => {
+                            assert_eq!(
+                                node.role(),
+                                Role::Leader,
+                                "AppendEntries only from a leader"
+                            );
+                            let from = request.prev_log_index.next();
+                            let max = node.config().max_entries();
+                            assert_eq!(
+                                Some(request.prev_log_term),
+                                node.log.term_at(request.prev_log_index),
+                                "the previous entry is the leader's own"
+                            );
+                            assert_eq!(
+                                request.entries,
+                                node.log.entries_from(from, max),
+                                "the entries are a slice of the leader's log"
+                            );
+                            assert_eq!(request.leader_commit, node.commit_index());
+                        }
                         Message::RequestVoteResponse(_) | Message::AppendEntriesResponse(_) => {
                             assert_eq!(sender, Some(*to), "a response goes back to the requester");
                         }
@@ -1212,6 +1977,11 @@ mod tests {
                         votes_granted += 1;
                     }
                 }
+                assert_eq!(
+                    next_apply,
+                    node.last_applied().next(),
+                    "every newly applied index produced exactly one Apply"
+                );
             }
         }
         assert_eq!(
@@ -1238,8 +2008,8 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             "every role must be reached"
         );
-        // Eşikler ölçülen değerlerin (531 liderlik, 2096 oy) çok altındadır: üretici bozulup lider
-        // tarafını seyrek görmeye başlarsa test bunu söyler.
+        // Eşikler ölçülen değerlerin (511 liderlik, 1240 oy, 2744 uygulama, 812 kesme) çok
+        // altındadır: üretici bozulup bir tarafı seyrek görmeye başlarsa test bunu söyler.
         assert!(
             elections_won >= 100,
             "too few elections won ({elections_won}); the leader side is barely exercised"
@@ -1247,6 +2017,15 @@ mod tests {
         assert!(
             votes_granted >= 100,
             "too few votes granted ({votes_granted}); the voting side is barely exercised"
+        );
+        assert!(
+            entries_applied >= 500,
+            "too few entries applied ({entries_applied}); the commit side is barely exercised"
+        );
+        assert!(
+            truncations >= 100,
+            "too few conflicting suffixes replaced ({truncations}); conflict resolution is barely \
+             exercised"
         );
     }
 }

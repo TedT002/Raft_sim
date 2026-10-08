@@ -31,6 +31,14 @@ pub enum ConfigError {
     /// `tick_every` sıfır: saat hiç ilerlemezdi.
     #[error("tick_every must be at least 1")]
     ZeroTickInterval,
+    /// `min_fsync_delay`, `max_fsync_delay`'den büyük.
+    #[error("min_fsync_delay ({min}) must not exceed max_fsync_delay ({max})")]
+    FsyncDelayRange {
+        /// En kısa fsync gecikmesi (tick).
+        min: u64,
+        /// En uzun fsync gecikmesi (tick).
+        max: u64,
+    },
     /// Aynı düğüm kimliği birden fazla kez verildi.
     #[error("node {0:?} was added more than once")]
     DuplicateNode(NodeId),
@@ -50,8 +58,8 @@ pub enum PartitionError {
     UnknownNode(NodeId),
 }
 
-/// Geçersiz bir çökme ya da yeniden başlatma isteği. Hata durumunda simülasyon değişmez (ne düğüm
-/// ne trace).
+/// Geçersiz bir çökme, yeniden başlatma ya da istemci isteği. Hata durumunda simülasyon değişmez
+/// (ne düğüm ne trace).
 ///
 /// Sessizce yok saymak yerine hata dönülür: zaten çökmüş bir düğümü "çökertmek" ya da ayaktaki bir
 /// düğümü "yeniden başlatmak", hata senaryosunu üreten kodda (Faz 5 fuzz koşucusu) bir mantık
@@ -67,4 +75,7 @@ pub enum LifecycleError {
     /// Düğüm zaten ayakta.
     #[error("node {0:?} is already up")]
     AlreadyUp(NodeId),
+    /// Düğüm çökmüş durumda: istek alamaz.
+    #[error("node {0:?} is down")]
+    Down(NodeId),
 }

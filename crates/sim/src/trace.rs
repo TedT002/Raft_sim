@@ -145,6 +145,39 @@ pub enum TraceKind {
         /// Yeniden başlatılan düğüm.
         node: NodeId,
     },
+    /// Bir düğümün en eski bekleyen yazmasının `fsync`'i tamamlandı: yazma artık kalıcı.
+    Sync {
+        /// Yazması kalıcı olan düğüm.
+        node: NodeId,
+    },
+    /// Bir çökmenin kaybettirdikleri: bekleyen yazmalardan kaçı yine de diske ulaştı, kaçı kayboldu
+    /// ve fsync bekleyen kaç çıktı (mesaj ya da uygulama) hiç bırakılamadan yok oldu. Yalnızca
+    /// kaybolacak bir şey varken kaydedilir.
+    CrashLoss {
+        /// Çöken düğüm.
+        node: NodeId,
+        /// Diske ulaşmış sayılan bekleyen yazmalar ("kısmen yazılır").
+        kept_writes: u64,
+        /// Kaybolan bekleyen yazmalar.
+        lost_writes: u64,
+        /// Bırakılamadan yok olan çıktılar.
+        dropped_outputs: u64,
+    },
+    /// Bir düğüm sırası gelen bir yerel etkiyi bıraktı (ör. commit edilmiş bir girdinin durum
+    /// makinesine uygulanması).
+    Apply {
+        /// Etkiyi bırakan düğüm.
+        node: NodeId,
+        /// Etkinin özeti.
+        digest: u64,
+    },
+    /// Bir düğüme istemci isteği verildi.
+    Client {
+        /// İsteği alan düğüm.
+        node: NodeId,
+        /// İsteğin özeti.
+        digest: u64,
+    },
 }
 
 /// Belirli bir zamanda gerçekleşen bir trace olayı.
@@ -233,6 +266,32 @@ impl TraceEvent {
                 hasher.write_u8(9);
                 hasher.write_u64(node.0);
             }
+            TraceKind::Sync { node } => {
+                hasher.write_u8(10);
+                hasher.write_u64(node.0);
+            }
+            TraceKind::CrashLoss {
+                node,
+                kept_writes,
+                lost_writes,
+                dropped_outputs,
+            } => {
+                hasher.write_u8(11);
+                hasher.write_u64(node.0);
+                hasher.write_u64(*kept_writes);
+                hasher.write_u64(*lost_writes);
+                hasher.write_u64(*dropped_outputs);
+            }
+            TraceKind::Apply { node, digest } => {
+                hasher.write_u8(12);
+                hasher.write_u64(node.0);
+                hasher.write_u64(*digest);
+            }
+            TraceKind::Client { node, digest } => {
+                hasher.write_u8(13);
+                hasher.write_u64(node.0);
+                hasher.write_u64(*digest);
+            }
         }
     }
 }
@@ -319,8 +378,8 @@ mod tests {
         assert_eq!(a.len(), 2);
     }
 
-    // Yaşam döngüsü olayları birbirinden ayrışır: aynı düğüm için Tick, Crash, Restart ve Persist
-    // farklı etiketlerle kodlanır, Persist'in özeti de hash'e girer.
+    // Yaşam döngüsü ve disk olayları birbirinden ayrışır: aynı düğüm için her tür farklı bir
+    // etiketle kodlanır; özetler ve sayaçlar da hash'e girer.
     #[test]
     fn lifecycle_events_have_distinct_encodings() {
         let node = NodeId(3);
@@ -330,7 +389,23 @@ mod tests {
             TraceKind::Restart { node },
             TraceKind::Persist { node, digest: 1 },
             TraceKind::Persist { node, digest: 2 },
+            TraceKind::Sync { node },
+            TraceKind::CrashLoss {
+                node,
+                kept_writes: 0,
+                lost_writes: 1,
+                dropped_outputs: 0,
+            },
+            TraceKind::CrashLoss {
+                node,
+                kept_writes: 1,
+                lost_writes: 0,
+                dropped_outputs: 0,
+            },
+            TraceKind::Apply { node, digest: 1 },
+            TraceKind::Client { node, digest: 1 },
         ];
+        let count = kinds.len();
         let mut hashes: Vec<u64> = kinds
             .into_iter()
             .map(|kind| {
@@ -341,7 +416,7 @@ mod tests {
             .collect();
         hashes.sort_unstable();
         hashes.dedup();
-        assert_eq!(hashes.len(), 5);
+        assert_eq!(hashes.len(), count);
     }
 
     // Uzunluk önekleri sayesinde grup sınırları özete girer: [[1],[2,3]] ≠ [[1,2],[3]].
