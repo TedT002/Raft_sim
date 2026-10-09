@@ -34,10 +34,12 @@ use crate::raft::{ClientReply, ClusterError, RaftCluster, ReplyOutcome};
 use crate::rng::{ChaCha8Rng, Component, SeedTree, chance, uniform_inclusive};
 
 /// İş yükündeki işlem karışımı: her işlem türünün ağırlığı. Bir işlemin türü, ağırlıkların toplamı
-/// üzerinden tek bir çekilişle seçilir.
+/// üzerinden tek bir çekilişle seçilir; aralıklar sabit sırayla dizilir (okuma, yazma, ekleme,
+/// silme, ReadIndex okuması). Ağırlığı 0 olan bir tür karışımda hiç yokmuş gibi davranır: ReadIndex
+/// okuması sona eklendiği için onu kullanmayan karışımların iş yükleri değişmez.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpMix {
-    /// Okuma (`Get`) ağırlığı.
+    /// Log üzerinden geçen okuma (`Get` komutu) ağırlığı.
     pub get: u64,
     /// Yazma (`Put`) ağırlığı.
     pub put: u64,
@@ -45,15 +47,18 @@ pub struct OpMix {
     pub append: u64,
     /// Silme (`Delete`) ağırlığı.
     pub delete: u64,
+    /// Log'a yazılmadan cevaplanan okuma (`Get`, ReadIndex, tezin §6.4'ü) ağırlığı.
+    pub read_index: u64,
 }
 
 impl OpMix {
-    /// %40 okuma, %25 yazma, %25 ekleme, %10 silme.
+    /// %40 okuma (log üzerinden), %25 yazma, %25 ekleme, %10 silme.
     pub const DEFAULT: Self = Self {
         get: 8,
         put: 5,
         append: 5,
         delete: 2,
+        read_index: 0,
     };
 
     /// Ağırlıkların toplamı (taşmada doygun).
@@ -62,6 +67,7 @@ impl OpMix {
             .saturating_add(self.put)
             .saturating_add(self.append)
             .saturating_add(self.delete)
+            .saturating_add(self.read_index)
     }
 }
 
@@ -169,6 +175,8 @@ pub struct ClientStats {
     pub deduplicated: u64,
     /// Kapalı bir düğüme verilemeyen denemeler (deneme hakkından düşmez).
     pub refused: u64,
+    /// Log'a yazılmadan (ReadIndex) cevaplanan okumalar.
+    pub index_reads: u64,
 }
 
 impl std::ops::AddAssign for ClientStats {
@@ -183,6 +191,7 @@ impl std::ops::AddAssign for ClientStats {
         self.lost_replies += other.lost_replies;
         self.deduplicated += other.deduplicated;
         self.refused += other.refused;
+        self.index_reads += other.index_reads;
     }
 }
 
@@ -200,6 +209,8 @@ enum ClientState {
 struct Pending {
     seq: u64,
     command: KvCommand,
+    /// Okuma log'a yazılmadan, ReadIndex'le mi yapılıyor (bkz. `RaftCluster::submit_read`)?
+    index_read: bool,
     /// İşlemin geçmişteki yeri.
     operation: usize,
     attempts: u32,
@@ -387,6 +398,9 @@ impl ClientDriver {
                 if duplicate {
                     self.stats.deduplicated += 1;
                 }
+                if pending.index_read {
+                    self.stats.index_reads += 1;
+                }
                 client.completed += 1;
                 client.leader = Some(reply.node);
                 let think =
@@ -416,7 +430,7 @@ impl ClientDriver {
                 }
                 let seq = client.next_seq;
                 client.next_seq += 1;
-                let command = random_command(
+                let (command, index_read) = random_command(
                     &mut self.rng,
                     self.config.keys,
                     self.config.ops,
@@ -436,6 +450,7 @@ impl ClientDriver {
                 let mut pending = Pending {
                     seq,
                     command,
+                    index_read,
                     operation: self.history.len() - 1,
                     attempts: 0,
                     deadline: now,
@@ -520,12 +535,20 @@ fn attempt(
     let Some(target) = client.leader.or_else(|| nodes.get(drawn).copied()) else {
         return Ok(());
     };
-    let request = KvRequest {
-        client: client.id,
-        seq: pending.seq,
-        command: pending.command.clone(),
+    let submitted = match &pending.command {
+        KvCommand::Get { key } if pending.index_read => {
+            cluster.submit_read(target, client.id, pending.seq, key.clone())
+        }
+        command => cluster.submit_request(
+            target,
+            KvRequest {
+                client: client.id,
+                seq: pending.seq,
+                command: command.clone(),
+            },
+        ),
     };
-    match cluster.submit_request(target, request) {
+    match submitted {
         Ok(()) => {
             pending.attempts += 1;
             pending.deadline = now.saturating_add(timeout);
@@ -546,19 +569,31 @@ fn attempt(
 
 /// Rastgele bir işlem: tür, karışımın ağırlıklarıyla seçilir. Yazılan ve eklenen değerler işleme
 /// özgüdür (`"istemci.sıra;"`): değerler ayırt edilebilir olunca kontrolcünün araması hızlanır ve
-/// hatalar daha kesin görünür. Her işlem TAM OLARAK iki çekiliş yapar (anahtar ve tür).
-fn random_command(rng: &mut ChaCha8Rng, keys: u64, ops: OpMix, client: u64, seq: u64) -> KvCommand {
+/// hatalar daha kesin görünür. Her işlem TAM OLARAK iki çekiliş yapar (anahtar ve tür). İkinci
+/// değer, okumanın log'a yazılmadan ReadIndex'le yapılıp yapılmayacağıdır.
+fn random_command(
+    rng: &mut ChaCha8Rng,
+    keys: u64,
+    ops: OpMix,
+    client: u64,
+    seq: u64,
+) -> (KvCommand, bool) {
     let key = format!("k{}", uniform_inclusive(rng, 0, keys.saturating_sub(1))).into_bytes();
     let token = format!("{client}.{seq};").into_bytes();
     let draw = uniform_inclusive(rng, 0, ops.total().saturating_sub(1));
+    let put_end = ops.get.saturating_add(ops.put);
+    let append_end = put_end.saturating_add(ops.append);
+    let delete_end = append_end.saturating_add(ops.delete);
     if draw < ops.get {
-        KvCommand::Get { key }
-    } else if draw < ops.get.saturating_add(ops.put) {
-        KvCommand::Put { key, value: token }
-    } else if draw < ops.get.saturating_add(ops.put).saturating_add(ops.append) {
-        KvCommand::Append { key, value: token }
+        (KvCommand::Get { key }, false)
+    } else if draw < put_end {
+        (KvCommand::Put { key, value: token }, false)
+    } else if draw < append_end {
+        (KvCommand::Append { key, value: token }, false)
+    } else if draw < delete_end {
+        (KvCommand::Delete { key }, false)
     } else {
-        KvCommand::Delete { key }
+        (KvCommand::Get { key }, true)
     }
 }
 
@@ -620,6 +655,7 @@ mod tests {
                 put: 0,
                 append: 0,
                 delete: 0,
+                read_index: 0,
             },
             ..ClientConfig::default()
         };

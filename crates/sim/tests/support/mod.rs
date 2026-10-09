@@ -186,6 +186,8 @@ pub const LOSSY: NetworkConfig = NetworkConfig {
     duplicate_prob: 0.1,
     min_delay: 1,
     max_delay: 5,
+    tail_prob: 0.0,
+    tail_delay: 0,
 };
 
 /// Trace'teki bir gönderim.

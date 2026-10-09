@@ -451,6 +451,7 @@ fn describe(fault: Fault, nodes: u64) -> String {
         }
         Fault::Heal => "heal".to_owned(),
         Fault::Loss { permille } => format!("set the drop rate to {permille}‰"),
+        Fault::IsolateLeader => "isolate the leader".to_owned(),
     }
 }
 

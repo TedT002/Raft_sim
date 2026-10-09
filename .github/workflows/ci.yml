@@ -112,6 +112,11 @@ jobs:
         run: >-
           cargo run --release --locked -p cli --
           fuzz --seeds 0..1000 --threads 4 --profile figure8
+      # Okumaların çoğu log'a yazılmadan (ReadIndex) cevaplanır; liderler sık devrilir.
+      - name: Fuzz 1000 seeds (reads profile)
+        run: >-
+          cargo run --release --locked -p cli --
+          fuzz --seeds 0..1000 --threads 4 --profile reads
 
   mutations:
     name: Mutations

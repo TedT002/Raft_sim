@@ -2,7 +2,7 @@
 
 use crate::message::Message;
 use crate::persist::PersistentState;
-use crate::types::{Command, NodeId};
+use crate::types::{Command, NodeId, ReadId};
 
 /// Sans-IO çekirdeğe dışarıdan gelebilecek tüm olaylar.
 ///
@@ -28,6 +28,15 @@ pub enum Input {
     /// durum makinesinden gelir. Komut boş olmamalıdır: boş komut no-op'a ayrılmıştır
     /// (`Command::noop`).
     ClientRequest(Command),
+    /// Bir istemci doğrusal (linearizable) bir okuma istiyor: log'a girdi EKLENMEDEN cevaplanır
+    /// (ReadIndex, tezin §6.4'ü). Lider, isteğin geldiği andaki commitIndex'i (`readIndex`) not
+    /// eder; kendi term'inden bir girdiyi henüz commit etmediyse onu commit ettiği andaki
+    /// commitIndex'i. Hâlâ lider olduğunu bir doğrulama turuyla (`Message::Probe`) çoğunluğa
+    /// onaylatır ve durum makinesi `readIndex`'e kadar uyguladığında `Output::Read { outcome: Ready
+    /// }` üretir. Sürücü okumayı o anda kendi durum makinesinden cevaplar. Lider olmayan düğüm aynı
+    /// adımda `NotLeader { hint }` döner. Her okuma, düğüm çökmedikçe tam olarak bir `Output::Read`
+    /// alır.
+    Read(ReadId),
     /// Düğüm çöktü ve yeniden başlatıldı; sürücü, simüle diskte `fsync` olmuş (dolayısıyla çökmeden
     /// sağ çıkan) kalıcı durumu geri veriyor. Çekirdek diski kendisi okuyamadığı için (sans-IO)
     /// kurtarma yalnızca bu değere dayanır; bellekte kalmış ama henüz persist edilmemiş

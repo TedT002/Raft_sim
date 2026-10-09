@@ -27,6 +27,17 @@ pub struct NetworkConfig {
     pub min_delay: u64,
     /// En büyük gecikme (tick, ≥ `min_delay`).
     pub max_delay: u64,
+    /// Bir mesajın gecikmesinin "uzun kuyruk"tan gelme olasılığı, `[0, 1]`. Gerçek ağlarda seyrek
+    /// de olsa bir mesaj, protokolün zaman aşımlarından çok daha uzun gecikebilir (bir yeniden
+    /// gönderim kuyruğu, bir duraklama). Böyle bir mesaj, gönderildiği andan bu yana seçimlerin ve
+    /// liderlik değişimlerinin yaşandığı bir dünyaya varır: "bayat mesaj" hatalarını ancak bu tür
+    /// gecikmeler ortaya çıkarır. 0 ise kapalıdır ve ağın RNG akışı ile trace kodlaması bu alanlar
+    /// hiç yokmuş gibi kalır.
+    pub tail_prob: f64,
+    /// Uzun kuyruk gecikmesinin üst sınırı (tick): kuyruktan gelen gecikme `[max_delay,
+    /// tail_delay]` aralığından çekilir. Yalnızca `tail_prob > 0` iken anlamlıdır; o zaman
+    /// `tail_delay ≥ max_delay` olmalıdır.
+    pub tail_delay: u64,
 }
 
 impl NetworkConfig {
@@ -39,10 +50,13 @@ impl NetworkConfig {
             duplicate_prob: 0.0,
             min_delay: delay,
             max_delay: delay,
+            tail_prob: 0.0,
+            tail_delay: delay,
         }
     }
 
-    /// Ayarları doğrular: olasılıklar sonlu ve `[0, 1]` içinde, `1 ≤ min_delay ≤ max_delay`.
+    /// Ayarları doğrular: olasılıklar sonlu ve `[0, 1]` içinde, `1 ≤ min_delay ≤ max_delay` ve
+    /// uzun kuyruk açıksa `max_delay ≤ tail_delay`.
     ///
     /// # Errors
     ///
@@ -50,6 +64,7 @@ impl NetworkConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         check_probability("drop_prob", self.drop_prob)?;
         check_probability("duplicate_prob", self.duplicate_prob)?;
+        check_probability("tail_prob", self.tail_prob)?;
         if self.min_delay == 0 {
             return Err(ConfigError::ZeroMinDelay);
         }
@@ -57,6 +72,12 @@ impl NetworkConfig {
             return Err(ConfigError::DelayRange {
                 min: self.min_delay,
                 max: self.max_delay,
+            });
+        }
+        if self.tail_prob > 0.0 && self.tail_delay < self.max_delay {
+            return Err(ConfigError::TailDelayRange {
+                max: self.max_delay,
+                tail: self.tail_delay,
             });
         }
         Ok(())
@@ -72,11 +93,20 @@ impl TraceEncode for NetworkConfig {
             duplicate_prob,
             min_delay,
             max_delay,
+            tail_prob,
+            tail_delay,
         } = self;
         out.extend_from_slice(&drop_prob.to_bits().to_le_bytes());
         out.extend_from_slice(&duplicate_prob.to_bits().to_le_bytes());
         out.extend_from_slice(&min_delay.to_le_bytes());
         out.extend_from_slice(&max_delay.to_le_bytes());
+        // Uzun kuyruk yalnızca açıkken kodlanır: kapalıyken kodlama (ve onu kullanan koşuların
+        // trace özetleri) bu alanlar eklenmeden önceki hâliyle aynıdır. Açık ve kapalı ayarların
+        // kodlamalarının uzunlukları farklıdır; birbirine karışmazlar.
+        if *tail_prob > 0.0 {
+            out.extend_from_slice(&tail_prob.to_bits().to_le_bytes());
+            out.extend_from_slice(&tail_delay.to_le_bytes());
+        }
     }
 }
 
@@ -205,7 +235,8 @@ impl SimNetwork {
 
     /// Ayarları değiştirir (ör. bir hata programının kayıp oranını değiştirmesi). Yoldaki mesajlar
     /// gönderildikleri andaki kararlarını korur; yeni ayarlar yalnızca bundan sonraki gönderimlere
-    /// uygulanır. RNG akışının biçimi değişmez: `route` her çağrıda yine tam dört çekiliş yapar.
+    /// uygulanır. RNG akışının biçimi, uzun kuyruk açılıp kapanmadıkça değişmez: `route` her
+    /// çağrıda yine aynı sayıda çekiliş yapar.
     ///
     /// # Errors
     ///
@@ -241,8 +272,20 @@ impl Network for SimNetwork {
         // yine değiştirebilir.
         let dropped = chance(&mut self.rng, self.config.drop_prob);
         let duplicated = chance(&mut self.rng, self.config.duplicate_prob);
-        let first_delay = self.delay();
+        let mut first_delay = self.delay();
         let second_delay = self.delay();
+        // Uzun kuyruk yalnızca açıkken çekilir (iki çekiliş daha: olasılık ve gecikme). Kapalıyken
+        // akış birebir eskisi gibidir; açıkken de çekiliş sayısı kaderden bağımsızdır. Kuyruk asıl
+        // mesajı geciktirir; varsa kopyası kendi normal gecikmesiyle, en geç onunla aynı anda
+        // varır.
+        if self.config.tail_prob > 0.0 {
+            let tail = chance(&mut self.rng, self.config.tail_prob);
+            let ticks =
+                uniform_inclusive(&mut self.rng, self.config.max_delay, self.config.tail_delay);
+            if tail {
+                first_delay = NonZeroU64::new(ticks).unwrap_or(first_delay);
+            }
+        }
 
         if !self.connected(from, to) {
             return Fate::Dropped(DropReason::PartitionAtSend);
@@ -355,6 +398,25 @@ mod tests {
                 },
                 ConfigError::DelayRange { min: 5, max: 2 },
             ),
+            (
+                NetworkConfig {
+                    tail_prob: 2.0,
+                    ..valid
+                },
+                ConfigError::InvalidProbability {
+                    name: "tail_prob",
+                    value: 2.0,
+                },
+            ),
+            (
+                NetworkConfig {
+                    max_delay: 9,
+                    tail_prob: 0.1,
+                    tail_delay: 8,
+                    ..valid
+                },
+                ConfigError::TailDelayRange { max: 9, tail: 8 },
+            ),
         ];
         for (config, expected) in cases {
             assert_eq!(config.validate(), Err(expected));
@@ -368,6 +430,46 @@ mod tests {
             Err(ConfigError::InvalidProbability { .. })
         ));
         assert_eq!(valid.validate(), Ok(()));
+        // Kuyruk kapalıyken üst sınırı anlamsızdır ve denetlenmez.
+        let closed = NetworkConfig {
+            max_delay: 9,
+            tail_delay: 0,
+            ..valid
+        };
+        assert_eq!(closed.validate(), Ok(()));
+    }
+
+    // Uzun kuyruk kapalıyken ağın kararları (dolayısıyla RNG akışı) kuyruğun üst sınırından
+    // bağımsızdır: kuyruk hiç yokmuş gibi davranır. Açıkken kararlar değişir.
+    #[test]
+    fn a_closed_tail_leaves_the_stream_unchanged() {
+        let base = NetworkConfig {
+            drop_prob: 0.2,
+            duplicate_prob: 0.3,
+            min_delay: 1,
+            max_delay: 9,
+            tail_prob: 0.0,
+            tail_delay: 0,
+        };
+        let fates = |config: NetworkConfig| -> Vec<Fate> {
+            let mut net = network(config);
+            (0..200).map(|_| net.route(N1, N2)).collect()
+        };
+        assert_eq!(
+            fates(base),
+            fates(NetworkConfig {
+                tail_delay: 500,
+                ..base
+            })
+        );
+        assert_ne!(
+            fates(base),
+            fates(NetworkConfig {
+                tail_prob: 0.5,
+                tail_delay: 500,
+                ..base
+            })
+        );
     }
 
     // Bağlantı kuralları: HER grup kendi içinde haberleşir (yalnızca ilki değil), farklı gruplar
@@ -470,6 +572,8 @@ mod tests {
             duplicate_prob: 0.3,
             min_delay: 1,
             max_delay: 50,
+            tail_prob: 0.0,
+            tail_delay: 0,
         };
         let mut plain = network(lossy);
         let mut cut = network(lossy);

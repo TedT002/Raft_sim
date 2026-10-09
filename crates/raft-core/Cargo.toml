@@ -28,6 +28,8 @@ mutation-forget-vote = []
 mutation-truncate-on-append = []
 mutation-skip-prev-log-term = []
 mutation-apply-before-commit = []
+mutation-read-without-quorum = []
+mutation-read-before-term-commit = []
 
 [lints]
 workspace = true

@@ -31,6 +31,8 @@ pub enum Profile {
     Chaos,
     /// Figure 8 style faults: one entry per AppendEntries and frequent leader changes.
     Figure8,
+    /// The chaos mix where most reads skip the log (ReadIndex) and leaders crash often.
+    Reads,
 }
 
 impl Profile {
@@ -40,6 +42,7 @@ impl Profile {
         match self {
             Profile::Chaos => ScenarioConfig::chaos(),
             Profile::Figure8 => ScenarioConfig::figure8(),
+            Profile::Reads => ScenarioConfig::reads(),
         }
     }
 
@@ -49,6 +52,7 @@ impl Profile {
         match self {
             Profile::Chaos => "chaos",
             Profile::Figure8 => "figure8",
+            Profile::Reads => "reads",
         }
     }
 
@@ -58,6 +62,7 @@ impl Profile {
         match self {
             Profile::Chaos => "",
             Profile::Figure8 => " --profile figure8",
+            Profile::Reads => " --profile reads",
         }
     }
 }

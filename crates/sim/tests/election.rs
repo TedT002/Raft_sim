@@ -23,6 +23,8 @@ const JITTERY: NetworkConfig = NetworkConfig {
     duplicate_prob: 0.0,
     min_delay: 1,
     max_delay: 6,
+    tail_prob: 0.0,
+    tail_delay: 0,
 };
 
 fn cluster(seed: u64, size: u64, network: NetworkConfig) -> RaftCluster {

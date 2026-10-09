@@ -29,6 +29,15 @@ pub enum Message {
     /// mesajlar çoğaltılıp gecikebildiği için bir cevap, hangi isteğe ait olduğu bilinerek
     /// eşlenemez.
     AppendEntriesResponse(AppendEntriesResponse),
+    /// Tezin §6.4'ü (ReadIndex): lider, bekleyen bir okumayı cevaplamadan önce HÂLÂ lider olduğunu
+    /// doğrulamak için bu turu gönderir. Figure 2'de yoktur; tez okuma için "yeni bir heartbeat
+    /// turu" ister. Ayrı bir mesaj olmasının nedeni: cevap turun numarasını geri taşır, böylece
+    /// geciken ya da çoğaltılmış eski bir cevap, okuma geldikten SONRA başlayan bir turu onaylamış
+    /// sayılmaz. AppendEntries'e alan eklemek de olurdu; ama o zaman okumasız her koşunun mesajları
+    /// da değişirdi.
+    Probe(Probe),
+    /// `Probe`'a verilen cevap: cevaplayanın term'i ve turun numarası.
+    ProbeResponse(ProbeResponse),
 }
 
 impl Message {
@@ -43,6 +52,8 @@ impl Message {
             Message::RequestVoteResponse(response) => response.term,
             Message::AppendEntries(request) => request.term,
             Message::AppendEntriesResponse(response) => response.term,
+            Message::Probe(request) => request.term,
+            Message::ProbeResponse(response) => response.term,
         }
     }
 }
@@ -103,4 +114,25 @@ pub struct AppendEntriesResponse {
     ///   çeker; geride kalmış bir takipçi yüzlerce tur yerine tek turda yakalanır. Bu, §5.3'ün
     ///   sonunda anlatılan iyileştirmenin basit bir hâlidir.
     pub match_index: LogIndex,
+}
+
+/// Liderliği doğrulama turu (ReadIndex, tezin §6.4'ü; bkz. `Message::Probe`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// Liderin term'i.
+    pub term: Term,
+    /// Turun numarası: lider her yeni turda bir artırır (liderlik başına 1'den).
+    pub round: u64,
+}
+
+/// `Probe` cevabı.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeResponse {
+    /// Cevaplayanın güncel term'i. Liderinkinden yüksekse lider geride kaldığını öğrenir (T1).
+    pub term: Term,
+    /// Onaylanan turun numarası: tur cevaplayanın GÜNCEL term'inden geldiyse istekteki `round`,
+    /// değilse 0 (onay değildir; turlar 1'den sayılır). Yalnızca o zaman, aynı term'deki bir cevap
+    /// "cevaplayan, bu term'in liderini o turdan sonra tanıdı" demektir: başka bir term'in turuna
+    /// verilen cevap, aynı numaralı yeni bir turun onayı sanılamaz.
+    pub round: u64,
 }

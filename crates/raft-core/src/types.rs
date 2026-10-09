@@ -41,6 +41,15 @@ impl LogIndex {
     }
 }
 
+/// Bir okuma isteğinin kimliği (ReadIndex, tezin §6.4'ü; bkz. `Input::Read`).
+///
+/// Sürücü seçer; çekirdek için opaktır ve yalnızca cevabı isteğe bağlar (`Output::Read`). Neden
+/// ayrı bir kimlik: okuma log'a girmez, yani bir log index'i ya da komutu yoktur. Cevap ise
+/// isteğin geldiği adımda değil, liderliği doğrulayan tur tamamlandığında, sonraki bir adımda
+/// üretilir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadId(pub u64);
+
 /// İstemcinin durum makinesine uygulanmasını istediği komutun opak bayt gösterimi.
 ///
 /// `raft-core` bu baytların içeriğini asla yorumlamaz/ayrıştırmaz: KV durum makinesi (Put/Delete

@@ -2,7 +2,7 @@
 
 use crate::message::Message;
 use crate::persist::PersistUpdate;
-use crate::types::{Command, LogIndex, NodeId};
+use crate::types::{Command, LogIndex, NodeId, ReadId};
 
 /// Bir `step` çağrısının sonucunda yapılması istenen eylemlerden biri.
 ///
@@ -42,10 +42,37 @@ pub enum Output {
         /// Uygulanacak komut.
         command: Command,
     },
+    /// Bir okuma isteğinin (`Input::Read`) sonucu. Aynı adımın `Apply`'larından SONRA gelir:
+    /// `Ready` geldiğinde sürücünün durum makinesi, çekirdeğin o ana kadar ürettiği bütün
+    /// `Apply`'ları uygulamış olur (çıktılar sırayla yürütülür, O1) ve okuma o durumdan
+    /// cevaplanır.
+    Read {
+        /// İsteğin kimliği.
+        id: ReadId,
+        /// Sonuç.
+        outcome: ReadOutcome,
+    },
     /// Bu adımı başlatan istemci isteğine bir cevap gönderilmesi istenir. Yalnızca bir
     /// `Input::ClientRequest` adımında üretilir; cevabın hangi isteğe ait olduğu böylece bellidir
     /// (çekirdek istemci kimliklerini bilmez, komutlar opaktır; C1).
     ClientResponse(ClientResponse),
+}
+
+/// Bir okumanın sonucu (ReadIndex, tezin §6.4'ü).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// Okuma şimdi yerel durum makinesinden cevaplanabilir. Lider, okuma geldikten SONRA
+    /// başlattığı bir doğrulama turunu çoğunluğa onaylattı (o turda daha yüksek term'li bir lider
+    /// yoktu) ve durum makinesi okumanın `readIndex`'ine kadar uygulandı. Okuma geldiğinde
+    /// tamamlanmış her yazma bu durumdadır.
+    Ready,
+    /// Bu düğüm lider değil ya da okuma tamamlanmadan liderliği bıraktı; okuma cevaplanmadı ve
+    /// başka bir düğüme yeniden gönderilebilir (okumanın hiçbir etkisi yoktur). `hint`, düğümün
+    /// bildiği lider.
+    NotLeader {
+        /// Bilinen lider, varsa.
+        hint: Option<NodeId>,
+    },
 }
 
 /// Çekirdeğin bir istemci isteğine verdiği cevap.

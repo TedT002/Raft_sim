@@ -2,20 +2,21 @@
 //!
 //! Deterministik kaos senaryolarını koşturan komut satırı aracı:
 //!
-//! - `raftsim fuzz --seeds A..B [--threads N] [--profile chaos|figure8] [--shrink]`: her seed'in
+//! - `raftsim fuzz --seeds A..B [--threads N] [--profile P] [--shrink]`: her seed'in
 //!   senaryosunu (bkz. `sim::Scenario`) koşturur; HER olaydan sonra Raft invariant'ları, sonda
 //!   istemci geçmişinin linearizability'si denetlenir. Seed'ler iş parçacıklarına dağıtılır ama her
 //!   koşu tek iş parçacıklıdır ve yalnızca seed'ine bağlıdır: sonuç, iş parçacığı sayısından
 //!   bağımsızdır. Başarısız her seed, seed'iyle ve tek satırlık yeniden üretme komutuyla
 //!   raporlanır; `--shrink` her başarısız senaryoyu aynı hatayı veren daha küçük bir senaryoya
 //!   indirir.
-//! - `raftsim replay --seed N [--profile chaos|figure8] [--trace] [--faults i,j,...|none]
-//!   [--horizon H]`: bir seed'in koşusunu birebir tekrarlar; isteğe bağlı olarak hata programını,
+//! - `raftsim replay --seed N [--profile P] [--trace] [--faults i,j,...|none] [--horizon H]`: bir
+//!   seed'in koşusunu birebir tekrarlar; isteğe bağlı olarak hata programını,
 //!   olay izini ve kümenin son hâlini yazdırır. `--faults` ve `--horizon`, küçültülmüş (shrink) bir
 //!   senaryoyu yeniden üretir.
 //!
-//! `--profile` senaryo ayarlarını seçer: `chaos` (varsayılan; kayıplı ağ, çökmeler, bölünmeler)
-//! ya da `figure8` (mesaj başına tek girdi ve sık lider değişimi, §5.4.2'nin tuzağı için).
+//! `--profile` senaryo ayarlarını seçer: `chaos` (varsayılan; kayıplı ağ, çökmeler, bölünmeler),
+//! `figure8` (mesaj başına tek girdi ve sık lider değişimi, §5.4.2'nin tuzağı için) ya da `reads`
+//! (okumaların çoğu log'a yazılmadan ReadIndex'le cevaplanır, tezin §6.4'ü).
 //!
 //! Paket adı `cli`, ikili adı `raftsim` olduğundan yeniden üretme komutu
 //! `cargo run -p cli -- replay --seed <N>` olur. Çıkış kodları: 0 başarı, 1 başarısız bir koşu, 2

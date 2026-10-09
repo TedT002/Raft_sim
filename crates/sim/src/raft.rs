@@ -5,7 +5,9 @@
 //!
 //! 1. `RaftNode` için [`SimNode`]'u uygular: `NodeInput`/`NodeOutput` ile raft-core'un
 //!    `Input`/`Output`'u arasında birebir çeviri. Mesajlar, kalıcı durum ve farklar için kanonik
-//!    trace kodlamaları da buradadır.
+//!    trace kodlamaları da buradadır. İstemci isteği ya log'a yazılacak bir komut ya da log'a
+//!    yazılmadan cevaplanacak bir okumadır ([`RaftRequest`]); `Ready` olan okumayı küme, düğümün
+//!    KV durum makinesinden cevaplar (ReadIndex, tezin §6.4'ü).
 //! 2. [`RaftCluster`]: simülasyonu olay olay sürer ve HER olaydan sonra (bir düğüm adımı, bir fsync
 //!    ya da bir teslim ve çıktılarının uygulanması) şunları denetler:
 //!    - Figure 3'ün beş güvenlik özelliği, bağımsız kâhinlerle (`checker` crate'i): **Election
@@ -64,8 +66,8 @@ use checker::{
 };
 use raft_core::{
     AppendEntries, AppendEntriesResponse, ClientResponse, Command, Config, Input, LogEntry,
-    LogIndex, LogUpdate, Message, NodeId, Output, PersistUpdate, PersistentState, RaftNode,
-    RequestVote, RequestVoteResponse, Role, Term,
+    LogIndex, LogUpdate, Message, NodeId, Output, PersistUpdate, PersistentState, Probe,
+    ProbeResponse, RaftNode, ReadId, ReadOutcome, RequestVote, RequestVoteResponse, Role, Term,
 };
 
 use crate::disk::{DiskConfig, SimDisk};
@@ -86,6 +88,30 @@ pub struct AppliedEntry {
     pub command: Command,
 }
 
+/// Raft düğümüne verilen bir istemci isteği (`NodeInput::Client`): log'a yazılacak bir komut ya da
+/// log'a yazılmadan cevaplanacak bir okuma (ReadIndex, tezin §6.4'ü).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftRequest {
+    /// Log üzerinden geçen bir komut (`Input::ClientRequest`).
+    Command(Command),
+    /// Log'a girmeyen bir okuma (`Input::Read`).
+    Read(ReadId),
+}
+
+/// Raft düğümünün istemciye cevabı (`NodeOutput::Reply`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftResponse {
+    /// Bir komutun reddi (§8).
+    NotLeader(NotLeaderReply),
+    /// Bir okumanın sonucu (`Output::Read`).
+    Read {
+        /// Okumanın kimliği.
+        id: ReadId,
+        /// Sonuç.
+        outcome: ReadOutcome,
+    },
+}
+
 /// Lider olmayan bir düğümün bir istemci isteğine cevabı (`ClientResponse::NotLeader`, §8):
 /// reddedilen istek ve düğümün bildiği lider.
 ///
@@ -104,21 +130,26 @@ pub struct NotLeaderReply {
 impl SimNode for RaftNode {
     type Msg = Message;
     type Durable = PersistentState;
-    type Request = Command;
+    type Request = RaftRequest;
     type Applied = AppliedEntry;
-    type Response = NotLeaderReply;
+    type Response = RaftResponse;
 
     fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
-        // Cevabı isteğe bağlamak için isteğin bir kopyası (bkz. `NotLeaderReply`).
+        // Cevabı isteğe bağlamak için komutun bir kopyası (bkz. `NotLeaderReply`). Okumanın cevabı
+        // kimliğini zaten taşır.
         let request = match &input {
-            NodeInput::Client(command) => Some(command.clone()),
-            NodeInput::Tick | NodeInput::Message { .. } | NodeInput::Restart(_) => None,
+            NodeInput::Client(RaftRequest::Command(command)) => Some(command.clone()),
+            NodeInput::Client(RaftRequest::Read(_))
+            | NodeInput::Tick
+            | NodeInput::Message { .. }
+            | NodeInput::Restart(_) => None,
         };
         let input = match input {
             NodeInput::Tick => Input::Tick,
             NodeInput::Message { from, msg } => Input::Message { from, msg },
             NodeInput::Restart(state) => Input::Restart(state),
-            NodeInput::Client(command) => Input::ClientRequest(command),
+            NodeInput::Client(RaftRequest::Command(command)) => Input::ClientRequest(command),
+            NodeInput::Client(RaftRequest::Read(id)) => Input::Read(id),
         };
         // `RaftNode::step` yazımı raft-core'un kendi `step`'ini çağırır (yerleşik metot, trait
         // metodundan önce gelir). Çıktılar sırası korunarak çevrilir (O1).
@@ -134,9 +165,14 @@ impl SimNode for RaftNode {
                 // adımda üretseydi bağlanacak bir istek olmazdı ve cevap düşerdi. `_` kolu bilerek
                 // yok: `Output`'a ya da cevaba yeni bir varyant eklenince burası derlenmez ve
                 // adaptör bilinçli olarak güncellenir.
-                Output::ClientResponse(ClientResponse::NotLeader { hint }) => request
-                    .clone()
-                    .map(|request| NodeOutput::Reply(NotLeaderReply { request, hint })),
+                Output::ClientResponse(ClientResponse::NotLeader { hint }) => {
+                    request.clone().map(|request| {
+                        NodeOutput::Reply(RaftResponse::NotLeader(NotLeaderReply { request, hint }))
+                    })
+                }
+                Output::Read { id, outcome } => {
+                    Some(NodeOutput::Reply(RaftResponse::Read { id, outcome }))
+                }
             })
             .collect()
     }
@@ -157,6 +193,8 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 }
 
 /// Uzunluk önekli bir bayt dizisi yazar: önek, ardışık iki alanın sınırını belirsizlikten kurtarır.
+/// Uzunluk `u64`'e her desteklenen platformda sığar; sığmasaydı yazılacak `u64::MAX`, okumaların
+/// işaretiyle (`READ_MARK`) aynı olurdu. O yol pratikte erişilemez (2^64 baytlık bir komut yoktur).
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     put_u64(out, u64::try_from(bytes.len()).unwrap_or(u64::MAX));
     out.extend_from_slice(bytes);
@@ -230,6 +268,16 @@ impl TraceEncode for Message {
                 out.push(u8::from(*success));
                 put_u64(out, match_index.0);
             }
+            Message::Probe(Probe { term, round }) => {
+                out.push(5);
+                put_u64(out, term.0);
+                put_u64(out, *round);
+            }
+            Message::ProbeResponse(ProbeResponse { term, round }) => {
+                out.push(6);
+                put_u64(out, term.0);
+                put_u64(out, *round);
+            }
         }
     }
 }
@@ -288,6 +336,43 @@ impl TraceEncode for NotLeaderReply {
         let NotLeaderReply { request, hint } = self;
         put_bytes(out, request.as_bytes());
         put_vote(out, *hint);
+    }
+}
+
+/// Okumaların kodlamasının başındaki işaret: uzunluk öneki yerinde `u64::MAX`. Bir komutun
+/// kodlaması uzunluk önekiyle başlar ve 2^64 - 1 baytlık bir komut olamaz; işaret, okumaları
+/// komutlardan ayırır. Komutlar etiketsiz kalır, böylece okumasız koşuların trace özetleri
+/// okumalar eklenmeden önceki hâliyle birebir aynıdır.
+const READ_MARK: u64 = u64::MAX;
+
+impl TraceEncode for RaftRequest {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            RaftRequest::Command(command) => command.encode(out),
+            RaftRequest::Read(id) => {
+                put_u64(out, READ_MARK);
+                put_u64(out, id.0);
+            }
+        }
+    }
+}
+
+impl TraceEncode for RaftResponse {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            RaftResponse::NotLeader(reply) => reply.encode(out),
+            RaftResponse::Read { id, outcome } => {
+                put_u64(out, READ_MARK);
+                put_u64(out, id.0);
+                match outcome {
+                    ReadOutcome::Ready => out.push(0),
+                    ReadOutcome::NotLeader { hint } => {
+                        out.push(1);
+                        put_vote(out, *hint);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -543,6 +628,19 @@ pub struct RaftCluster {
     client_replies: Vec<ClientReply>,
     // `submit`'in iç oturumunun (istemci 0) bir sonraki sıra numarası.
     driver_seq: u64,
+    // Cevap bekleyen okumalar (ReadIndex): düğüm ve okuma kimliği başına hangi istemcinin hangi
+    // anahtarı okuduğu. Düğüm çökünce o düğümün okumaları düşer (bağlantı kopar).
+    reads: BTreeMap<(NodeId, ReadId), ClientRead>,
+    // Bir sonraki okuma kimliği: her deneme yeni bir kimlik alır.
+    next_read: u64,
+}
+
+/// Cevap bekleyen bir okuma: kimin, hangi anahtarı.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientRead {
+    client: u64,
+    seq: u64,
+    key: Vec<u8>,
 }
 
 impl RaftCluster {
@@ -578,6 +676,8 @@ impl RaftCluster {
             pending: BTreeMap::new(),
             client_replies: Vec::new(),
             driver_seq: 0,
+            reads: BTreeMap::new(),
+            next_read: 0,
         })
     }
 
@@ -677,6 +777,7 @@ impl RaftCluster {
         self.sim.crash(id)?;
         // İstemcilerin bu düğüme açık istekleri bağlantıyla birlikte kopar: cevapları hiç gelmez.
         self.pending.remove(&id);
+        self.reads.retain(|&(node, _), _| node != id);
         self.stores.insert(id, KvStore::default());
         self.state_machine.observe_restart(id.0);
         self.completeness.observe_restart(id.0);
@@ -715,7 +816,8 @@ impl RaftCluster {
             seq: self.driver_seq,
             command,
         };
-        self.sim.submit(id, request.encode())?;
+        self.sim
+            .submit(id, RaftRequest::Command(request.encode()))?;
         self.check()
     }
 
@@ -733,7 +835,8 @@ impl RaftCluster {
     /// Düğüm yoksa ya da çökmüşse [`ClusterError::Lifecycle`] (istek verilmez); ardından bir
     /// invariant çiğnenmişse [`ClusterError::Violation`].
     pub fn submit_request(&mut self, id: NodeId, request: KvRequest) -> Result<(), ClusterError> {
-        self.sim.submit(id, request.encode())?;
+        self.sim
+            .submit(id, RaftRequest::Command(request.encode()))?;
         // Cevap (reddetme) aynı adımda bırakılmış olabilir: istek, `check` cevapları işlemeden
         // önce kaydedilir.
         *self
@@ -742,6 +845,36 @@ impl RaftCluster {
             .or_default()
             .entry((request.client, request.seq))
             .or_default() += 1;
+        self.check()
+    }
+
+    /// Ayaktaki bir düğüme log'a yazılmayacak bir okuma verir (ReadIndex, tezin §6.4'ü) ve
+    /// invariant'ları denetler. Okumanın cevabı sırası gelince
+    /// [`RaftCluster::take_client_replies`]'tan alınır:
+    ///
+    /// - Düğüm lider değilse ya da okuma tamamlanmadan liderliği bırakırsa `NotLeader { hint }`.
+    /// - Lider okumayı doğruladığında `Done { result: Value(..) }`: değer, düğümün KV durum
+    ///   makinesinin o anki hâlinden okunur. Okuma oturumlara girmez (hiçbir etkisi yoktur).
+    /// - Düğüm cevap veremeden çökerse hiç cevap gelmez; istemci zaman aşımında yeniden dener.
+    ///
+    /// # Errors
+    ///
+    /// Düğüm yoksa ya da çökmüşse [`ClusterError::Lifecycle`] (okuma verilmez); ardından bir
+    /// invariant çiğnenmişse [`ClusterError::Violation`].
+    pub fn submit_read(
+        &mut self,
+        id: NodeId,
+        client: u64,
+        seq: u64,
+        key: Vec<u8>,
+    ) -> Result<(), ClusterError> {
+        self.next_read = self.next_read.saturating_add(1);
+        let read = ReadId(self.next_read);
+        self.sim.submit(id, RaftRequest::Read(read))?;
+        // Cevap aynı adımda bırakılmış olabilir (ör. lider olmayan düğümün reddi): okuma, `check`
+        // cevapları işlemeden önce kaydedilir.
+        self.reads
+            .insert((id, read), ClientRead { client, seq, key });
         self.check()
     }
 
@@ -822,18 +955,52 @@ impl RaftCluster {
                 });
             }
         }
-        // Reddedilen istekler: bekleyen istemciye `NotLeader` döner.
+        // Reddedilen istekler bekleyen istemciye `NotLeader` döner. Sonuçlanan okumalar düğümün
+        // durum makinesinden cevaplanır: bu olayın uygulamaları yukarıda işlendi, yani okuma,
+        // düğümün `Ready`'den önce verdiği her `Apply`'ı görür (Q1). Aynı olayda okumadan SONRA
+        // bırakılan bir uygulama da görünebilir; o da commit edilmiş bir yazmadır ve okumanın
+        // aralığı içinde gerçekleşmiştir: sonuç yine doğrusaldır.
         for (id, reply) in self.sim.take_replies() {
-            let Ok(request) = KvRequest::decode(reply.request.as_bytes()) else {
-                continue;
-            };
-            if close_attempt(&mut self.pending, id, (request.client, request.seq)) {
-                self.client_replies.push(ClientReply {
-                    client: request.client,
-                    seq: request.seq,
-                    node: id,
-                    outcome: ReplyOutcome::NotLeader { hint: reply.hint },
-                });
+            match reply {
+                RaftResponse::NotLeader(reply) => {
+                    let Ok(request) = KvRequest::decode(reply.request.as_bytes()) else {
+                        continue;
+                    };
+                    if close_attempt(&mut self.pending, id, (request.client, request.seq)) {
+                        self.client_replies.push(ClientReply {
+                            client: request.client,
+                            seq: request.seq,
+                            node: id,
+                            outcome: ReplyOutcome::NotLeader { hint: reply.hint },
+                        });
+                    }
+                }
+                RaftResponse::Read { id: read, outcome } => {
+                    let Some(ClientRead { client, seq, key }) = self.reads.remove(&(id, read))
+                    else {
+                        continue;
+                    };
+                    let outcome = match outcome {
+                        ReadOutcome::Ready => {
+                            let value = self
+                                .stores
+                                .get(&id)
+                                .and_then(|store| store.get(&key))
+                                .map(<[u8]>::to_vec);
+                            ReplyOutcome::Done {
+                                result: KvResult::Value(value),
+                                duplicate: false,
+                            }
+                        }
+                        ReadOutcome::NotLeader { hint } => ReplyOutcome::NotLeader { hint },
+                    };
+                    self.client_replies.push(ClientReply {
+                        client,
+                        seq,
+                        node: id,
+                        outcome,
+                    });
+                }
             }
         }
 

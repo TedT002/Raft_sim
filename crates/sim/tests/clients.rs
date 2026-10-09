@@ -408,6 +408,8 @@ fn workload_run(seed: u64) -> (RaftCluster, ClientDriver) {
         duplicate_prob: 0.0,
         min_delay: 1,
         max_delay: 3,
+        tail_prob: 0.0,
+        tail_delay: 0,
     };
     let mut cluster = RaftCluster::new(seed, ClusterConfig::new(3, network)).expect("valid config");
     let config = ClientConfig {

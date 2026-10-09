@@ -5,7 +5,7 @@
 //! istemci arayüzünün çekirdekteki kısmı (§8): lider olmayan düğümün `NotLeader { hint }` cevabı ve
 //! yeni liderin term başında eklediği no-op girdi. Tekrarlanan isteklerin ayıklanması (aynı
 //! `(client_id, seq)`'in bir kez uygulanması) durum makinesinin işidir: komutlar çekirdek için
-//! opaktır (C1).
+//! opaktır (C1). Okumalar log'a yazılmadan da cevaplanabilir (ReadIndex, tezin §6.4'ü; Q1).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,12 +16,13 @@ use crate::config::Config;
 use crate::input::Input;
 use crate::log::{Log, LogEntry};
 use crate::message::{
-    AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
+    AppendEntries, AppendEntriesResponse, Message, Probe, ProbeResponse, RequestVote,
+    RequestVoteResponse,
 };
-use crate::output::{ClientResponse, Output};
+use crate::output::{ClientResponse, Output, ReadOutcome};
 use crate::persist::{PersistUpdate, PersistentState};
 use crate::role::Role;
-use crate::types::{Command, LogIndex, NodeId, Term};
+use crate::types::{Command, LogIndex, NodeId, ReadId, Term};
 
 /// Bir adımda gönderilecek mesajlar, üretildikleri sırayla. İşleyiciler yalnızca buraya yazar;
 /// `Persist` kararını `step` tek bir yerde verir (O2). Böylece hiçbir işleyici `Persist`'i yanlış
@@ -36,6 +37,22 @@ struct Progress {
     next_index: LogIndex,
     /// O takipçinin log'unun liderinkiyle eşleştiği bilinen en yüksek index (`matchIndex`).
     match_index: LogIndex,
+    /// O takipçinin onayladığı en yüksek doğrulama turu (ReadIndex, tezin §6.4'ü; bkz.
+    /// `Message::Probe`). Yalnızca ileri gider.
+    probe_round: u64,
+}
+
+/// Liderin cevap bekleyen bir okuması (ReadIndex, tezin §6.4'ü; Q1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingRead {
+    id: ReadId,
+    /// Okumayı onaylayabilecek ilk doğrulama turu: okuma geldikten SONRA başlatılan tur. Daha
+    /// önce başlamış bir turun onayı, okuma gelmeden önceki bir anı anlatır; o anla okumanın
+    /// gelişi arasında yeni bir lider seçilip yazma tamamlamış olabilir.
+    round: u64,
+    /// Okumanın `readIndex`'i: liderin kendi term'inden bir girdiyi commit ettiği andaki (ya da
+    /// sonraki) commitIndex'i; o ana kadar `None`.
+    read_index: Option<LogIndex>,
 }
 
 /// Bir Raft düğümünün durum makinesi.
@@ -88,6 +105,13 @@ pub struct RaftNode {
     // Lider olunan term'de her takipçinin ilerlemesi. BTreeMap: takipçiler her koşuda aynı sırayla
     // gezilir.
     progress: BTreeMap<NodeId, Progress>,
+    // Bu liderlikte başlatılan son doğrulama turunun numarası (ReadIndex; 0 = hiç tur yok).
+    probe_round: u64,
+    // Liderin cevap bekleyen okumaları, geliş sırasıyla. Geçicidir: çökmeyle kaybolur ve istemci
+    // zaman aşımında yeniden dener. Sınırsızdır: azınlıkta kalmış bir lider, bölünme boyunca gelen
+    // her okumayı biriktirir. Simülatörde koşunun süresi bunu sınırlar; gerçek bir çalıştırıcı bir
+    // tavan ya da son tarih koymalı ve aynı adımda gelen okumaları tek turda toplamalıdır.
+    pending_reads: Vec<PendingRead>,
 }
 
 impl RaftNode {
@@ -146,6 +170,8 @@ impl RaftNode {
             heartbeat_elapsed: 0,
             leader_id: None,
             progress: BTreeMap::new(),
+            probe_round: 0,
+            pending_reads: Vec::new(),
         }
     }
 
@@ -230,8 +256,9 @@ impl RaftNode {
     /// sırasız ya da eksik yürütmek (O1 ihlali) ise derleyicinin göremeyeceği, sürücünün
     /// sorumluluğundaki bir hatadır.
     ///
-    /// Çıktıların sırası: varsa tek bir `Persist`, sonra `Send`'ler, sonra `Apply`'lar, en sonda
-    /// (yalnızca bir istemci isteği adımında) `ClientResponse`.
+    /// Çıktıların sırası: varsa tek bir `Persist`, sonra `Send`'ler, sonra `Apply`'lar, sonra
+    /// okumaların sonuçları (`Read`), en sonda (yalnızca bir istemci isteği adımında)
+    /// `ClientResponse`.
     ///
     /// N3: `step` tam (total) bir fonksiyondur: her `Input` değeri için panik atmadan döner.
     /// Simülatör her düğümü her tick'te adımlar; tek bir panik bütün koşuyu ve determinizm
@@ -246,12 +273,14 @@ impl RaftNode {
         let before = (self.current_term, self.voted_for);
         let mut outbox = Outbox::new();
         let mut response = None;
+        let mut read_reply = None;
         match input {
             Input::Tick => self.on_tick(&mut outbox),
             Input::Message { from, msg } => self.on_message(from, msg, &mut outbox),
             Input::ClientRequest(command) => {
                 response = self.on_client_request(command, &mut outbox);
             }
+            Input::Read(id) => read_reply = self.on_read(id, &mut outbox),
             Input::Restart(state) => {
                 self.restart(state);
                 // R1: yüklenen durum zaten diskteki durumdur; yeniden yazmaya gerek yok. Yeniden
@@ -276,10 +305,15 @@ impl RaftNode {
             None
         };
         let applies = self.apply_committed();
+        // Okumalar uygulamalardan SONRA sonuçlanır: `Ready`, bu adımın `Apply`'larını da görmüş
+        // bir durum makinesinden cevaplanır (Q1).
+        let reads = self.settle_reads();
         persist
             .into_iter()
             .chain(outbox.into_iter().map(|(to, msg)| Output::Send { to, msg }))
             .chain(applies)
+            .chain(read_reply)
+            .chain(reads)
             .chain(response.map(Output::ClientResponse))
             .collect()
     }
@@ -291,6 +325,16 @@ impl RaftNode {
                 self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(1);
                 if self.heartbeat_elapsed >= self.config.heartbeat_interval() {
                     self.broadcast_append_entries(outbox);
+                    // Onaylanmamış bir okuma varsa doğrulama turu heartbeat'le yenilenir: tur
+                    // mesajları ya da cevapları kaybolmuş olabilir. Daha sonraki bir turun onayı
+                    // da okumayı onaylar (o tur da okumadan sonra başladı). Bekleyen okuma yoksa
+                    // hiçbir şey hesaplanmaz: okumasız koşular bu yolun bedelini ödemez.
+                    if !self.pending_reads.is_empty() {
+                        let confirmed = self.confirmed_round();
+                        if self.pending_reads.iter().any(|read| read.round > confirmed) {
+                            self.start_probe_round(outbox);
+                        }
+                    }
                 }
             }
             // Figure 2: Follower, zaman aşımı boyunca mevcut liderden AppendEntries almaz ya da bir
@@ -358,10 +402,15 @@ impl RaftNode {
                 let progress = Progress {
                     next_index,
                     match_index: LogIndex(0),
+                    probe_round: 0,
                 };
                 (peer, progress)
             })
             .collect();
+        // Doğrulama turları liderlik başına 1'den sayılır. Eski bir liderliğin turlarına verilen
+        // cevaplar ya term denetiminde elenir ya da, cevaplayan o an başka bir term'deyse, tur 0
+        // taşır ve hiçbir okumayı onaylamaz (bkz. `on_probe`).
+        self.probe_round = 0;
         // §8: yeni lider term'inin başında log'una bir no-op girdi ekler. Neden: lider önceki
         // term'lerin girdilerini kopyalarını sayarak commit edemez (§5.4.2); onlar ancak liderin
         // kendi term'inden bir girdi commit edilince dolaylı olarak commit olur. İstemci komutu
@@ -443,6 +492,131 @@ impl RaftNode {
         None
     }
 
+    /// Bir okuma isteği geldi (ReadIndex, tezin §6.4'ü; Q1). Lider olmayan düğüm hemen `NotLeader`
+    /// döner. Lider okumayı bekletir ve liderliğini doğrulayacak yeni bir tur başlatır; okuma
+    /// `settle_reads`'te sonuçlanır.
+    fn on_read(&mut self, id: ReadId, outbox: &mut Outbox) -> Option<Output> {
+        if self.role != Role::Leader {
+            return Some(Output::Read {
+                id,
+                outcome: ReadOutcome::NotLeader {
+                    hint: self.leader_id,
+                },
+            });
+        }
+        // Lider kendini lider sanıyor, ama daha yüksek bir term'de yeni bir lider seçilmiş ve
+        // yazmalar tamamlamış olabilir (ör. lider azınlıkta kaldıysa). Bu yüzden okuma ancak
+        // GELDİKTEN SONRA başlatılan bir turu çoğunluk onaylarsa cevaplanır: onay veren bir düğüm,
+        // onay anında daha yüksek bir term'e oy vermemiştir; çoğunluk onayladıysa o anda başka bir
+        // lider yoktu ve okuma gelmeden önce tamamlanan her yazma bu liderin commitIndex'indedir.
+        let round = self.start_probe_round(outbox);
+        let read_index = self.term_commit_index();
+        self.pending_reads.push(PendingRead {
+            id,
+            round,
+            read_index,
+        });
+        None
+    }
+
+    /// Liderin kendi term'inden bir girdiyi commit ettiyse commitIndex'i; etmediyse `None`.
+    ///
+    /// Tezin §6.4'ünün ilk adımı: yeni bir lider, önceki liderin commit ettiği girdilerin hangileri
+    /// olduğunu kendi term'inden bir girdi (no-op, §8) commit edilene kadar bilemez; commitIndex'i
+    /// geride olabilir (ör. yeniden başlatmadan sonra 0). Bu noktadan sonra commitIndex, okuma
+    /// gelmeden önce tamamlanmış her yazmayı kapsar (Leader Completeness). Commit edilen en yüksek
+    /// girdinin term'i liderinkiyse lider kendi term'inden bir girdiyi commit etmiştir: log'daki
+    /// term'ler index'le azalmaz.
+    ///
+    /// Mutasyon `mutation-read-before-term-commit` (Faz 6) bu beklemeyi atlar: yeni lider, geride
+    /// kalmış commitIndex'iyle bayat bir okuma cevaplayabilir.
+    fn term_commit_index(&self) -> Option<LogIndex> {
+        let committed_in_term = self.log.term_at(self.commit_index) == Some(self.current_term);
+        (committed_in_term || cfg!(feature = "mutation-read-before-term-commit"))
+            .then_some(self.commit_index)
+    }
+
+    /// Yeni bir doğrulama turu başlatır ve numarasını döndürür. Tek düğümlü kümede gönderilecek
+    /// kimse yoktur; liderin kendi onayı çoğunluktur.
+    fn start_probe_round(&mut self, outbox: &mut Outbox) -> u64 {
+        self.probe_round = self.probe_round.saturating_add(1);
+        let probe = Probe {
+            term: self.current_term,
+            round: self.probe_round,
+        };
+        for &peer in &self.peers {
+            outbox.push((peer, Message::Probe(probe.clone())));
+        }
+        self.probe_round
+    }
+
+    /// Çoğunluğun (lider dahil) onayladığı en yüksek doğrulama turu. Lider başlattığı her turu
+    /// kendisi onaylamış sayılır. Takipçilerin onayları büyükten küçüğe dizilir; çoğunluğu
+    /// tamamlayan onay, çoğunluğun en az o turu onayladığını gösterir.
+    fn confirmed_round(&self) -> u64 {
+        let mut rounds: Vec<u64> = self
+            .progress
+            .values()
+            .map(|progress| progress.probe_round)
+            .collect();
+        rounds.push(self.probe_round);
+        rounds.sort_unstable_by(|a, b| b.cmp(a));
+        rounds
+            .get(self.quorum().saturating_sub(1))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Bekleyen okumaları adım sonunda sonuçlandırır (Q1).
+    ///
+    /// - Düğüm artık lider değilse (bu adımda daha yüksek bir term gördü) bekleyen okumaların hepsi
+    ///   `NotLeader` ile biter: liderliği doğrulanamaz ve istemci başka bir düğüme gitmelidir.
+    /// - Lider kendi term'inden bir girdiyi commit ettiyse `readIndex`'i henüz belli olmayan
+    ///   okumalar o anki commitIndex'i alır.
+    /// - Okuma geldikten sonra başlatılan bir tur çoğunlukça onaylandıysa ve durum makinesi
+    ///   `readIndex`'e kadar uygulandıysa okuma `Ready` olur. Okumalar geliş sırasıyla hazır olur:
+    ///   sonra gelenin turu ve `readIndex`'i öncekininkinden küçük olamaz.
+    fn settle_reads(&mut self) -> Vec<Output> {
+        if self.pending_reads.is_empty() {
+            return Vec::new();
+        }
+        if self.role != Role::Leader {
+            let hint = self.leader_id;
+            return self
+                .pending_reads
+                .drain(..)
+                .map(|read| Output::Read {
+                    id: read.id,
+                    outcome: ReadOutcome::NotLeader { hint },
+                })
+                .collect();
+        }
+        if let Some(read_index) = self.term_commit_index() {
+            for read in &mut self.pending_reads {
+                read.read_index.get_or_insert(read_index);
+            }
+        }
+        let confirmed = self.confirmed_round();
+        let last_applied = self.last_applied;
+        let mut ready = Vec::new();
+        self.pending_reads.retain(|read| {
+            // Mutasyon `mutation-read-without-quorum` (Faz 6) doğrulama turunu beklemez: azınlıkta
+            // kalmış eski bir lider, çoğunluk tarafında tamamlanmış yazmaları görmeden okuma
+            // cevaplar.
+            let confirmed =
+                read.round <= confirmed || cfg!(feature = "mutation-read-without-quorum");
+            let applied = read.read_index.is_some_and(|index| index <= last_applied);
+            if confirmed && applied {
+                ready.push(Output::Read {
+                    id: read.id,
+                    outcome: ReadOutcome::Ready,
+                });
+            }
+            !(confirmed && applied)
+        });
+        ready
+    }
+
     /// Bir eşten gelen RPC'yi ya da cevabı işler.
     fn on_message(&mut self, from: NodeId, msg: Message, outbox: &mut Outbox) {
         // Yapılandırmada olmayan bir göndericiden (kendisi dahil) gelen mesaj yok sayılır. Böyle
@@ -467,6 +641,8 @@ impl RaftNode {
             Message::AppendEntriesResponse(response) => {
                 self.on_append_entries_response(from, &response, outbox)
             }
+            Message::Probe(request) => self.on_probe(from, &request, outbox),
+            Message::ProbeResponse(response) => self.on_probe_response(from, &response),
         }
     }
 
@@ -576,14 +752,11 @@ impl RaftNode {
         }
         // §5.2: aday, aynı term'de seçilmiş bir liderden AppendEntries alırsa onun liderliğini
         // tanır ve Follower'a döner. `votedFor` değişmez: bu term'deki oy zaten kullanıldı.
-        self.role = Role::Follower;
-        self.votes.clear();
         // Bu term'de AppendEntries gönderen, bu term'in lideridir (Election Safety: tek lider).
         // Tutarlılık denetimi aşağıda başarısız olsa bile: o, log'un değil göndericinin
         // kimliğinin sınavıdır. İstemcilere verilecek ipucu budur (§8).
-        self.leader_id = Some(from);
         // Figure 2: mevcut liderden AppendEntries almak seçim zamanlayıcısını sıfırlar.
-        self.reset_election_timer();
+        self.recognize_leader(from);
 
         let AppendEntries {
             prev_log_index,
@@ -681,6 +854,66 @@ impl RaftNode {
             let backed_off = progress.next_index.prev().min(response.match_index.next());
             progress.next_index = floor.max(backed_off);
             outbox.push((from, self.append_entries_for(from)));
+        }
+    }
+
+    /// `Probe` alıcısı (tezin §6.4'ü): liderin doğrulama turunu term'iyle cevaplar.
+    fn on_probe(&mut self, from: NodeId, request: &Probe, outbox: &mut Outbox) {
+        // Daha yüksek term `on_message`'da zaten benimsendi; eski bir liderin turu onaylanmaz:
+        // cevap güncel term'i taşır ve o lider geride kaldığını öğrenir (T1).
+        let current = request.term == self.current_term;
+        if current {
+            if self.role == Role::Leader {
+                // Aynı term'de ikinci bir lider Election Safety'ye göre imkânsızdır. Olursa (bir
+                // hata) cevap verilmez: bir onay, öbür "liderin" okumasını yanlışlıkla doğrulardı.
+                return;
+            }
+            // Bu term'de tur gönderen, bu term'in lideridir: AppendEntries'teki gibi (§5.2) aday
+            // Follower'a döner, lider öğrenilir ve seçim zamanlayıcısı sıfırlanır (tur, mevcut
+            // liderden gelen bir heartbeat'tir).
+            self.recognize_leader(from);
+        }
+        // Tur numarası YALNIZCA bu term'in liderine geri yansıtılır: onay, "seni bu term'in lideri
+        // olarak tanıyorum" demektir. Eski bir term'in turuna verilen cevap güncel term'i taşır ama
+        // tur 0'ı; turlar 1'den sayıldığı için 0 hiçbir okumayı onaylamaz. Numara yansıtılsaydı,
+        // aynı düğüm sonra BU term'in lideri olduğunda (turlar her liderlikte 1'den başlar)
+        // gecikmiş cevap onun yeni bir turunun onayı sanılırdı. Cevaplayan çoktan daha yüksek bir
+        // term'e geçmiş olsa bile okuma onaylanır ve bayat bir değer dönerdi.
+        let round = if current { request.round } else { 0 };
+        outbox.push((
+            from,
+            Message::ProbeResponse(ProbeResponse {
+                term: self.current_term,
+                round,
+            }),
+        ));
+    }
+
+    /// Bu term'in liderini tanır (§5.2): bu term'de AppendEntries ya da doğrulama turu gönderen,
+    /// bu term'in lideridir (Election Safety: tek lider). Aday Follower'a döner, lider ipucu
+    /// öğrenilir (§8) ve seçim zamanlayıcısı sıfırlanır (Figure 2: mevcut liderden haber almak).
+    fn recognize_leader(&mut self, leader: NodeId) {
+        self.role = Role::Follower;
+        self.votes.clear();
+        self.leader_id = Some(leader);
+        self.reset_election_timer();
+    }
+
+    /// `Probe` cevabını işler: takipçinin onayladığı en yüksek turu günceller.
+    fn on_probe_response(&mut self, from: NodeId, response: &ProbeResponse) {
+        // Yalnızca bu term'in lideri sayar; başka bir term'in cevabı başka bir liderliğe aittir.
+        // Daha yüksek term `on_message`'da işlendi (lider Follower'a döndü).
+        if self.role != Role::Leader || response.term != self.current_term {
+            return;
+        }
+        // Başlatılmamış bir turun cevabı (doğru bir takipçide imkânsız) yok sayılır: kırpılıp en
+        // güçlü onay sayılsaydı, o an bekleyen bütün okumaları onaylardı.
+        if response.round > self.probe_round {
+            return;
+        }
+        if let Some(progress) = self.progress.get_mut(&from) {
+            // Yalnızca ileri gider: geciken eski bir cevap onayı geri almaz.
+            progress.probe_round = progress.probe_round.max(response.round);
         }
     }
 
@@ -828,15 +1061,16 @@ mod tests {
     use crate::input::Input;
     use crate::log::LogEntry;
     use crate::message::{
-        AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
+        AppendEntries, AppendEntriesResponse, Message, Probe, ProbeResponse, RequestVote,
+        RequestVoteResponse,
     };
-    use crate::output::{ClientResponse, Output};
+    use crate::output::{ClientResponse, Output, ReadOutcome};
     use crate::persist::{LogUpdate, PersistUpdate, PersistentState};
     use crate::role::Role;
-    use crate::types::{Command, LogIndex, NodeId, Term};
+    use crate::types::{Command, LogIndex, NodeId, ReadId, Term};
     use rand_chacha::ChaCha8Rng;
     use rand_chacha::rand_core::{Rng, SeedableRng};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroUsize;
 
     /// Varsayılan seçim zaman aşımı tabanı (`Config::default()`).
@@ -975,6 +1209,42 @@ mod tests {
 
     fn client(byte: u8) -> Input {
         Input::ClientRequest(Command::new(vec![byte]))
+    }
+
+    fn read(id: u64) -> Input {
+        Input::Read(ReadId(id))
+    }
+
+    fn probe(term: u64, round: u64) -> Message {
+        Message::Probe(Probe {
+            term: Term(term),
+            round,
+        })
+    }
+
+    fn probe_reply(term: u64, round: u64) -> Message {
+        Message::ProbeResponse(ProbeResponse {
+            term: Term(term),
+            round,
+        })
+    }
+
+    /// Okuma şimdi durum makinesinden cevaplanabilir.
+    fn ready(id: u64) -> Output {
+        Output::Read {
+            id: ReadId(id),
+            outcome: ReadOutcome::Ready,
+        }
+    }
+
+    /// Okuma reddedildi; `hint` bilinen lider.
+    fn read_rejected(id: u64, hint: Option<u64>) -> Output {
+        Output::Read {
+            id: ReadId(id),
+            outcome: ReadOutcome::NotLeader {
+                hint: hint.map(NodeId),
+            },
+        }
     }
 
     /// Diskinde `state` olan bir düğüm (yeni düğüm + yeniden başlatma).
@@ -1826,6 +2096,190 @@ mod tests {
         );
     }
 
+    // Q1: lider olmayan düğüm okumayı aynı adımda reddeder ve bildiği lideri ipucu olarak verir;
+    // hiçbir durumu değişmez (okuma log'a girmez).
+    #[test]
+    fn a_follower_rejects_a_read_with_its_leader_as_hint() {
+        let mut node = node(1, &[1, 2, 3], 40);
+        let _ = node.step(message(2, heartbeat(1)));
+        let state = node.persistent_state();
+        assert_eq!(node.step(read(7)), vec![read_rejected(7, Some(2))]);
+        assert_eq!(node.persistent_state(), state);
+    }
+
+    // Q1 (tezin §6.4'ü): lider okuma gelince yeni bir doğrulama turu başlatır. Daha önceki bir
+    // turun onayı sayılmaz; okuma geldikten sonra başlayan turu bir eşin onaylaması (lider + eş, üç
+    // düğümde çoğunluk) okumayı cevaplatır. Okuma hiçbir zaman log'a girmez.
+    #[test]
+    fn a_leader_serves_a_read_once_a_majority_confirms_a_later_round() {
+        let mut node = leader(1, &[1, 2, 3], 41);
+        let _ = node.step(message(2, append_reply(1, true, 1)));
+        assert_eq!(node.commit_index(), LogIndex(1), "the no-op is committed");
+        let log = node.log().to_vec();
+        assert_eq!(
+            node.step(read(1)),
+            vec![send(2, probe(1, 1)), send(3, probe(1, 1))]
+        );
+        assert!(
+            node.step(message(2, probe_reply(1, 0))).is_empty(),
+            "an answer to an earlier round does not confirm the read"
+        );
+        assert_eq!(node.step(message(3, probe_reply(1, 1))), vec![ready(1)]);
+        assert_eq!(node.log(), log.as_slice(), "a read never touches the log");
+    }
+
+    // Q1 (tezin §6.4'ünün ilk adımı): yeni lider kendi term'inden bir girdiyi commit edene kadar
+    // hangi girdilerin commit edildiğini bilemez (yeniden başlatılmış bir liderin commitIndex'i 0).
+    // Tur onaylansa da okuma bekler; no-op çoğunluğa ulaşınca girdiler uygulanır ve okuma
+    // uygulamalardan SONRA cevaplanır.
+    #[test]
+    fn a_read_waits_for_the_first_commit_of_the_leaders_term() {
+        let mut node = leader_with_log(1, &[1, 2, 3], 42, vec![entry(1, 10), entry(1, 11)]);
+        assert_eq!(node.commit_index(), LogIndex(0));
+        assert_eq!(
+            node.step(read(1)),
+            vec![send(2, probe(2, 1)), send(3, probe(2, 1))]
+        );
+        assert!(
+            node.step(message(2, probe_reply(2, 1))).is_empty(),
+            "the round is confirmed but nothing of term 2 is committed yet"
+        );
+        assert_eq!(
+            node.step(message(3, append_reply(2, true, 3))),
+            vec![apply(1, 10), apply(2, 11), apply_noop(3), ready(1)]
+        );
+    }
+
+    // Q1: daha yüksek bir term gören lider Follower'a döner; bekleyen okumaları cevaplanamaz ve
+    // aynı adımda yeni liderin ipucuyla reddedilir.
+    #[test]
+    fn a_leader_that_steps_down_rejects_its_pending_reads() {
+        let mut node = leader(1, &[1, 2, 3], 43);
+        let _ = node.step(read(1));
+        let outputs = node.step(message(2, heartbeat(2)));
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(outputs.last(), Some(&read_rejected(1, Some(2))));
+    }
+
+    // Tek düğümlü küme: liderin kendi onayı çoğunluktur ve no-op seçim adımında commit edildi;
+    // okuma geldiği adımda cevaplanır, gönderilecek bir tur yoktur.
+    #[test]
+    fn a_single_node_cluster_serves_reads_at_once() {
+        let mut node = node(1, &[1], 44);
+        let _ = tick_until_output(&mut node);
+        assert_eq!(node.role(), Role::Leader);
+        assert_eq!(node.step(read(9)), vec![ready(9)]);
+    }
+
+    // Tur mesajları ya da cevapları kaybolabilir: onaylanmamış bir okuma varken heartbeat yeni bir
+    // tur başlatır. Daha sonraki turun onayı da okumayı onaylar (o tur da okumadan sonra başladı).
+    #[test]
+    fn lost_probes_are_retried_with_the_next_heartbeat() {
+        let mut node = leader(1, &[1, 2, 3], 45);
+        let _ = node.step(message(2, append_reply(1, true, 1)));
+        let _ = node.step(read(1));
+        let mut outputs = Vec::new();
+        for _ in 0..H {
+            outputs = node.step(Input::Tick);
+        }
+        assert!(
+            outputs.contains(&send(2, probe(1, 2))) && outputs.contains(&send(3, probe(1, 2))),
+            "the heartbeat starts round 2: {outputs:?}"
+        );
+        assert_eq!(node.step(message(2, probe_reply(1, 2))), vec![ready(1)]);
+    }
+
+    // Takipçi tarafı: aynı term'den bir tur, o term'in liderinden gelir. Aday onu tanıyıp Follower
+    // olur (AppendEntries'teki gibi, §5.2) ve turu onaylar. Eski bir term'in turu güncel term'le
+    // ama tur 0 ile cevaplanır: eski lider geride kaldığını öğrenir (T1) ve cevap, aynı numaralı
+    // yeni bir turun onayı sanılamaz.
+    #[test]
+    fn followers_answer_probes_and_recognize_the_leader() {
+        let mut node = candidate(1, &[1, 2, 3], 46);
+        assert_eq!(
+            node.step(message(2, probe(1, 5))),
+            vec![send(2, probe_reply(1, 5))]
+        );
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.leader_hint(), Some(NodeId(2)));
+        assert_eq!(
+            node.step(message(3, probe(0, 1))),
+            vec![send(3, probe_reply(1, 0))]
+        );
+    }
+
+    // Sayılmayan onaylar: henüz başlatılmamış bir tur için (doğru bir takipçide imkânsız; en güçlü
+    // onay sayılsaydı bekleyen her okumayı onaylardı), yapılandırma dışından ya da eski bir
+    // term'den gelen cevap. Bu term'deki turun gerçek onayı okumayı cevaplatır.
+    #[test]
+    fn only_answers_to_started_rounds_of_this_term_confirm_reads() {
+        let mut node = leader(1, &[1, 2, 3], 47);
+        let _ = node.step(message(2, append_reply(1, true, 1)));
+        let _ = node.step(read(1));
+        assert!(node.step(message(2, probe_reply(1, 7))).is_empty());
+        assert!(node.step(message(5, probe_reply(1, 1))).is_empty());
+        assert!(node.step(message(3, probe_reply(0, 1))).is_empty());
+        assert_eq!(node.step(message(2, probe_reply(1, 1))), vec![ready(1)]);
+    }
+
+    // Kod incelemesinin bulduğu karşı örnek (düğüm düzeyinde): term 1'in lideri A'nın turu C'ye geç
+    // ulaşır. C o sırada term 2'dedir ve A da term 2'nin lideri olmuştur. Turlar her liderlikte
+    // 1'den sayıldığı için C'nin bu eski tura cevabı, A'nın term 2'deki 1. turunun onayı
+    // sanılabilir. Oysa cevap, A'nın term 2'deki okumasından ÖNCE üretildi; C o arada başka bir
+    // lidere oy vermiş olabilir ve okuma bayat bir değer döndürürdü. C eski term'in turuna tur 0
+    // ile cevap verir; cevap hiçbir okumayı onaylamaz. Bu sıralama iki uzun gecikme ve bir liderlik
+    // değişimi gerektirir: rastgele hata enjeksiyonu (uzun kuyruklu gecikmelerle bile) onu
+    // bulamadı, bu test onu deterministik olarak korur.
+    #[test]
+    fn an_answer_to_an_earlier_terms_probe_never_confirms_a_read() {
+        // A (1) term 1'in lideri ve no-op'unu commit etmiş; okuma 1 için 1. turu başlatır. C'ye
+        // giden tur (term 1, tur 1) yolda kalır.
+        let mut a = leader(1, &[1, 2, 3], 49);
+        let _ = a.step(message(2, append_reply(1, true, 1)));
+        let _ = a.step(read(1));
+        let late_probe = probe(1, 1);
+        // A çöküp kalkar ve term 2'yi kazanır; C (3) de term 2'dedir (A'ya oy vermiştir).
+        let disk = a.persistent_state();
+        assert!(a.step(Input::Restart(disk)).is_empty());
+        let _ = tick_until_output(&mut a);
+        let _ = a.step(message(3, vote(2, true)));
+        assert_eq!(a.role(), Role::Leader);
+        assert_eq!(a.current_term(), Term(2));
+        let _ = a.step(message(3, append_reply(2, true, 2)));
+        let mut c = node(3, &[1, 2, 3], 50);
+        let _ = c.step(message(1, append(2, (0, 0), Vec::new(), 0)));
+        assert_eq!(c.current_term(), Term(2));
+        // Gecikmiş tur C'ye ulaşır: C onu term 2 ile ama tur 0 ile cevaplar.
+        let answer = c.step(message(1, late_probe));
+        assert_eq!(answer, vec![send(1, probe_reply(2, 0))]);
+        // A term 2'de yeni bir okuma başlatır (yine 1. tur). C'nin eski cevabı onu onaylamaz.
+        let _ = a.step(read(2));
+        let Output::Send { msg, .. } = &answer[0] else {
+            panic!("C answers with a message");
+        };
+        assert!(
+            a.step(message(3, msg.clone())).is_empty(),
+            "an answer to a term-1 probe confirmed a term-2 read"
+        );
+    }
+
+    // Gerçek bir önceki turun geç gelen onayı, o turdan SONRA gelen okumayı onaylamaz: okuma 1 tur
+    // 1'le onaylanır, okuma 2 tur 2'yi bekler. Düğüm 3'ün tur 1'e verdiği geciken onay, okuma 2
+    // gelmeden önceki bir anı anlatır.
+    #[test]
+    fn a_late_answer_to_an_earlier_round_does_not_confirm_a_later_read() {
+        let mut node = leader(1, &[1, 2, 3], 48);
+        let _ = node.step(message(2, append_reply(1, true, 1)));
+        let _ = node.step(read(1));
+        assert_eq!(node.step(message(2, probe_reply(1, 1))), vec![ready(1)]);
+        assert_eq!(
+            node.step(read(2)),
+            vec![send(2, probe(1, 2)), send(3, probe(1, 2))]
+        );
+        assert!(node.step(message(3, probe_reply(1, 1))).is_empty());
+        assert_eq!(node.step(message(3, probe_reply(1, 2))), vec![ready(2)]);
+    }
+
     // Kapsama bekçisi: `Input`'in her varyantı için ayrık bir isim döndürür. Kasıtlı olarak `_`
     // kolu YOK — `Input`'e yeni bir varyant eklenirse bu fonksiyon derlenmez; derleme hatası seni
     // aşağıdaki rastgele girdi testine getirir. Yeni varyant için hem girdi üreticisini hem de
@@ -1836,17 +2290,20 @@ mod tests {
             Input::Tick => "Tick",
             Input::Message { .. } => "Message",
             Input::ClientRequest(_) => "ClientRequest",
+            Input::Read(_) => "Read",
             Input::Restart(_) => "Restart",
         }
     }
 
-    // Aynı bekçi mantığı `Message` için: 4 RPC varyantının hepsi üretilmeli.
+    // Aynı bekçi mantığı `Message` için: 6 mesaj varyantının hepsi üretilmeli.
     fn message_name(msg: &Message) -> &'static str {
         match msg {
             Message::RequestVote(_) => "RequestVote",
             Message::RequestVoteResponse(_) => "RequestVoteResponse",
             Message::AppendEntries(_) => "AppendEntries",
             Message::AppendEntriesResponse(_) => "AppendEntriesResponse",
+            Message::Probe(_) => "Probe",
+            Message::ProbeResponse(_) => "ProbeResponse",
         }
     }
 
@@ -1860,13 +2317,25 @@ mod tests {
     /// dahil. Term'ler düğümün term'i civarındadır (bir eksik, aynı, bir fazla); aynı term daha
     /// sıktır. `Restart`, sürücünün diskindeki durumu verir.
     ///
-    /// Aday iken üretilen mesajların yarısı, güncel term'e ait bir oy cevabıdır; lider iken yarısı
-    /// güncel term'e ait başarılı bir AppendEntries cevabıdır. Neden: tamamen tekdüze girdilerle
-    /// bir adaylık çoğunluğu toplamadan, bir liderlik de commit görmeden (daha yüksek bir term, bir
-    /// heartbeat ya da bir yeniden başlatma yüzünden) neredeyse her zaman biter; sözleşmenin lider
-    /// ve commit tarafı hiç sınanmazdı. Kapsama denetimi bunu yakalar.
-    fn random_input(rng: &mut ChaCha8Rng, node: &RaftNode, disk: &PersistentState) -> Input {
-        match below(rng, 20) {
+    /// Aday iken üretilen mesajların yarısı, güncel term'e ait bir oy cevabıdır; lider iken dörtte
+    /// üçü güncel term'e ait bir cevaptır (çoğunlukla başarılı bir AppendEntries cevabı, bazen bir
+    /// doğrulama turu cevabı). Neden: tamamen tekdüze girdilerle bir adaylık çoğunluğu toplamadan,
+    /// bir liderlik de commit ya da onaylanmış bir okuma görmeden (daha yüksek bir term, bir
+    /// heartbeat ya da bir yeniden başlatma yüzünden) neredeyse her zaman biter; sözleşmenin lider,
+    /// commit ve okuma tarafı hiç sınanmazdı. Kapsama denetimi bunu yakalar.
+    fn random_input(
+        rng: &mut ChaCha8Rng,
+        node: &RaftNode,
+        disk: &PersistentState,
+        next_read: &mut u64,
+    ) -> Input {
+        // Liderin okuması ayrıca sık üretilir: rastgele bir okuma çoğunlukla lider olmayan bir
+        // düğüme düşer ve onaylanan okuma yolu (Q1'in `Ready` tarafı) seyrek görülürdü.
+        if node.role() == Role::Leader && below(rng, 8) == 0 {
+            *next_read += 1;
+            return Input::Read(ReadId(*next_read));
+        }
+        match below(rng, 21) {
             0..=8 => Input::Tick,
             9..=16 => {
                 let from = NodeId(1 + below(rng, 5));
@@ -1878,12 +2347,36 @@ mod tests {
                     });
                     return Input::Message { from, msg };
                 }
-                if node.role() == Role::Leader && below(rng, 2) == 0 {
-                    let msg = Message::AppendEntriesResponse(AppendEntriesResponse {
-                        term: Term(current),
-                        success: true,
-                        match_index: LogIndex(below(rng, node.log.last_index().0 + 1)),
-                    });
+                if node.role() == Role::Leader && below(rng, 4) != 0 {
+                    let msg = if below(rng, 3) == 0 {
+                        // Onay bir eşten gelir ve çoğunlukla son turu onaylar: aksi hâlde bir okuma
+                        // liderlik bitmeden neredeyse hiç onaylanmazdı.
+                        let from = NodeId(2 + below(rng, 3));
+                        let round = if below(rng, 2) == 0 {
+                            node.probe_round
+                        } else {
+                            below(rng, node.probe_round + 2)
+                        };
+                        let msg = Message::ProbeResponse(ProbeResponse {
+                            term: Term(current),
+                            round,
+                        });
+                        return Input::Message { from, msg };
+                    } else {
+                        // Yarısı log'un sonunu onaylar: liderin no-op'u (ve kendi term'inin
+                        // girdileri) çoğunluğa ulaşsın, commit ve okumalar gerçekten görülsün.
+                        let last = node.log.last_index().0;
+                        let matched = if below(rng, 2) == 0 {
+                            last
+                        } else {
+                            below(rng, last + 1)
+                        };
+                        Message::AppendEntriesResponse(AppendEntriesResponse {
+                            term: Term(current),
+                            success: true,
+                            match_index: LogIndex(matched),
+                        })
+                    };
                     return Input::Message { from, msg };
                 }
                 let term = Term(match below(rng, 4) {
@@ -1891,7 +2384,7 @@ mod tests {
                     1 => current.saturating_add(1),
                     _ => current,
                 });
-                let msg = match below(rng, 4) {
+                let msg = match below(rng, 6) {
                     0 => Message::RequestVote(RequestVote {
                         term,
                         last_log_index: LogIndex(below(rng, 4)),
@@ -1902,15 +2395,27 @@ mod tests {
                         vote_granted: below(rng, 4) != 0,
                     }),
                     2 => Message::AppendEntries(random_append(rng, node, term)),
-                    _ => Message::AppendEntriesResponse(AppendEntriesResponse {
+                    3 => Message::AppendEntriesResponse(AppendEntriesResponse {
                         term,
                         success: below(rng, 2) == 0,
                         match_index: LogIndex(below(rng, node.log.last_index().0 + 2)),
+                    }),
+                    4 => Message::Probe(Probe {
+                        term,
+                        round: below(rng, 4),
+                    }),
+                    _ => Message::ProbeResponse(ProbeResponse {
+                        term,
+                        round: below(rng, node.probe_round + 2),
                     }),
                 };
                 Input::Message { from, msg }
             }
             17 => Input::Restart(disk.clone()),
+            18 => {
+                *next_read += 1;
+                Input::Read(ReadId(*next_read))
+            }
             _ => Input::ClientRequest(Command::new(vec![random_byte(rng)])),
         }
     }
@@ -1958,16 +2463,22 @@ mod tests {
     // - hiçbir girdi panik attırmaz (N3);
     // - kalıcı durum değiştiyse İLK çıktı TEK bir `Persist`'tir ve farkı diske uygulamak tam olarak
     //   bellekteki durumu verir; değişmediyse hiç `Persist` yoktur (O2);
-    // - çıktı sırası: `Persist`, sonra `Send`'ler, sonra `Apply`'lar, en sonda `ClientResponse`;
+    // - çıktı sırası: `Persist`, sonra `Send`'ler, sonra `Apply`'lar, sonra `Read`'ler, en sonda
+    //   `ClientResponse`;
+    // - Q1: her okuma (yeniden başlatma araya girmedikçe) tam olarak bir `Read` sonucu alır; lider
+    //   olmayan düğüm aynı adımda `NotLeader` (ipucu bildiği lider) döner; `Ready` yalnızca
+    //   liderden, kendi term'inden bir girdiyi commit etmişken ve okuma geldikten sonra başlattığı
+    //   turu çoğunluk onayladıktan sonra çıkar; liderliğini bırakan düğümün bekleyen okuması
+    //   kalmaz; doğrulama turları birer birer artar;
     // - S1: istemci isteğine lider olmayan düğüm log'unu değiştirmeden tek bir `NotLeader` ile
     //   (ipucu bildiği lider) cevap verir; lider cevap vermez; cevap başka hiçbir adımda çıkmaz;
     // - S2: lider olan düğümün log'unun sonunda kendi term'inden bir no-op girdi vardır;
     // - term asla azalmaz (T1) ve aynı term içinde verilmiş oy değişmez (E1);
     // - aday ve lider kendine oy vermiştir; olumlu oy yalnızca `votedFor`'a gider;
     // - mesajlar yalnızca eşlere gider ve her zaman düğümün güncel term'ini taşır;
-    // - oy isteği yalnızca tick'te seçim başlatan adaydan, AppendEntries yalnızca liderden çıkar,
-    //   cevaplar yalnızca isteği gönderene gider; liderin AppendEntries'i kendi log'unun bir
-    //   dilimini ve kendi commitIndex'ini taşır;
+    // - oy isteği yalnızca tick'te seçim başlatan adaydan, AppendEntries ve doğrulama turu yalnızca
+    //   liderden çıkar, cevaplar yalnızca isteği gönderene gider; liderin AppendEntries'i kendi
+    //   log'unun bir dilimini ve kendi commitIndex'ini taşır;
     // - commitIndex yalnızca artar, lastApplied onu aşmaz; `Apply`'lar ardışık index'lerle ve
     //   log'daki komutlarla gelir;
     // - aynı term'de lider kalan düğümün log'u yalnızca uzar (Leader Append-Only);
@@ -1987,13 +2498,22 @@ mod tests {
         let mut entries_applied = 0_u32;
         let mut truncations = 0_u32;
         let mut not_leader_answers = 0_u32;
+        let mut reads_ready = 0_u32;
+        let mut reads_rejected = 0_u32;
+        let mut stale_probes_answered = 0_u32;
         for seed in 0..300 {
             let mut rng = ChaCha8Rng::from_seed(seed_bytes(1_000 + seed));
             let config = Config::new(4, 2).expect("valid config");
             let mut node = RaftNode::new(NodeId(1), ids(&[1, 2, 3, 4]), config, seed_bytes(seed));
             let mut disk = PersistentState::default();
+            // Q1'in sürücü tarafı: cevap bekleyen okumalar (okuma → onu onaylayabilecek ilk tur),
+            // bu liderlikte gönderilen son tur ve eşlerin onayladığı en yüksek turlar.
+            let mut next_read = 0_u64;
+            let mut waiting: BTreeMap<ReadId, u64> = BTreeMap::new();
+            let mut last_round = 0_u64;
+            let mut acked: BTreeMap<NodeId, u64> = BTreeMap::new();
             for _ in 0..300 {
-                let input = random_input(&mut rng, &node, &disk);
+                let input = random_input(&mut rng, &node, &disk, &mut next_read);
                 inputs_seen.insert(input_name(&input));
                 if let Input::Message { msg, .. } = &input {
                     messages_seen.insert(message_name(msg));
@@ -2001,12 +2521,31 @@ mod tests {
                 let restart = matches!(input, Input::Restart(_));
                 let tick = matches!(input, Input::Tick);
                 let client = matches!(input, Input::ClientRequest(_));
+                let read = match input {
+                    Input::Read(id) => Some(id),
+                    _ => None,
+                };
                 let sender = match &input {
                     Input::Message { from, .. } => Some(*from),
                     _ => None,
                 };
+                let probe_ack = match &input {
+                    Input::Message {
+                        from,
+                        msg: Message::ProbeResponse(response),
+                    } => Some((*from, response.clone())),
+                    _ => None,
+                };
+                let probe_input = match &input {
+                    Input::Message {
+                        msg: Message::Probe(_),
+                        ..
+                    } => Some(input.clone()),
+                    _ => None,
+                };
                 let before = node.persistent_state();
                 let was_leader = node.role() == Role::Leader;
+                let term_before = node.current_term();
                 let commit_before = node.commit_index();
                 let applied_before = node.last_applied();
                 let outputs = node.step(input);
@@ -2030,7 +2569,27 @@ mod tests {
                     assert_eq!(node.role(), Role::Follower);
                     assert_eq!(node.commit_index(), LogIndex(0));
                     assert_eq!(node.last_applied(), LogIndex(0));
+                    // Okumalar geçicidir: çökmeyle kaybolur ve hiçbir zaman cevaplanmaz.
+                    waiting.clear();
                     continue;
+                }
+                // Yeni bir liderlik turları 1'den sayar; eski onaylar geçersizdir.
+                if node.role() == Role::Leader
+                    && (!was_leader || node.current_term() != term_before)
+                {
+                    last_round = 0;
+                    acked.clear();
+                }
+                // Bir onay, liderin aynı term'deki bir turuna verilmişse ve eşten geldiyse sayılır.
+                if let Some((from, response)) = probe_ack
+                    && was_leader
+                    && node.role() == Role::Leader
+                    && response.term == node.current_term()
+                    && node.peers().contains(&from)
+                    && response.round <= last_round
+                {
+                    let best = acked.entry(from).or_default();
+                    *best = (*best).max(response.round);
                 }
                 let persists = outputs
                     .iter()
@@ -2077,7 +2636,32 @@ mod tests {
                 }
                 let mut next_apply = applied_before.next();
                 let mut applying = false;
+                let mut reading = false;
                 let mut responded = false;
+                // Bu adımda başlatılan tur: bu adımda gelen okumayı onaylayabilecek ilk tur.
+                let mut started_round = None;
+                for output in &outputs[persists..] {
+                    if let Output::Send {
+                        msg: Message::Probe(probe),
+                        ..
+                    } = output
+                    {
+                        assert!(
+                            probe.round == last_round + 1 || Some(probe.round) == started_round,
+                            "Q1: probe rounds count up by one"
+                        );
+                        started_round = Some(probe.round);
+                    }
+                }
+                if let Some(round) = started_round {
+                    last_round = round;
+                }
+                if let Some(id) = read
+                    && node.role() == Role::Leader
+                {
+                    let round = started_round.expect("Q1: a read starts a new probe round");
+                    waiting.insert(id, round);
+                }
                 for output in &outputs[persists..] {
                     assert!(!responded, "S1: the client response is the last output");
                     if let Output::ClientResponse(response) = output {
@@ -2094,7 +2678,40 @@ mod tests {
                         not_leader_answers += 1;
                         continue;
                     }
+                    if let Output::Read { id, outcome } = output {
+                        reading = true;
+                        match outcome {
+                            ReadOutcome::NotLeader { hint } => {
+                                assert_eq!(*hint, node.leader_hint(), "Q1: the hint is the leader");
+                                assert_ne!(node.role(), Role::Leader, "Q1: a leader serves reads");
+                                assert!(
+                                    Some(*id) == read || waiting.contains_key(id),
+                                    "Q1: a rejection answers a read"
+                                );
+                                reads_rejected += 1;
+                            }
+                            ReadOutcome::Ready => {
+                                assert_eq!(node.role(), Role::Leader, "Q1: only a leader serves");
+                                assert_eq!(
+                                    node.log.term_at(node.commit_index()),
+                                    Some(node.current_term()),
+                                    "Q1: the leader has committed an entry of its term"
+                                );
+                                let round = waiting[id];
+                                let confirmations =
+                                    acked.values().filter(|&&acked| acked >= round).count();
+                                assert!(
+                                    confirmations + 1 >= node.quorum(),
+                                    "Q1: a majority confirmed a round started after the read"
+                                );
+                                reads_ready += 1;
+                            }
+                        }
+                        waiting.remove(id);
+                        continue;
+                    }
                     if let Output::Apply { index, command } = output {
+                        assert!(!reading, "Applies come before Reads");
                         applying = true;
                         assert_eq!(*index, next_apply, "entries are applied in index order");
                         assert_eq!(
@@ -2107,9 +2724,12 @@ mod tests {
                         continue;
                     }
                     let Output::Send { to, msg } = output else {
-                        panic!("only Sends, Applies and a response follow the Persist: {output:?}");
+                        panic!(
+                            "only Sends, Applies, Reads and a response follow the Persist: \
+                             {output:?}"
+                        );
                     };
-                    assert!(!applying, "Sends come before Applies");
+                    assert!(!applying && !reading, "Sends come before Applies and Reads");
                     assert!(node.peers().contains(to), "messages go to peers only");
                     assert_eq!(
                         msg.term(),
@@ -2144,8 +2764,38 @@ mod tests {
                             );
                             assert_eq!(request.leader_commit, node.commit_index());
                         }
-                        Message::RequestVoteResponse(_) | Message::AppendEntriesResponse(_) => {
+                        Message::Probe(_) => {
+                            assert_eq!(node.role(), Role::Leader, "probe rounds only from a leader")
+                        }
+                        Message::RequestVoteResponse(_)
+                        | Message::AppendEntriesResponse(_)
+                        | Message::ProbeResponse(_) => {
                             assert_eq!(sender, Some(*to), "a response goes back to the requester");
+                        }
+                    }
+                    // Q1, takipçi tarafı: bir tur yalnızca cevaplayanın güncel term'inden geldiyse
+                    // onaylanır; başka bir term'in turunun cevabı tur 0 taşır. Aksi hâlde gecikmiş
+                    // cevap, aynı numaralı yeni bir turun onayı sanılabilirdi.
+                    if let (
+                        Message::ProbeResponse(response),
+                        Some(Input::Message {
+                            msg: Message::Probe(request),
+                            ..
+                        }),
+                    ) = (msg, &probe_input)
+                    {
+                        assert!(
+                            request.term == node.current_term() || response.round == 0,
+                            "Q1: only a probe of the current term is acknowledged"
+                        );
+                        if request.term == node.current_term() {
+                            assert_eq!(
+                                response.round, request.round,
+                                "Q1: a probe of the current term is acknowledged as is"
+                            );
+                        }
+                        if response.round == 0 && request.term != node.current_term() {
+                            stale_probes_answered += 1;
                         }
                     }
                     if let Message::RequestVoteResponse(RequestVoteResponse {
@@ -2170,11 +2820,14 @@ mod tests {
                     assert!(responded, "S1: a non-leader answers every client request");
                     assert_eq!(after, before, "S1: a rejected request changes nothing");
                 }
+                if node.role() != Role::Leader {
+                    assert!(waiting.is_empty(), "Q1: a non-leader has no pending reads");
+                }
             }
         }
         assert_eq!(
             inputs_seen,
-            ["Tick", "Message", "ClientRequest", "Restart"]
+            ["Tick", "Message", "ClientRequest", "Read", "Restart"]
                 .into_iter()
                 .collect::<BTreeSet<_>>()
         );
@@ -2184,7 +2837,9 @@ mod tests {
                 "RequestVote",
                 "RequestVoteResponse",
                 "AppendEntries",
-                "AppendEntriesResponse"
+                "AppendEntriesResponse",
+                "Probe",
+                "ProbeResponse"
             ]
             .into_iter()
             .collect::<BTreeSet<_>>()
@@ -2196,9 +2851,10 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             "every role must be reached"
         );
-        // Eşikler ölçülen değerlerin (501 liderlik, 1143 oy, 3218 uygulama, 880 kesme, 8418
-        // NotLeader cevabı) çok altındadır: üretici bozulup bir tarafı seyrek görmeye başlarsa test
-        // bunu söyler.
+        // Eşikler ölçülen değerlerin (402 liderlik, 887 oy, 2042 uygulama, 451 kesme, 7922
+        // NotLeader cevabı, 188 cevaplanan ve 4147 reddedilen okuma, başka bir term'in turuna
+        // verilen 664 cevap) çok altındadır: üretici bozulup bir tarafı seyrek görmeye başlarsa
+        // test bunu söyler.
         assert!(
             elections_won >= 100,
             "too few elections won ({elections_won}); the leader side is barely exercised"
@@ -2219,6 +2875,20 @@ mod tests {
         assert!(
             not_leader_answers >= 1_000,
             "too few NotLeader answers ({not_leader_answers}); the client side is barely exercised"
+        );
+        assert!(
+            reads_ready >= 50,
+            "too few reads served ({reads_ready}); the ReadIndex path is barely exercised"
+        );
+        assert!(
+            reads_rejected >= 1_000,
+            "too few reads rejected ({reads_rejected}); the NotLeader side of reads is barely \
+             exercised"
+        );
+        assert!(
+            stale_probes_answered >= 100,
+            "too few probes of another term answered ({stale_probes_answered}); the stale-round \
+             guard is barely exercised"
         );
     }
 }

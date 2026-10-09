@@ -55,6 +55,8 @@ fn drop_prob_zero_delivers_every_message_exactly_once() {
         duplicate_prob: 0.0,
         min_delay: 1,
         max_delay: 5,
+        tail_prob: 0.0,
+        tail_delay: 0,
     };
     let mut sim = cluster(5, 3, config);
     sim.run_until(HORIZON);
@@ -76,6 +78,8 @@ fn duplicate_prob_one_delivers_every_message_twice_with_independent_delays() {
         duplicate_prob: 1.0,
         min_delay: 1,
         max_delay: 5,
+        tail_prob: 0.0,
+        tail_delay: 0,
     };
     let mut sim = cluster(6, 3, config);
     sim.run_until(HORIZON);
@@ -110,6 +114,8 @@ fn delivery_times_stay_within_delay_bounds() {
         duplicate_prob: 0.3,
         min_delay: 3,
         max_delay: 9,
+        tail_prob: 0.0,
+        tail_delay: 0,
     };
     let mut sim = cluster(8, 4, config);
     sim.run_until(HORIZON);
@@ -123,6 +129,39 @@ fn delivery_times_stay_within_delay_bounds() {
         seen_max |= delay == 9;
     }
     assert!(seen_min && seen_max, "both delay bounds should be reached");
+}
+
+// Uzun kuyruk: tail_prob = 1.0 iken her asıl mesaj [max_delay, tail_delay] aralığında bir gecikme
+// alır ve aralığın üst bölgesi de gerçekten görülür (seçim zaman aşımlarını aşan gecikmeler).
+// Çoğaltılan kopya kendi normal gecikmesiyle, en geç asıl mesajla aynı anda varır.
+#[test]
+fn a_long_tail_delays_messages_far_beyond_the_normal_range() {
+    let config = NetworkConfig {
+        drop_prob: 0.0,
+        duplicate_prob: 1.0,
+        min_delay: 1,
+        max_delay: 4,
+        tail_prob: 1.0,
+        tail_delay: 60,
+    };
+    let mut sim = cluster(8, 3, config);
+    sim.run_until(HORIZON);
+    let mut long = 0;
+    for (msg_id, copies) in deliveries_by_msg(&sim) {
+        assert!(copies.len() <= 2, "{msg_id}: {copies:?}");
+        let delays: Vec<u64> = copies.iter().map(|copy| copy.at - copy.sent_at).collect();
+        assert!(
+            delays.iter().all(|delay| (1..=60).contains(delay)),
+            "{delays:?}"
+        );
+        if delays.iter().any(|&delay| delay > 40) {
+            long += 1;
+        }
+    }
+    assert!(
+        long > 10,
+        "only {long} messages took a long-tail delay above 40 ticks"
+    );
 }
 
 // Gecikme sınırları: min_delay = max_delay iken her teslim tam o kadar gecikir.

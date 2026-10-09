@@ -82,6 +82,8 @@ impl ScenarioConfig {
                 duplicate_prob: 0.05,
                 min_delay: 1,
                 max_delay: 5,
+                tail_prob: 0.0,
+                tail_delay: 0,
             },
             disk: DiskConfig::default(),
             clients: ClientConfig {
@@ -118,6 +120,8 @@ impl ScenarioConfig {
                 duplicate_prob: 0.0,
                 min_delay: 1,
                 max_delay: 3,
+                tail_prob: 0.0,
+                tail_delay: 0,
             },
             disk: DiskConfig::default(),
             clients: ClientConfig {
@@ -135,6 +139,37 @@ impl ScenarioConfig {
             fault_mix: FaultMix::FIGURE8,
             horizon: 1_200,
             settle: 1_200,
+        }
+    }
+
+    /// Log'a yazılmayan okumalara (ReadIndex, tezin §6.4'ü) odaklanan ayarlar: kaos profilinin
+    /// diski ve istemcileri; okumaların çoğu log'a yazılmadan cevaplanır, lider sık devrilir ya da
+    /// azınlıkta yalıtılır (`FaultMix::READS`) ve ağın mesajlarının %1'i 120 tick'e kadar, çoğu
+    /// seçim zaman aşımlarını aşan bir gecikme alır. Okuma yolunun tuzakları şunlardır: azınlıkta
+    /// kalıp kendini hâlâ lider sanan eski bir lider, commitIndex'i geride kalmış yeni bir lider ve
+    /// bir seçimi atlatıp yeni bir liderliğe varan bayat bir mesaj. Bu profil üçünü de üretebilir;
+    /// sonuncusunun tetiklediği bazı sıralamalar yine de nadir kalır (bkz. docs/mutation-table.md).
+    #[must_use]
+    pub fn reads() -> Self {
+        let chaos = Self::chaos();
+        Self {
+            network: NetworkConfig {
+                tail_prob: 0.01,
+                tail_delay: 120,
+                ..chaos.network
+            },
+            clients: ClientConfig {
+                ops: OpMix {
+                    get: 2,
+                    put: 5,
+                    append: 5,
+                    delete: 2,
+                    read_index: 8,
+                },
+                ..chaos.clients
+            },
+            fault_mix: FaultMix::READS,
+            ..chaos
         }
     }
 }
@@ -163,6 +198,9 @@ pub struct FaultMix {
     pub loss: u64,
     /// Hata yok (yalnızca zaman geçer).
     pub quiet: u64,
+    /// Lideri tek başına azınlığa ayırma. Kendini hâlâ lider sanan ama çoğunluğa ulaşamayan bir
+    /// "eski lider" üretir: ReadIndex'in (tezin §6.4'ü) korumak istediği durum budur.
+    pub isolate_leader: u64,
 }
 
 impl FaultMix {
@@ -176,6 +214,19 @@ impl FaultMix {
         heal: 1,
         loss: 1,
         quiet: 2,
+        isolate_leader: 0,
+    };
+
+    /// ReadIndex profilinin karışımı: kaos karışımı, artı lideri çökertme ve lideri yalıtma.
+    pub const READS: Self = Self {
+        crash: 3,
+        crash_leader: 2,
+        restart: 3,
+        partition: 2,
+        heal: 1,
+        loss: 1,
+        quiet: 2,
+        isolate_leader: 2,
     };
 
     /// Figure 8 profilinin karışımı: liderler sık devrilir ve düğümler hızla geri döner.
@@ -187,10 +238,11 @@ impl FaultMix {
         heal: 1,
         loss: 0,
         quiet: 1,
+        isolate_leader: 0,
     };
 
     /// Ağırlıklar, sabit sırayla.
-    fn weights(&self) -> [u64; 7] {
+    fn weights(&self) -> [u64; 8] {
         [
             self.crash,
             self.crash_leader,
@@ -199,9 +251,13 @@ impl FaultMix {
             self.heal,
             self.loss,
             self.quiet,
+            self.isolate_leader,
         ]
     }
 }
+
+/// "Sessizlik"in `FaultMix::weights` içindeki yeri: ağırlıkların hepsi sıfırsa seçilen tür.
+const QUIET: usize = 6;
 
 /// Bir hata niyeti. Hedef, hatanın yürütüldüğü andaki duruma göre seçilir (bkz. modül belgesi).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +292,9 @@ pub enum Fault {
         /// Binde kayıp olasılığı.
         permille: u16,
     },
+    /// Ayaktaki liderlerden term'i en yüksek olanı (eşitlikte küçük kimlik) tek başına bir gruba,
+    /// diğer bütün düğümleri öbür gruba ayır; lider yoksa etkisizdir.
+    IsolateLeader,
 }
 
 /// Zamanı belli bir hata.
@@ -284,7 +343,7 @@ impl Scenario {
                 .fold(0_u64, |sum, &weight| sum.saturating_add(weight));
             let mut draw = uniform_inclusive(&mut rng, 0, total.saturating_sub(1));
             // Çekilişin düştüğü aralık; ağırlıkların hepsi sıfırsa "sessizlik".
-            let mut kind = weights.len() - 1;
+            let mut kind = QUIET;
             for (index, &weight) in weights.iter().enumerate() {
                 if draw < weight {
                     kind = index;
@@ -311,6 +370,8 @@ impl Scenario {
                         _ => 200,
                     },
                 },
+                7 => Fault::IsolateLeader,
+                // `QUIET`: hata yok, yalnızca zaman geçer.
                 _ => continue,
             };
             faults.push(ScheduledFault { at, fault });
@@ -357,8 +418,8 @@ pub struct RunStats {
     /// Gerçekten yeniden başlatılan düğümler: çökmüş düğüm yokken etkisiz kalan `Restart` hataları
     /// sayılmaz.
     pub restarts: u64,
-    /// Uygulanan bölünmeler; maskesi bütün düğümleri tek gruba koyan (etkisiz) bölünmeler de
-    /// sayılır.
+    /// Uygulanan bölünmeler (lideri yalıtma dahil); maskesi bütün düğümleri tek gruba koyan
+    /// (etkisiz) bölünmeler de sayılır.
     pub partitions: u64,
     /// Kayıp oranı değişimleri; oranı zaten olduğu değere "değiştiren" hatalar da sayılır.
     pub loss_changes: u64,
@@ -615,17 +676,16 @@ fn inject(
             }
         }
         Fault::CrashLeader => {
-            // `leaders` kimlik sırasıyla döner; en yüksek term'i seçmek eşitlikte küçük kimliği
-            // korur (`max_by_key` eşitlikte SONUNCUYU seçtiği için ters sırada gezilir).
-            let leader = cluster
-                .leaders()
-                .into_iter()
-                .rev()
-                .max_by_key(|&(_, term)| term)
-                .map(|(id, _)| id);
-            if let Some(id) = leader {
+            if let Some(id) = current_leader(cluster) {
                 cluster.crash(id)?;
                 stats.crashes += 1;
+            }
+        }
+        Fault::IsolateLeader => {
+            if let Some(leader) = current_leader(cluster) {
+                let rest: Vec<NodeId> = nodes.iter().copied().filter(|&id| id != leader).collect();
+                cluster.partition(&[&[leader], &rest])?;
+                stats.partitions += 1;
             }
         }
         Fault::Restart { pick } => {
@@ -657,6 +717,19 @@ fn inject(
         }
     }
     Ok(())
+}
+
+/// Ayaktaki liderlerden term'i en yüksek olanı; eşitlikte küçük kimlik. Bölünme sırasında
+/// azınlıkta kalmış eski bir lider de kendini lider sanabilir; hedef, en yeni liderliktir.
+fn current_leader(cluster: &RaftCluster) -> Option<NodeId> {
+    // `leaders` kimlik sırasıyla döner; en yüksek term'i seçmek eşitlikte küçük kimliği korur
+    // (`max_by_key` eşitlikte SONUNCUYU seçtiği için ters sırada gezilir).
+    cluster
+        .leaders()
+        .into_iter()
+        .rev()
+        .max_by_key(|&(_, term)| term)
+        .map(|(id, _)| id)
 }
 
 /// `items` içinden `pick mod uzunluk`'uncusu; liste boşsa `None`.
@@ -696,7 +769,7 @@ mod tests {
             Scenario::generate(3, config).faults,
             Scenario::generate(4, config).faults
         );
-        let mut kinds = [false; 6];
+        let mut kinds = [false; 7];
         for seed in 0..20 {
             let scenario = Scenario::generate(seed, config);
             let mut previous = 0;
@@ -714,12 +787,20 @@ mod tests {
                         4
                     }
                     Fault::CrashLeader => 5,
+                    Fault::IsolateLeader => 6,
                 };
                 kinds[kind] = true;
             }
         }
-        // Kaos karışımında lideri çökertme kapalıdır (ağırlığı 0).
-        assert_eq!(kinds, [true, true, true, true, true, false]);
+        // Kaos karışımında lideri çökertme ve lideri yalıtma kapalıdır (ağırlıkları 0).
+        assert_eq!(kinds, [true, true, true, true, true, false, false]);
+        let reads = Scenario::generate(1, ScenarioConfig::reads());
+        assert!(
+            reads
+                .faults
+                .iter()
+                .any(|scheduled| scheduled.fault == Fault::IsolateLeader)
+        );
         let figure8 = Scenario::generate(1, ScenarioConfig::figure8());
         assert!(
             figure8

@@ -24,9 +24,10 @@
 //!   çıktılar (mesajlar, uygulamalar) o yazma kalıcı olana kadar tutulur. Çökme bekleyen yazmaları
 //!   kaybettirir, istenirse bir öneklerini diske ulaştırır ("kısmen yazılır").
 //! - **Raft adaptörü** ([`RaftCluster`]): istemci istekleri ([`KvRequest`]: oturum ve
-//!   [`KvCommand`]), düğüm başına oturumlu KV durum makinesi ([`KvStore`], §8: aynı istek bir kez
-//!   uygulanır) ve her olaydan sonra Figure 3'ün beş güvenlik özelliğiyle kümenin diğer
-//!   denetimleri (dayanıklılık, çıktı sırası, commit edilmiş girdilerin korunması).
+//!   [`KvCommand`]), log'a yazılmadan cevaplanan okumalar (ReadIndex, tezin §6.4'ü;
+//!   [`RaftCluster::submit_read`]), düğüm başına oturumlu KV durum makinesi ([`KvStore`], §8: aynı
+//!   istek bir kez uygulanır) ve her olaydan sonra Figure 3'ün beş güvenlik özelliğiyle kümenin
+//!   diğer denetimleri (dayanıklılık, çıktı sırası, commit edilmiş girdilerin korunması).
 //! - **İstemciler** ([`ClientDriver`]): sırayla çalışan, zaman aşımında aynı `(client, seq)` ile
 //!   yeniden deneyen, `NotLeader` ipucunu izleyen istemciler; cevapların bir kısmı seed'li olarak
 //!   kaybolur. Geçmiş, `checker`'ın linearizability kontrolcüsünün tipleriyle kaydedilir.
@@ -164,7 +165,7 @@ pub use node::{DurableState, InputOf, NodeInput, NodeOutput, OutputOf, SimNode, 
 pub use queue::{EventQueue, Scheduled};
 pub use raft::{
     AppliedEntry, ClientReply, ClusterConfig, ClusterError, DurabilityMismatch, Election,
-    NotLeaderReply, RaftCluster, ReplyOutcome, Violation,
+    NotLeaderReply, RaftCluster, RaftRequest, RaftResponse, ReplyOutcome, Violation,
 };
 pub use raft_core::NodeId;
 // `RaftCluster`'ın genel API'sinde görünen raft-core tipleri de aynı gerekçeyle buradan dışa
@@ -173,7 +174,7 @@ pub use raft_core::NodeId;
 // `ConfigError` takma adla verilir: sim'in kendi `ConfigError`'ıyla karışmasınlar.
 pub use raft_core::{
     Command, Config as RaftConfig, ConfigError as RaftConfigError, LogEntry, LogIndex, LogUpdate,
-    PersistUpdate, PersistentState, RaftNode, Role, Term,
+    PersistUpdate, PersistentState, RaftNode, ReadId, ReadOutcome, Role, Term,
 };
 pub use rng::{ChaCha8Rng, Component, SeedTree, chance, uniform_inclusive};
 pub use scenario::{

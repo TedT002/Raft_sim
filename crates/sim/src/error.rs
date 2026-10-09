@@ -28,6 +28,15 @@ pub enum ConfigError {
         /// En büyük gecikme (tick).
         max: u64,
     },
+    /// Uzun kuyruk açıkken `tail_delay`, `max_delay`'den küçük: kuyruk gecikmesi normal
+    /// gecikmelerden uzun olmalı.
+    #[error("tail_delay ({tail}) must not be below max_delay ({max})")]
+    TailDelayRange {
+        /// En büyük normal gecikme (tick).
+        max: u64,
+        /// Uzun kuyruk gecikmesinin üst sınırı (tick).
+        tail: u64,
+    },
     /// `tick_every` sıfır: saat hiç ilerlemezdi.
     #[error("tick_every must be at least 1")]
     ZeroTickInterval,

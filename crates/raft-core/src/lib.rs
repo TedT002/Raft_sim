@@ -28,7 +28,10 @@
 //! commit kuralı; commit edilen girdilerin sırayla uygulanması) ve **istemci arayüzünün
 //! çekirdekteki kısmını** uygular (§8: lider olmayan düğümün [`ClientResponse::NotLeader`] cevabı
 //! ve yeni liderin term başında eklediği no-op girdi). Aynı isteğin bir kez uygulanması (oturumlar
-//! ve tekilleştirme) durum makinesinin işidir: komutlar çekirdek için opaktır (C1).
+//! ve tekilleştirme) durum makinesinin işidir: komutlar çekirdek için opaktır (C1). Okumalar log'a
+//! yazılmadan da cevaplanabilir (**ReadIndex**, tezin §6.4'ü): lider liderliğini bir doğrulama
+//! turuyla ([`Message::Probe`]) çoğunluğa onaylatır ve okumayı commitIndex'ine kadar uygulanmış
+//! durumdan cevaplatır ([`Input::Read`], [`Output::Read`]).
 //!
 //! Yorumlarda geçen etiketler bu crate'in sözleşme maddeleridir (değişmezler ve kenar durumlar):
 //!
@@ -49,8 +52,8 @@
 //! - **O2:** Bir adım kalıcı durumu (`currentTerm`, `votedFor` ya da log) değiştirdiyse İLK
 //!   çıktısı, değişikliği (farkı) taşıyan tek bir `Persist`'tir; değiştirmediyse hiç `Persist`
 //!   yoktur. Farkı diskteki duruma uygulamak (`PersistentState::apply`) tam olarak bellekteki
-//!   durumu verir. Ardından `Send`'ler, sonra `Apply`'lar, en sonda (varsa) `ClientResponse`
-//!   gelir.
+//!   durumu verir. Ardından `Send`'ler, sonra `Apply`'lar, sonra okumaların sonuçları (`Read`),
+//!   en sonda (varsa) `ClientResponse` gelir.
 //! - **R1:** `Input::Restart` yalnızca diskte kalıcı olan durumu taşır; kurtarma ondan başlar.
 //!   Düğüm Follower olarak açılır ve bu adım hiç çıktı üretmez.
 //! - **T1:** Term asla azalmaz. Daha yüksek term taşıyan herhangi bir mesaj görülünce düğüm o
@@ -69,6 +72,12 @@
 //!   8).
 //! - **A1:** Commit edilen girdiler index sırasıyla, her biri bir kez `Apply` olarak verilir;
 //!   yeniden başlatmadan sonra (lastApplied geçici olduğu için) baştan yeniden verilir.
+//! - **Q1:** Her `Input::Read`, düğüm arada çökmedikçe tam olarak bir `Output::Read` alır. Lider
+//!   olmayan düğüm aynı adımda `NotLeader` döner. Lider `Ready`'yi yalnızca şu üçü birlikte
+//!   sağlanınca üretir: okuma geldikten SONRA başlattığı bir doğrulama turunu çoğunluk onayladı,
+//!   kendi term'inden bir girdiyi commit etti (okumanın `readIndex`'i o andan sonraki
+//!   commitIndex'idir) ve `readIndex`'e kadar uyguladı. Okuma tamamlanmadan liderliği bırakan
+//!   düğüm bekleyen okumaları `NotLeader` ile bitirir.
 //!
 //! Aşağıdaki örnek, gerçek bir sürücünün (ör. simülatör) çekirdekle nasıl konuşacağını gösterir:
 //! üç düğümlü bir kümenin bir düğümünü kurar, seçim zaman aşımı dolana kadar `Tick` verir ve dönen
@@ -108,6 +117,10 @@
 //!             // Durum makinesine (raft-core dışında yaşayan KV store gibi) uygulanır.
 //!             let _ = (index, command);
 //!         }
+//!         Output::Read { id, outcome } => {
+//!             // Okuma (Input::Read) sonuçlandı: `Ready` ise durum makinesinden cevaplanır.
+//!             let _ = (id, outcome);
+//!         }
 //!         Output::ClientResponse(response) => {
 //!             // İstemciye geri döndürülür.
 //!             let _ = response;
@@ -130,7 +143,9 @@ const ENABLED_MUTATIONS: usize = cfg!(feature = "mutation-no-election-restrictio
     + cfg!(feature = "mutation-forget-vote") as usize
     + cfg!(feature = "mutation-truncate-on-append") as usize
     + cfg!(feature = "mutation-skip-prev-log-term") as usize
-    + cfg!(feature = "mutation-apply-before-commit") as usize;
+    + cfg!(feature = "mutation-apply-before-commit") as usize
+    + cfg!(feature = "mutation-read-without-quorum") as usize
+    + cfg!(feature = "mutation-read-before-term-commit") as usize;
 // `<= 1` yerine `matches!`: varsayılan derlemede sabit 0'dır ve clippy, türün en küçük değeriyle
 // yapılan her zaman doğru bir karşılaştırmayı (`absurd_extreme_comparisons`) hata sayar.
 const _: () = assert!(
@@ -157,6 +172,10 @@ pub const ENABLED_MUTATION: Option<&str> = if cfg!(feature = "mutation-no-electi
     Some("mutation-skip-prev-log-term")
 } else if cfg!(feature = "mutation-apply-before-commit") {
     Some("mutation-apply-before-commit")
+} else if cfg!(feature = "mutation-read-without-quorum") {
+    Some("mutation-read-without-quorum")
+} else if cfg!(feature = "mutation-read-before-term-commit") {
+    Some("mutation-read-before-term-commit")
 } else {
     None
 };
@@ -178,10 +197,11 @@ pub use config::{Config, ConfigError};
 pub use input::Input;
 pub use log::LogEntry;
 pub use message::{
-    AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
+    AppendEntries, AppendEntriesResponse, Message, Probe, ProbeResponse, RequestVote,
+    RequestVoteResponse,
 };
 pub use node::RaftNode;
-pub use output::{ClientResponse, Output};
+pub use output::{ClientResponse, Output, ReadOutcome};
 pub use persist::{LogUpdate, PersistUpdate, PersistentState};
 pub use role::Role;
-pub use types::{Command, LogIndex, NodeId, Term};
+pub use types::{Command, LogIndex, NodeId, ReadId, Term};

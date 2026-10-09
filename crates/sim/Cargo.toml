@@ -24,6 +24,8 @@ mutation-forget-vote = ["raft-core/mutation-forget-vote"]
 mutation-truncate-on-append = ["raft-core/mutation-truncate-on-append"]
 mutation-skip-prev-log-term = ["raft-core/mutation-skip-prev-log-term"]
 mutation-apply-before-commit = ["raft-core/mutation-apply-before-commit"]
+mutation-read-without-quorum = ["raft-core/mutation-read-without-quorum"]
+mutation-read-before-term-commit = ["raft-core/mutation-read-before-term-commit"]
 mutation-no-dedup = []
 
 [lints]
