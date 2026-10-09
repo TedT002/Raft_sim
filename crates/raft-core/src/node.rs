@@ -5,7 +5,9 @@
 //! istemci arayüzünün çekirdekteki kısmı (§8): lider olmayan düğümün `NotLeader { hint }` cevabı ve
 //! yeni liderin term başında eklediği no-op girdi. Tekrarlanan isteklerin ayıklanması (aynı
 //! `(client_id, seq)`'in bir kez uygulanması) durum makinesinin işidir: komutlar çekirdek için
-//! opaktır (C1). Okumalar log'a yazılmadan da cevaplanabilir (ReadIndex, tezin §6.4'ü; Q1).
+//! opaktır (C1). Okumalar log'a yazılmadan da cevaplanabilir (ReadIndex, tezin §6.4'ü; Q1). Log,
+//! durum makinesinin snapshot'ıyla sıkıştırılabilir; log'unda olmayan girdilere ihtiyacı olan bir
+//! takipçiye lider snapshot'ı gönderir (§7, Figure 13; P1).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,11 +18,11 @@ use crate::config::Config;
 use crate::input::Input;
 use crate::log::{Log, LogEntry};
 use crate::message::{
-    AppendEntries, AppendEntriesResponse, Message, Probe, ProbeResponse, RequestVote,
-    RequestVoteResponse,
+    AppendEntries, AppendEntriesResponse, InstallSnapshot, Message, Probe, ProbeResponse,
+    RequestVote, RequestVoteResponse,
 };
 use crate::output::{ClientResponse, Output, ReadOutcome};
-use crate::persist::{PersistUpdate, PersistentState};
+use crate::persist::{PersistUpdate, PersistentState, Snapshot};
 use crate::role::Role;
 use crate::types::{Command, LogIndex, NodeId, ReadId, Term};
 
@@ -78,6 +80,9 @@ pub struct RaftNode {
     // adımın bütün `Send`'lerinden önce tek bir `Output::Persist` ile diske yazdırılır (O1, O2).
     current_term: Term,
     voted_for: Option<NodeId>,
+    // Log ve varsa snapshot'ı (§7): snapshot, log'un `1..=snapshot.last_index` önekinin yerini
+    // tutar. Verisi, log'unda artık bulunmayan girdilere ihtiyacı olan bir takipçiye gönderilmek
+    // için saklanır. İkisi tek bir yapıdadır: log'un tabanı her zaman snapshot'ınkidir.
     log: Log,
 
     // --- Geçici durum: çökmede kaybolur, `Restart` onu sıfırdan kurar (R1).
@@ -112,6 +117,9 @@ pub struct RaftNode {
     // her okumayı biriktirir. Simülatörde koşunun süresi bunu sınırlar; gerçek bir çalıştırıcı bir
     // tavan ya da son tarih koymalı ve aynı adımda gelen okumaları tek turda toplamalıdır.
     pending_reads: Vec<PendingRead>,
+    // Bu adımda liderden kurulan snapshot: sürücü durum makinesini onunla değiştirir
+    // (`Output::Restore`).
+    restored: Option<Snapshot>,
 }
 
 impl RaftNode {
@@ -151,8 +159,14 @@ impl RaftNode {
         let PersistentState {
             current_term,
             voted_for,
+            snapshot,
             log,
         } = state;
+        // Snapshot'ın kapsadığı girdiler commit edilmiş ve durum makinesine uygulanmıştır: düğüm
+        // `lastApplied = commitIndex = snapshot.last_index` ile açılır (sürücü durum makinesini
+        // snapshot'tan kurar). Snapshot yoksa ikisi de 0'dan başlar (Figure 2).
+        let log = Log::new(snapshot, log);
+        let base = log.snapshot_index();
         Self {
             id,
             peers,
@@ -160,11 +174,11 @@ impl RaftNode {
             rng,
             current_term,
             voted_for,
-            log: Log::new(log),
+            log,
             role: Role::Follower,
             votes: BTreeSet::new(),
-            commit_index: LogIndex(0),
-            last_applied: LogIndex(0),
+            commit_index: base,
+            last_applied: base,
             election_elapsed: 0,
             election_timeout,
             heartbeat_elapsed: 0,
@@ -172,6 +186,7 @@ impl RaftNode {
             progress: BTreeMap::new(),
             probe_round: 0,
             pending_reads: Vec::new(),
+            restored: None,
         }
     }
 
@@ -211,10 +226,23 @@ impl RaftNode {
         self.voted_for
     }
 
-    /// Log girdileri; dilimdeki 0. konum 1. index'tir.
+    /// Log girdileri; dilimdeki 0. konum 1. index'tir. Bir snapshot varsa (§7) yalnızca ondan
+    /// sonraki girdiler: 0. konum `snapshot.last_index + 1`. index'tir.
     #[must_use]
     pub fn log(&self) -> &[LogEntry] {
         self.log.entries()
+    }
+
+    /// Varsa snapshot (§7): log'un `1..=last_index` önekinin yerini tutar.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.log.snapshot()
+    }
+
+    /// `index`'teki girdi; snapshot'ın kapsadığı ya da log'un ötesindeki bir index için `None`.
+    #[must_use]
+    pub fn entry(&self, index: LogIndex) -> Option<&LogEntry> {
+        self.log.entry(index)
     }
 
     /// Commit edildiği bilinen en yüksek index (Figure 2: `commitIndex`).
@@ -245,6 +273,7 @@ impl RaftNode {
         PersistentState {
             current_term: self.current_term,
             voted_for: self.voted_for,
+            snapshot: self.log.snapshot().cloned(),
             log: self.log.entries().to_vec(),
         }
     }
@@ -256,9 +285,9 @@ impl RaftNode {
     /// sırasız ya da eksik yürütmek (O1 ihlali) ise derleyicinin göremeyeceği, sürücünün
     /// sorumluluğundaki bir hatadır.
     ///
-    /// Çıktıların sırası: varsa tek bir `Persist`, sonra `Send`'ler, sonra `Apply`'lar, sonra
-    /// okumaların sonuçları (`Read`), en sonda (yalnızca bir istemci isteği adımında)
-    /// `ClientResponse`.
+    /// Çıktıların sırası: varsa tek bir `Persist`, sonra `Send`'ler, sonra varsa `Restore`, sonra
+    /// `Apply`'lar, sonra okumaların sonuçları (`Read`), en sonda (yalnızca bir istemci isteği
+    /// adımında) `ClientResponse`.
     ///
     /// N3: `step` tam (total) bir fonksiyondur: her `Input` değeri için panik atmadan döner.
     /// Simülatör her düğümü her tick'te adımlar; tek bir panik bütün koşuyu ve determinizm
@@ -281,6 +310,7 @@ impl RaftNode {
                 response = self.on_client_request(command, &mut outbox);
             }
             Input::Read(id) => read_reply = self.on_read(id, &mut outbox),
+            Input::Compact { index, data } => self.on_compact(index, data),
             Input::Restart(state) => {
                 self.restart(state);
                 // R1: yüklenen durum zaten diskteki durumdur; yeniden yazmaya gerek yok. Yeniden
@@ -288,8 +318,13 @@ impl RaftNode {
                 return Vec::new();
             }
         }
-        let log_update = self.log.take_update();
-        let persist = if (self.current_term, self.voted_for) != before || log_update.is_some() {
+        // Snapshot ve log farkı birlikte alınır (`Log::take_update`): log'un tabanını kaydıran bir
+        // snapshot, onun ardındaki log'la aynı yazmada diske gider.
+        let (snapshot_update, log_update) = self.log.take_update();
+        let persist = if (self.current_term, self.voted_for) != before
+            || log_update.is_some()
+            || snapshot_update.is_some()
+        {
             Some(Output::Persist(PersistUpdate {
                 current_term: self.current_term,
                 // Mutasyon `mutation-forget-vote` (Faz 5) oyu diske yazmaz: çöküp kalkan düğüm aynı
@@ -299,11 +334,15 @@ impl RaftNode {
                 } else {
                     self.voted_for
                 },
+                snapshot: snapshot_update,
                 log: log_update,
             }))
         } else {
             None
         };
+        // Kurulan snapshot uygulamalardan ÖNCE gelir: durum makinesi önce snapshot'la değiştirilir,
+        // sonraki `Apply`'lar onun ardından devam eder (P1).
+        let restore = self.restored.take().map(Output::Restore);
         let applies = self.apply_committed();
         // Okumalar uygulamalardan SONRA sonuçlanır: `Ready`, bu adımın `Apply`'larını da görmüş
         // bir durum makinesinden cevaplanır (Q1).
@@ -311,6 +350,7 @@ impl RaftNode {
         persist
             .into_iter()
             .chain(outbox.into_iter().map(|(to, msg)| Output::Send { to, msg }))
+            .chain(restore)
             .chain(applies)
             .chain(read_reply)
             .chain(reads)
@@ -440,19 +480,33 @@ impl RaftNode {
     fn broadcast_append_entries(&mut self, outbox: &mut Outbox) {
         self.heartbeat_elapsed = 0;
         for &peer in &self.peers {
-            outbox.push((peer, self.append_entries_for(peer)));
+            outbox.push((peer, self.replication_for(peer)));
         }
     }
 
     /// `peer` için bir AppendEntries: `nextIndex`'ten başlayan en fazla `max_entries` girdi, hemen
     /// öncesindeki girdinin index'i ve term'i (tutarlılık denetimi için) ve liderin
-    /// `commitIndex`'i.
-    fn append_entries_for(&self, peer: NodeId) -> Message {
+    /// `commitIndex`'i. O girdilerin öncesi snapshot'a alınmışsa (§7) takipçi onları ancak
+    /// snapshot olarak alabilir: mesaj bir `InstallSnapshot`'tır.
+    ///
+    /// Takipçi snapshot'ı kurduğunu bildirene kadar snapshot her heartbeat'te yeniden gönderilir;
+    /// yoldaki bir snapshot izlenmez. Simülatörde bu zararsızdır (mesaj boyu sınırı yoktur); gerçek
+    /// bir çalıştırıcı büyük snapshot'ları parçalara bölmeli (Figure 13: `offset`, `done`) ve
+    /// gönderilmekte olanı izlemelidir.
+    fn replication_for(&self, peer: NodeId) -> Message {
         let next_index = self
             .progress
             .get(&peer)
             .map_or(self.log.last_index().next(), |progress| progress.next_index);
         let prev_log_index = next_index.prev();
+        if prev_log_index < self.log.snapshot_index()
+            && let Some(snapshot) = self.log.snapshot()
+        {
+            return Message::InstallSnapshot(InstallSnapshot {
+                term: self.current_term,
+                snapshot: snapshot.clone(),
+            });
+        }
         Message::AppendEntries(AppendEntries {
             term: self.current_term,
             prev_log_index,
@@ -643,6 +697,7 @@ impl RaftNode {
             }
             Message::Probe(request) => self.on_probe(from, &request, outbox),
             Message::ProbeResponse(response) => self.on_probe_response(from, &response),
+            Message::InstallSnapshot(request) => self.on_install_snapshot(from, request, outbox),
         }
     }
 
@@ -773,10 +828,17 @@ impl RaftNode {
         // varlık denetimi kalır: log'u yeterince uzun olan takipçi, `prev_log_index`'teki
         // girdisinin term'i liderinkinden farklı olsa bile isteği kabul eder. Tutarsız bir önekin
         // arkasına girdi eklenir ve log'lar ayrışır.
-        let consistent = match self.log.term_at(prev_log_index) {
-            None => false,
-            Some(term) => term == prev_log_term || cfg!(feature = "mutation-skip-prev-log-term"),
-        };
+        // §7: takipçi `prev_log_index`'i snapshot'a almışsa denetim geçer: snapshot yalnızca commit
+        // edilmiş girdiler içerir ve commit edilmiş bir önek her liderin log'unda aynıdır (Leader
+        // Completeness). İsteğin snapshot'ın içine düşen girdileri aşağıda atlanır.
+        let compacted = prev_log_index < self.log.snapshot_index();
+        let consistent = compacted
+            || match self.log.term_at(prev_log_index) {
+                None => false,
+                Some(term) => {
+                    term == prev_log_term || cfg!(feature = "mutation-skip-prev-log-term")
+                }
+            };
         if !consistent {
             let hint = self.log.last_index().min(prev_log_index.prev());
             return (false, hint);
@@ -795,6 +857,9 @@ impl RaftNode {
         let mut index = prev_log_index;
         for entry in entries {
             index = index.next();
+            if index <= self.log.snapshot_index() {
+                continue;
+            }
             match self.log.term_at(index) {
                 Some(term) if term == entry.term => {}
                 Some(_) => {
@@ -813,7 +878,79 @@ impl RaftNode {
         if leader_commit > self.commit_index {
             self.commit_index = self.commit_index.max(leader_commit.min(index));
         }
-        (true, index)
+        // Snapshot'ın kapsadığı önek de eşleşir (commit edilmiştir): istek snapshot'ın gerisinde
+        // bittiyse eşleşme en az snapshot'ın sonuna kadardır.
+        (true, index.max(self.log.snapshot_index()))
+    }
+
+    /// Sürücü durum makinesini `index`'te snapshot'a aldı (§7): `1..=index` girdileri log'dan
+    /// atılır ve snapshot persist edilir.
+    fn on_compact(&mut self, index: LogIndex, data: Vec<u8>) {
+        // Yalnızca uygulanmış bir önek sıkıştırılabilir: snapshot, durum makinesinin o index'teki
+        // hâlidir ve uygulanmış girdiler commit edilmiştir (lastApplied ≤ commitIndex). Henüz
+        // uygulanmamış bir girdiyi atmak onu hiç uygulanamaz kılardı. Snapshot'ın gerisine ya da
+        // log'un ötesine sıkıştırma da etkisizdir (`Log::compact`).
+        if index > self.last_applied {
+            return;
+        }
+        self.log.compact(index, data);
+    }
+
+    /// `InstallSnapshot` alıcısı (Figure 13): snapshot'ı gerekirse kurar ve bir
+    /// `AppendEntriesResponse` ile cevap verir (bkz. `Message::InstallSnapshot`).
+    fn on_install_snapshot(&mut self, from: NodeId, request: InstallSnapshot, outbox: &mut Outbox) {
+        let (success, match_index) = self.accept_snapshot(from, request);
+        outbox.push((
+            from,
+            Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: self.current_term,
+                success,
+                match_index,
+            }),
+        ));
+    }
+
+    /// InstallSnapshot'ı Figure 13'ün alıcı kurallarıyla uygular; cevabın `success` ve
+    /// `match_index` alanlarını döndürür.
+    fn accept_snapshot(&mut self, from: NodeId, request: InstallSnapshot) -> (bool, LogIndex) {
+        // 1. adım: eski term'li bir liderin snapshot'ı reddedilir; cevaptaki güncel term sayesinde
+        // eski lider geride kaldığını öğrenir (AppendEntries'teki gibi, §5.1).
+        if request.term < self.current_term {
+            return (false, LogIndex(0));
+        }
+        if self.role == Role::Leader {
+            // Aynı term'de ikinci bir lider Election Safety'ye göre imkânsızdır (bkz.
+            // `accept_append_entries`); lider snapshot kurmaz, panik de atmaz (N3).
+            return (false, LogIndex(0));
+        }
+        // Bu term'de snapshot gönderen, bu term'in lideridir.
+        self.recognize_leader(from);
+        let InstallSnapshot { snapshot, .. } = request;
+        let last_index = snapshot.last_index;
+        // Snapshot düğümün zaten commit ettiği bir önekin özetiyse kurulmaz: o girdiler (ya da daha
+        // yeni bir snapshot) zaten var ve durum makinesi en az o kadar ilerdedir; kurmak durumu ve
+        // commitIndex'i geri alırdı. Geciken ya da çoğaltılmış eski bir InstallSnapshot böyle
+        // gelir. Eşleşme yine de bildirilir: commit edilmiş önek liderinkiyle aynıdır. Mutasyon
+        // `mutation-install-stale-snapshot` (Faz 6) bu denetimi atlar: eski bir snapshot durum
+        // makinesini ve commitIndex'i geri sarar.
+        if last_index <= self.commit_index && !cfg!(feature = "mutation-install-stale-snapshot") {
+            return (true, last_index);
+        }
+        // 6. ve 7. adımlar: snapshot'ın son girdisiyle eşleşen bir girdi varsa sonrası korunur,
+        // yoksa log'un tamamı atılır (`Log::install`).
+        //
+        // Figure 13'ten bilinçli bir sapma: 6. adım lafzen "sonrasını koru ve cevap ver" der ve
+        // durum makinesine dokunmaz. Burada eşleşmede de durum makinesi snapshot'la değiştirilir
+        // (8. adım), çünkü buraya yalnızca `last_index > commitIndex ≥ lastApplied` iken gelinir:
+        // `(lastApplied, last_index]` girdileri henüz uygulanmamıştır ve log'dan atıldıkları için
+        // artık tek tek uygulanamazlar; onların etkisi yalnızca snapshot'tadır.
+        self.log.install(snapshot.clone());
+        // 8. adım: durum makinesi snapshot'la değiştirilir. Snapshot yalnızca commit edilmiş
+        // girdiler içerir: commitIndex ve lastApplied onun sonuna gelir.
+        self.commit_index = last_index;
+        self.last_applied = last_index;
+        self.restored = Some(snapshot);
+        (true, last_index)
     }
 
     /// `AppendEntries` cevabını işler (Figure 2, Leaders).
@@ -843,7 +980,7 @@ impl RaftNode {
             self.advance_commit_index();
             // Takipçide hâlâ eksik girdi varsa bir sonraki heartbeat'i beklemeden devam et.
             if lagging {
-                outbox.push((from, self.append_entries_for(from)));
+                outbox.push((from, self.replication_for(from)));
             }
         } else {
             // §5.3: tutarsızlık → nextIndex'i geri çek ve hemen yeniden dene. İpucu sayesinde birer
@@ -853,7 +990,7 @@ impl RaftNode {
             let floor = progress.match_index.next();
             let backed_off = progress.next_index.prev().min(response.match_index.next());
             progress.next_index = floor.max(backed_off);
-            outbox.push((from, self.append_entries_for(from)));
+            outbox.push((from, self.replication_for(from)));
         }
     }
 
@@ -1061,11 +1198,11 @@ mod tests {
     use crate::input::Input;
     use crate::log::LogEntry;
     use crate::message::{
-        AppendEntries, AppendEntriesResponse, Message, Probe, ProbeResponse, RequestVote,
-        RequestVoteResponse,
+        AppendEntries, AppendEntriesResponse, InstallSnapshot, Message, Probe, ProbeResponse,
+        RequestVote, RequestVoteResponse,
     };
     use crate::output::{ClientResponse, Output, ReadOutcome};
-    use crate::persist::{LogUpdate, PersistUpdate, PersistentState};
+    use crate::persist::{LogUpdate, PersistUpdate, PersistentState, Snapshot};
     use crate::role::Role;
     use crate::types::{Command, LogIndex, NodeId, ReadId, Term};
     use rand_chacha::ChaCha8Rng;
@@ -1170,6 +1307,7 @@ mod tests {
         Output::Persist(PersistUpdate {
             current_term: Term(term),
             voted_for: voted_for.map(NodeId),
+            snapshot: None,
             log: None,
         })
     }
@@ -1179,6 +1317,7 @@ mod tests {
         Output::Persist(PersistUpdate {
             current_term: Term(term),
             voted_for: voted_for.map(NodeId),
+            snapshot: None,
             log: Some(LogUpdate {
                 from: LogIndex(from),
                 entries,
@@ -1213,6 +1352,29 @@ mod tests {
 
     fn read(id: u64) -> Input {
         Input::Read(ReadId(id))
+    }
+
+    /// Tek baytlık verili bir snapshot.
+    fn snap(last_index: u64, last_term: u64, byte: u8) -> Snapshot {
+        Snapshot {
+            last_index: LogIndex(last_index),
+            last_term: Term(last_term),
+            data: vec![byte],
+        }
+    }
+
+    fn install(term: u64, snapshot: Snapshot) -> Message {
+        Message::InstallSnapshot(InstallSnapshot {
+            term: Term(term),
+            snapshot,
+        })
+    }
+
+    fn compact(index: u64, byte: u8) -> Input {
+        Input::Compact {
+            index: LogIndex(index),
+            data: vec![byte],
+        }
     }
 
     fn probe(term: u64, round: u64) -> Message {
@@ -1261,6 +1423,7 @@ mod tests {
         let state = PersistentState {
             current_term: Term(term),
             voted_for: None,
+            snapshot: None,
             log,
         };
         let mut node = node_with_state(id, cluster, seed, state);
@@ -1742,6 +1905,7 @@ mod tests {
         let exhausted = PersistentState {
             current_term: Term(u64::MAX),
             voted_for: Some(NodeId(2)),
+            snapshot: None,
             log: Vec::new(),
         };
         assert!(node.step(Input::Restart(exhausted.clone())).is_empty());
@@ -2002,6 +2166,7 @@ mod tests {
         let state = PersistentState {
             current_term: Term(1),
             voted_for: None,
+            snapshot: None,
             log,
         };
         let config = Config::default().with_max_entries(NonZeroUsize::new(2).expect("not zero"));
@@ -2034,6 +2199,7 @@ mod tests {
         let state = PersistentState {
             current_term: Term(2),
             voted_for: None,
+            snapshot: None,
             log: vec![entry(2, 1)],
         };
         let mut node = node_with_state(1, &[1, 2, 3], 31, state);
@@ -2280,6 +2446,159 @@ mod tests {
         assert_eq!(node.step(message(3, probe_reply(1, 2))), vec![ready(2)]);
     }
 
+    // P1 (§7): sıkıştırma yalnızca uygulanmış bir öneki alır; snapshot persist edilir ve log'un
+    // kalanı aynen kalır (diskteki fark yalnızca snapshot'tır). Henüz uygulanmamış bir index'e ya
+    // da snapshot'ın gerisine sıkıştırma etkisizdir.
+    #[test]
+    fn compaction_drops_applied_entries_and_persists_the_snapshot() {
+        let mut node = node(1, &[1, 2, 3], 60);
+        let entries = vec![entry(1, 10), entry(1, 11), entry(1, 12)];
+        let _ = node.step(message(2, append(1, (0, 0), entries, 2)));
+        assert_eq!(node.last_applied(), LogIndex(2));
+        assert!(
+            node.step(compact(3, 9)).is_empty(),
+            "index 3 is not applied yet"
+        );
+        assert_eq!(
+            node.step(compact(2, 42)),
+            vec![Output::Persist(PersistUpdate {
+                current_term: Term(1),
+                voted_for: None,
+                snapshot: Some(snap(2, 1, 42)),
+                log: None,
+            })]
+        );
+        assert_eq!(node.log(), &[entry(1, 12)]);
+        assert_eq!(node.snapshot(), Some(&snap(2, 1, 42)));
+        assert!(node.step(compact(1, 1)).is_empty(), "behind the snapshot");
+        assert!(
+            node.step(compact(2, 1)).is_empty(),
+            "not beyond the snapshot"
+        );
+    }
+
+    // P1 (Figure 13): bir takipçinin ihtiyaç duyduğu girdilerin öncesi snapshot'a alındıysa lider
+    // AppendEntries yerine snapshot'ı gönderir; takipçinin başarılı cevabı (eşleşme snapshot'ın
+    // sonuna kadar) ilerlemeyi snapshot'ın ardına taşır.
+    #[test]
+    fn a_leader_sends_its_snapshot_when_a_follower_needs_compacted_entries() {
+        let mut node = leader(1, &[1, 2, 3], 61);
+        let _ = node.step(client(5));
+        let _ = node.step(message(2, append_reply(1, true, 2)));
+        assert_eq!(node.last_applied(), LogIndex(2));
+        let _ = node.step(compact(2, 7));
+        assert_eq!(
+            node.step(message(3, append_reply(1, false, 0))),
+            vec![send(3, install(1, snap(2, 1, 7)))]
+        );
+        assert!(
+            node.step(message(3, append_reply(1, true, 2))).is_empty(),
+            "the follower caught up through the snapshot; nothing is left to send"
+        );
+    }
+
+    // P1 (Figure 13, 6. adım): takipçi daha yeni bir snapshot'ı kurar; snapshot'ın son girdisiyle
+    // eşleşen bir girdisi varsa sonrasını korur. Snapshot önce persist edilir (diskte yeni tabanın
+    // ardı yeniden yazılır), sonra cevap gider ve durum makinesi snapshot'la değiştirilir.
+    #[test]
+    fn a_follower_installs_a_newer_snapshot_and_keeps_a_matching_suffix() {
+        let mut node = node(1, &[1, 2, 3], 62);
+        let entries = vec![entry(1, 10), entry(1, 11), entry(2, 12)];
+        let _ = node.step(message(2, append(2, (0, 0), entries, 0)));
+        assert_eq!(
+            node.step(message(2, install(2, snap(2, 1, 77)))),
+            vec![
+                Output::Persist(PersistUpdate {
+                    current_term: Term(2),
+                    voted_for: None,
+                    snapshot: Some(snap(2, 1, 77)),
+                    log: Some(LogUpdate {
+                        from: LogIndex(3),
+                        entries: vec![entry(2, 12)],
+                    }),
+                }),
+                send(2, append_reply(2, true, 2)),
+                Output::Restore(snap(2, 1, 77)),
+            ]
+        );
+        assert_eq!(node.log(), &[entry(2, 12)]);
+        assert_eq!(node.commit_index(), LogIndex(2));
+        assert_eq!(node.last_applied(), LogIndex(2));
+    }
+
+    // P1 (Figure 13, 7. adım): snapshot'ın son girdisiyle eşleşmeyen bir log atılır.
+    #[test]
+    fn a_conflicting_log_is_discarded_for_a_snapshot() {
+        let mut node = node(1, &[1, 2, 3], 63);
+        let _ = node.step(message(
+            2,
+            append(1, (0, 0), vec![entry(1, 10), entry(1, 11)], 0),
+        ));
+        let outputs = node.step(message(2, install(3, snap(2, 3, 5))));
+        assert!(node.log().is_empty());
+        assert_eq!(node.commit_index(), LogIndex(2));
+        assert_eq!(outputs.last(), Some(&Output::Restore(snap(2, 3, 5))));
+    }
+
+    // P1: düğümün zaten commit ettiği bir önekin snapshot'ı (geciken ya da çoğaltılmış eski bir
+    // InstallSnapshot) kurulmaz: durum makinesi ve commitIndex geri gitmez. Eşleşme yine
+    // bildirilir.
+    #[test]
+    fn an_older_snapshot_is_not_installed() {
+        let mut node = node(1, &[1, 2, 3], 64);
+        let entries = vec![entry(1, 10), entry(1, 11), entry(1, 12)];
+        let _ = node.step(message(2, append(1, (0, 0), entries, 3)));
+        assert_eq!(
+            node.step(message(2, install(1, snap(2, 1, 9)))),
+            vec![send(2, append_reply(1, true, 2))]
+        );
+        assert_eq!(node.log().len(), 3);
+        assert_eq!(node.commit_index(), LogIndex(3));
+        assert_eq!(node.snapshot(), None);
+    }
+
+    // P1 ve R1: snapshot'lı bir diskle açılan düğüm, snapshot'ın kapsadığı girdileri uygulanmış
+    // sayar; sonraki girdiler snapshot'ın ardından uygulanır.
+    #[test]
+    fn a_restart_with_a_snapshot_starts_after_it() {
+        let state = PersistentState {
+            current_term: Term(2),
+            voted_for: None,
+            snapshot: Some(snap(3, 2, 8)),
+            log: vec![entry(2, 13)],
+        };
+        let mut node = node_with_state(1, &[1, 2, 3], 65, state);
+        assert_eq!(node.commit_index(), LogIndex(3));
+        assert_eq!(node.last_applied(), LogIndex(3));
+        assert_eq!(
+            node.step(message(2, append(2, (4, 2), Vec::new(), 4))),
+            vec![send(2, append_reply(2, true, 4)), apply(4, 13)]
+        );
+    }
+
+    // P1 ve §5.3: önceki girdisi takipçinin snapshot'ının içine düşen bir AppendEntries kabul
+    // edilir (snapshot commit edilmiş bir önektir); snapshot'ın kapsadığı girdiler atlanır, sonrası
+    // eklenir.
+    #[test]
+    fn appends_reaching_into_a_snapshot_skip_the_compacted_entries() {
+        let state = PersistentState {
+            current_term: Term(1),
+            voted_for: None,
+            snapshot: Some(snap(3, 1, 8)),
+            log: Vec::new(),
+        };
+        let mut node = node_with_state(1, &[1, 2, 3], 66, state);
+        let entries = vec![entry(1, 12), entry(1, 13), entry(1, 14)];
+        assert_eq!(
+            node.step(message(2, append(1, (1, 1), entries, 0))),
+            vec![
+                persist_log(1, None, 4, vec![entry(1, 14)]),
+                send(2, append_reply(1, true, 4))
+            ]
+        );
+        assert_eq!(node.log(), &[entry(1, 14)]);
+    }
+
     // Kapsama bekçisi: `Input`'in her varyantı için ayrık bir isim döndürür. Kasıtlı olarak `_`
     // kolu YOK — `Input`'e yeni bir varyant eklenirse bu fonksiyon derlenmez; derleme hatası seni
     // aşağıdaki rastgele girdi testine getirir. Yeni varyant için hem girdi üreticisini hem de
@@ -2291,11 +2610,12 @@ mod tests {
             Input::Message { .. } => "Message",
             Input::ClientRequest(_) => "ClientRequest",
             Input::Read(_) => "Read",
+            Input::Compact { .. } => "Compact",
             Input::Restart(_) => "Restart",
         }
     }
 
-    // Aynı bekçi mantığı `Message` için: 6 mesaj varyantının hepsi üretilmeli.
+    // Aynı bekçi mantığı `Message` için: 7 mesaj varyantının hepsi üretilmeli.
     fn message_name(msg: &Message) -> &'static str {
         match msg {
             Message::RequestVote(_) => "RequestVote",
@@ -2304,6 +2624,23 @@ mod tests {
             Message::AppendEntriesResponse(_) => "AppendEntriesResponse",
             Message::Probe(_) => "Probe",
             Message::ProbeResponse(_) => "ProbeResponse",
+            Message::InstallSnapshot(_) => "InstallSnapshot",
+        }
+    }
+
+    /// Rastgele bir snapshot: son index'i düğümün log'unun biraz ötesine kadar; term'i yarı
+    /// yarıya düğümün o index'teki term'i (eşleşen sonek korunur) ya da rastgele (log atılır).
+    fn random_snapshot(rng: &mut ChaCha8Rng, node: &RaftNode, term: Term) -> Snapshot {
+        let last_index = LogIndex(below(rng, node.log.last_index().0 + 3));
+        let own = node.log.term_at(last_index);
+        let last_term = match own {
+            Some(own) if below(rng, 2) == 0 => own,
+            _ => Term(below(rng, term.0 + 1)),
+        };
+        Snapshot {
+            last_index,
+            last_term,
+            data: vec![random_byte(rng)],
         }
     }
 
@@ -2335,7 +2672,7 @@ mod tests {
             *next_read += 1;
             return Input::Read(ReadId(*next_read));
         }
-        match below(rng, 21) {
+        match below(rng, 22) {
             0..=8 => Input::Tick,
             9..=16 => {
                 let from = NodeId(1 + below(rng, 5));
@@ -2384,7 +2721,10 @@ mod tests {
                     1 => current.saturating_add(1),
                     _ => current,
                 });
-                let msg = match below(rng, 6) {
+                // Her mesaj türü 2/13, snapshot 1/13 olasılıkla: snapshot kurulumu log'u ve
+                // uygulama sırasını baştan değiştirir; daha sık olsaydı sözleşmenin diğer
+                // tarafları (uygulama, çakışma çözümü) seyrek sınanırdı.
+                let msg = match below(rng, 13) / 2 {
                     0 => Message::RequestVote(RequestVote {
                         term,
                         last_log_index: LogIndex(below(rng, 4)),
@@ -2404,14 +2744,22 @@ mod tests {
                         term,
                         round: below(rng, 4),
                     }),
-                    _ => Message::ProbeResponse(ProbeResponse {
+                    5 => Message::ProbeResponse(ProbeResponse {
                         term,
                         round: below(rng, node.probe_round + 2),
+                    }),
+                    _ => Message::InstallSnapshot(InstallSnapshot {
+                        term,
+                        snapshot: random_snapshot(rng, node, term),
                     }),
                 };
                 Input::Message { from, msg }
             }
             17 => Input::Restart(disk.clone()),
+            21 => Input::Compact {
+                index: LogIndex(below(rng, node.last_applied().0 + 2)),
+                data: vec![random_byte(rng)],
+            },
             18 => {
                 *next_read += 1;
                 Input::Read(ReadId(*next_read))
@@ -2501,6 +2849,9 @@ mod tests {
         let mut reads_ready = 0_u32;
         let mut reads_rejected = 0_u32;
         let mut stale_probes_answered = 0_u32;
+        let mut compactions = 0_u32;
+        let mut restores = 0_u32;
+        let mut snapshots_sent = 0_u32;
         for seed in 0..300 {
             let mut rng = ChaCha8Rng::from_seed(seed_bytes(1_000 + seed));
             let config = Config::new(4, 2).expect("valid config");
@@ -2519,6 +2870,14 @@ mod tests {
                     messages_seen.insert(message_name(msg));
                 }
                 let restart = matches!(input, Input::Restart(_));
+                let compact = matches!(input, Input::Compact { .. });
+                let installing = matches!(
+                    input,
+                    Input::Message {
+                        msg: Message::InstallSnapshot(_),
+                        ..
+                    }
+                );
                 let tick = matches!(input, Input::Tick);
                 let client = matches!(input, Input::ClientRequest(_));
                 let read = match input {
@@ -2567,8 +2926,9 @@ mod tests {
                     assert!(outputs.is_empty(), "R1: a restart produces no outputs");
                     assert_eq!(after, disk, "R1: a restart loads the disk");
                     assert_eq!(node.role(), Role::Follower);
-                    assert_eq!(node.commit_index(), LogIndex(0));
-                    assert_eq!(node.last_applied(), LogIndex(0));
+                    // P1: snapshot'ın kapsadığı girdiler uygulanmış sayılır.
+                    assert_eq!(node.commit_index(), disk.snapshot_index());
+                    assert_eq!(node.last_applied(), disk.snapshot_index());
                     // Okumalar geçicidir: çökmeyle kaybolur ve hiçbir zaman cevaplanmaz.
                     waiting.clear();
                     continue;
@@ -2602,8 +2962,11 @@ mod tests {
                     let Output::Persist(update) = &outputs[0] else {
                         panic!("O2: the Persist must come first: {outputs:?}");
                     };
+                    // Yalnızca gerçek kuyruk değiştirmeler (§5.3) sayılır; snapshot kurulumunun
+                    // "tabanın ardını yeniden yaz" farkı sayılmaz.
                     if let Some(log) = &update.log
-                        && log.from.0 <= u64::try_from(before.log.len()).unwrap_or(u64::MAX)
+                        && update.snapshot.is_none()
+                        && log.from.0 <= before.last_index().0
                     {
                         truncations += 1;
                     }
@@ -2619,10 +2982,24 @@ mod tests {
                     && node.role() == Role::Leader
                     && after.current_term == before.current_term
                 {
-                    assert!(
-                        after.log.starts_with(&before.log),
-                        "Leader Append-Only: a leader only appends to its log"
-                    );
+                    // Mutlak index'lerle: liderin snapshot'a aldığı (P1) girdiler log'dan çıkar,
+                    // geri kalanı aynen kalır.
+                    for index in before.snapshot_index().0 + 1..=before.last_index().0 {
+                        if index > after.snapshot_index().0 {
+                            assert_eq!(
+                                after.entry(LogIndex(index)),
+                                before.entry(LogIndex(index)),
+                                "Leader Append-Only: a leader only appends to its log"
+                            );
+                        }
+                    }
+                    assert!(after.snapshot_index() >= before.snapshot_index());
+                }
+                // P1: sıkıştırma yalnızca uygulanmış bir öneki ve yalnızca ileri doğru alır.
+                if compact && after.snapshot != before.snapshot {
+                    assert!(after.snapshot_index() > before.snapshot_index());
+                    assert!(after.snapshot_index() <= applied_before);
+                    compactions += 1;
                 }
                 assert!(
                     after.current_term >= before.current_term,
@@ -2635,6 +3012,7 @@ mod tests {
                     assert_eq!(node.voted_for(), Some(node.id()));
                 }
                 let mut next_apply = applied_before.next();
+                let mut restoring = false;
                 let mut applying = false;
                 let mut reading = false;
                 let mut responded = false;
@@ -2710,6 +3088,22 @@ mod tests {
                         waiting.remove(id);
                         continue;
                     }
+                    if let Output::Restore(snapshot) = output {
+                        assert!(
+                            !restoring && !applying && !reading,
+                            "P1: one restore, before Applies and Reads"
+                        );
+                        assert!(installing, "P1: only an InstallSnapshot restores");
+                        assert_eq!(node.snapshot(), Some(snapshot), "P1: the node's snapshot");
+                        assert!(
+                            snapshot.last_index > commit_before,
+                            "P1: never an older one"
+                        );
+                        restoring = true;
+                        next_apply = snapshot.last_index.next();
+                        restores += 1;
+                        continue;
+                    }
                     if let Output::Apply { index, command } = output {
                         assert!(!reading, "Applies come before Reads");
                         applying = true;
@@ -2725,11 +3119,14 @@ mod tests {
                     }
                     let Output::Send { to, msg } = output else {
                         panic!(
-                            "only Sends, Applies, Reads and a response follow the Persist: \
-                             {output:?}"
+                            "only Sends, a Restore, Applies, Reads and a response follow the \
+                             Persist: {output:?}"
                         );
                     };
-                    assert!(!applying && !reading, "Sends come before Applies and Reads");
+                    assert!(
+                        !restoring && !applying && !reading,
+                        "Sends come before a Restore, Applies and Reads"
+                    );
                     assert!(node.peers().contains(to), "messages go to peers only");
                     assert_eq!(
                         msg.term(),
@@ -2766,6 +3163,15 @@ mod tests {
                         }
                         Message::Probe(_) => {
                             assert_eq!(node.role(), Role::Leader, "probe rounds only from a leader")
+                        }
+                        Message::InstallSnapshot(request) => {
+                            assert_eq!(node.role(), Role::Leader, "snapshots only from a leader");
+                            assert_eq!(
+                                Some(&request.snapshot),
+                                node.snapshot(),
+                                "P1: a leader sends its own snapshot"
+                            );
+                            snapshots_sent += 1;
                         }
                         Message::RequestVoteResponse(_)
                         | Message::AppendEntriesResponse(_)
@@ -2827,9 +3233,16 @@ mod tests {
         }
         assert_eq!(
             inputs_seen,
-            ["Tick", "Message", "ClientRequest", "Read", "Restart"]
-                .into_iter()
-                .collect::<BTreeSet<_>>()
+            [
+                "Tick",
+                "Message",
+                "ClientRequest",
+                "Read",
+                "Compact",
+                "Restart"
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
         );
         assert_eq!(
             messages_seen,
@@ -2839,7 +3252,8 @@ mod tests {
                 "AppendEntries",
                 "AppendEntriesResponse",
                 "Probe",
-                "ProbeResponse"
+                "ProbeResponse",
+                "InstallSnapshot"
             ]
             .into_iter()
             .collect::<BTreeSet<_>>()
@@ -2851,10 +3265,11 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             "every role must be reached"
         );
-        // Eşikler ölçülen değerlerin (402 liderlik, 887 oy, 2042 uygulama, 451 kesme, 7922
-        // NotLeader cevabı, 188 cevaplanan ve 4147 reddedilen okuma, başka bir term'in turuna
-        // verilen 664 cevap) çok altındadır: üretici bozulup bir tarafı seyrek görmeye başlarsa
-        // test bunu söyler.
+        // Eşikler ölçülen değerlerin (355 liderlik, 735 oy, 1114 uygulama, 263 kuyruk değiştirme
+        // (§5.3), 7501 NotLeader cevabı, 164 cevaplanan ve 4019 reddedilen okuma, başka bir term'in
+        // turuna verilen 617 cevap, 137 sıkıştırma, 458 snapshot kurulumu, liderin gönderdiği 81
+        // snapshot) çok altındadır: üretici bozulup bir tarafı seyrek görmeye başlarsa test bunu
+        // söyler.
         assert!(
             elections_won >= 100,
             "too few elections won ({elections_won}); the leader side is barely exercised"
@@ -2884,6 +3299,18 @@ mod tests {
             reads_rejected >= 1_000,
             "too few reads rejected ({reads_rejected}); the NotLeader side of reads is barely \
              exercised"
+        );
+        assert!(
+            compactions >= 20,
+            "too few compactions ({compactions}); P1's compaction side is barely exercised"
+        );
+        assert!(
+            restores >= 100,
+            "too few snapshots installed ({restores}); P1's follower side is barely exercised"
+        );
+        assert!(
+            snapshots_sent >= 10,
+            "too few snapshots sent ({snapshots_sent}); P1's leader side is barely exercised"
         );
         assert!(
             stale_probes_answered >= 100,

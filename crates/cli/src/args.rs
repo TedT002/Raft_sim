@@ -33,6 +33,8 @@ pub enum Profile {
     Figure8,
     /// The chaos mix where most reads skip the log (ReadIndex) and leaders crash often.
     Reads,
+    /// The chaos mix with log compaction: nodes snapshot their state every 16 entries.
+    Snapshots,
 }
 
 impl Profile {
@@ -43,6 +45,7 @@ impl Profile {
             Profile::Chaos => ScenarioConfig::chaos(),
             Profile::Figure8 => ScenarioConfig::figure8(),
             Profile::Reads => ScenarioConfig::reads(),
+            Profile::Snapshots => ScenarioConfig::snapshots(),
         }
     }
 
@@ -53,6 +56,7 @@ impl Profile {
             Profile::Chaos => "chaos",
             Profile::Figure8 => "figure8",
             Profile::Reads => "reads",
+            Profile::Snapshots => "snapshots",
         }
     }
 
@@ -63,6 +67,7 @@ impl Profile {
             Profile::Chaos => "",
             Profile::Figure8 => " --profile figure8",
             Profile::Reads => " --profile reads",
+            Profile::Snapshots => " --profile snapshots",
         }
     }
 }

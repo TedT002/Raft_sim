@@ -117,6 +117,11 @@ jobs:
         run: >-
           cargo run --release --locked -p cli --
           fuzz --seeds 0..1000 --threads 4 --profile reads
+      # Her düğüm 16 girdide bir snapshot alır ve log'unu sıkıştırır (§7).
+      - name: Fuzz 1000 seeds (snapshots profile)
+        run: >-
+          cargo run --release --locked -p cli --
+          fuzz --seeds 0..1000 --threads 4 --profile snapshots
 
   mutations:
     name: Mutations

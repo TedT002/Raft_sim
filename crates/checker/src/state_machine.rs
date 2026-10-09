@@ -65,9 +65,40 @@ impl StateMachineSafety {
     }
 
     /// `node` yeniden başladı: durum makinesi çökmeyle kayboldu ve girdiler 1'den yeniden
-    /// uygulanacak.
+    /// uygulanacak (diskte bir snapshot varsa ardından [`StateMachineSafety::observe_snapshot`]).
     pub fn observe_restart(&mut self, node: u64) {
         self.next_index.remove(&node);
+    }
+
+    /// `node`'un durum makinesi bir snapshot'la değiştirildi (§7): `1..=index` girdileri uygulanmış
+    /// sayılır ve sonraki uygulama `index + 1`'den beklenir. Snapshot'ın içeriği burada
+    /// denetlenemez (komutları görmez); sürücü onu durum makinesinin o index'teki hâliyle
+    /// karşılaştırır.
+    ///
+    /// # Errors
+    ///
+    /// Snapshot, düğümün zaten uyguladığı girdilerin gerisindeyse (durum makinesi geri sarılırdı)
+    /// [`StateMachineSafetyViolation::RolledBack`].
+    pub fn observe_snapshot(
+        &mut self,
+        node: u64,
+        index: u64,
+    ) -> Result<(), StateMachineSafetyViolation> {
+        let applied = self
+            .next_index
+            .get(&node)
+            .copied()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        if index < applied {
+            return Err(StateMachineSafetyViolation::RolledBack {
+                node,
+                applied,
+                snapshot: index,
+            });
+        }
+        self.next_index.insert(node, index.saturating_add(1));
+        Ok(())
     }
 }
 
@@ -96,6 +127,19 @@ pub enum StateMachineSafetyViolation {
         expected: u64,
         /// Uygulanan index.
         actual: u64,
+    },
+    /// Bir düğümün durum makinesi, uyguladığı girdilerin gerisindeki bir snapshot'la değiştirildi.
+    #[error(
+        "state machine safety violated: node {node} restored a snapshot through index {snapshot} \
+         after applying index {applied}"
+    )]
+    RolledBack {
+        /// Düğüm.
+        node: u64,
+        /// Düğümün o ana kadar uyguladığı son index.
+        applied: u64,
+        /// Snapshot'ın son index'i.
+        snapshot: u64,
     },
 }
 
@@ -145,5 +189,35 @@ mod tests {
                 actual: 1,
             })
         );
+    }
+
+    // Snapshot (§7): durum makinesi bir snapshot'la ileri atlayabilir ve sonraki uygulama
+    // snapshot'ın ardından beklenir. Uygulanmış girdilerin gerisindeki bir snapshot durumu geri
+    // sarar: ihlal. Aynı noktadaki bir snapshot geri sarma değildir.
+    #[test]
+    fn snapshots_move_the_applied_prefix_forward_only() {
+        let mut checker = StateMachineSafety::new();
+        for index in 1..=3_u8 {
+            assert_eq!(checker.observe_apply(1, u64::from(index), &[index]), Ok(()));
+        }
+        assert_eq!(checker.observe_snapshot(1, 5), Ok(()));
+        assert_eq!(
+            checker.observe_apply(1, 4, &[4]),
+            Err(StateMachineSafetyViolation::OutOfOrder {
+                node: 1,
+                expected: 6,
+                actual: 4,
+            })
+        );
+        assert_eq!(checker.observe_apply(1, 6, &[6]), Ok(()));
+        assert_eq!(
+            checker.observe_snapshot(1, 2),
+            Err(StateMachineSafetyViolation::RolledBack {
+                node: 1,
+                applied: 6,
+                snapshot: 2,
+            })
+        );
+        assert_eq!(checker.observe_snapshot(1, 6), Ok(()));
     }
 }

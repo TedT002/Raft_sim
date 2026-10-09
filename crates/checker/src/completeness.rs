@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use crate::view::{EntryView, entry_at, last_index};
+use crate::view::LogView;
 
 /// Leader Completeness denetçisi.
 ///
@@ -56,13 +56,14 @@ impl LeaderCompleteness {
     /// Commit edilmiş bir index'te farklı bir girdi, log'un ötesine taşan bir commitIndex ya da
     /// (yeniden başlatma olmadan) geri giden bir commitIndex gözlenirse
     /// [`LeaderCompletenessViolation`].
-    pub fn observe_commit(
+    pub fn observe_commit<'a>(
         &mut self,
         node: u64,
         term: u64,
         commit_index: u64,
-        log: &[EntryView<'_>],
+        log: impl Into<LogView<'a>>,
     ) -> Result<Vec<u64>, LeaderCompletenessViolation> {
+        let log = log.into();
         let seen = self.commit_seen.get(&node).copied().unwrap_or(0);
         if commit_index < seen {
             return Err(LeaderCompletenessViolation::CommitIndexDecreased {
@@ -71,17 +72,30 @@ impl LeaderCompleteness {
                 to: commit_index,
             });
         }
-        if commit_index > last_index(log) {
+        if commit_index > log.last_index() {
             return Err(LeaderCompletenessViolation::CommitBeyondLog {
                 node,
                 commit_index,
-                last_index: last_index(log),
+                last_index: log.last_index(),
             });
         }
         let mut newly_committed = Vec::new();
         for index in seen.saturating_add(1)..=commit_index {
-            let Some(entry) = entry_at(log, index) else {
-                break;
+            let Some(entry) = log.entry(index) else {
+                // Sıkıştırılmış önekteki bir index (§7): girdi görünmez. Snapshot yalnızca commit
+                // edilmiş girdileri kapsar; kaydı varsa önekin son index'inin term'i
+                // karşılaştırılır.
+                if index == log.compacted
+                    && let Some(committed) = self.committed.get(&index)
+                    && committed.term != log.compacted_term
+                {
+                    return Err(LeaderCompletenessViolation::CommittedEntryChanged {
+                        index,
+                        first: committed.node,
+                        second: node,
+                    });
+                }
+                continue;
             };
             match self.committed.entry(index) {
                 Entry::Vacant(slot) => {
@@ -122,11 +136,11 @@ impl LeaderCompleteness {
     ///
     /// Böyle bir girdi eksik ya da farklıysa
     /// [`LeaderCompletenessViolation::MissingCommittedEntry`].
-    pub fn check_leader(
+    pub fn check_leader<'a>(
         &self,
         node: u64,
         term: u64,
-        log: &[EntryView<'_>],
+        log: impl Into<LogView<'a>>,
     ) -> Result<(), LeaderCompletenessViolation> {
         self.check_entries(node, term, log, self.committed.keys().copied())
     }
@@ -137,13 +151,14 @@ impl LeaderCompleteness {
     /// # Errors
     ///
     /// Bkz. [`LeaderCompleteness::check_leader`].
-    pub fn check_entries(
+    pub fn check_entries<'a>(
         &self,
         node: u64,
         term: u64,
-        log: &[EntryView<'_>],
+        log: impl Into<LogView<'a>>,
         indices: impl IntoIterator<Item = u64>,
     ) -> Result<(), LeaderCompletenessViolation> {
+        let log = log.into();
         for index in indices {
             let Some(committed) = self.committed.get(&index) else {
                 continue;
@@ -151,9 +166,16 @@ impl LeaderCompleteness {
             if committed.commit_term >= term {
                 continue;
             }
-            let present = entry_at(log, index).is_some_and(|entry| {
-                entry.term == committed.term && entry.command == committed.command
-            });
+            // Sıkıştırılmış önekteki bir girdi snapshot'ta sayılır (snapshot commit edilmiş
+            // girdileri kapsar; doğruluğu sürücüde ayrıca denetlenir); önekin son girdisinin term'i
+            // bilinir ve karşılaştırılır.
+            let present = if index <= log.compacted {
+                index < log.compacted || log.compacted_term == committed.term
+            } else {
+                log.entry(index).is_some_and(|entry| {
+                    entry.term == committed.term && entry.command == committed.command
+                })
+            };
             if !present {
                 return Err(LeaderCompletenessViolation::MissingCommittedEntry {
                     leader: node,
@@ -223,7 +245,7 @@ pub enum LeaderCompletenessViolation {
 #[cfg(test)]
 mod tests {
     use super::{LeaderCompleteness, LeaderCompletenessViolation};
-    use crate::view::EntryView;
+    use crate::view::{EntryView, LogView};
 
     fn view(entries: &[(u64, Vec<u8>)]) -> Vec<EntryView<'_>> {
         entries
@@ -293,5 +315,46 @@ mod tests {
         );
         checker.observe_restart(1);
         assert_eq!(checker.observe_commit(1, 2, 1, &view(&log)), Ok(Vec::new()));
+    }
+
+    // Sıkıştırılmış log'lar (§7): snapshot'ın kapsadığı commit edilmiş girdiler snapshot'ta
+    // sayılır; sınırdaki (snapshot'ın son) girdinin term'i karşılaştırılır. Bilerek bozulmuş
+    // sınırlar: yanlış term'li bir liderin snapshot'ı commit edilmiş girdiyi taşımaz; yanlış
+    // term'li bir düğüm snapshot'ı, commit edilmiş girdinin değiştiği anlamına gelir.
+    #[test]
+    fn compacted_prefixes_hold_committed_entries_up_to_their_boundary() {
+        let log = vec![(1, vec![1]), (1, vec![2]), (2, vec![3])];
+        let mut checker = LeaderCompleteness::new();
+        assert_eq!(
+            checker.observe_commit(1, 2, 3, &view(&log)),
+            Ok(vec![1, 2, 3])
+        );
+        let rest = view(&log[2..]);
+        assert_eq!(
+            checker.check_leader(2, 3, LogView::compacted(2, 1, &rest)),
+            Ok(())
+        );
+        assert_eq!(
+            checker.check_leader(2, 3, LogView::compacted(2, 5, &rest)),
+            Err(LeaderCompletenessViolation::MissingCommittedEntry {
+                leader: 2,
+                term: 3,
+                index: 2,
+                commit_term: 2,
+            })
+        );
+        let nothing: Vec<EntryView<'_>> = Vec::new();
+        assert_eq!(
+            checker.observe_commit(3, 3, 3, LogView::compacted(3, 9, &nothing)),
+            Err(LeaderCompletenessViolation::CommittedEntryChanged {
+                index: 3,
+                first: 1,
+                second: 3,
+            })
+        );
+        assert_eq!(
+            checker.observe_commit(4, 3, 3, LogView::compacted(3, 2, &nothing)),
+            Ok(Vec::new())
+        );
     }
 }

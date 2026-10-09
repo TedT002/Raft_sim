@@ -17,7 +17,7 @@
 //! (bkz. [`RunError::Panic`]).
 
 use std::any::Any;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::panic::{self, AssertUnwindSafe};
 
 use checker::LinearizabilityError;
@@ -52,6 +52,8 @@ pub struct ScenarioConfig {
     pub horizon: u64,
     /// Sakinleşmede her bekleme için tanınan en uzun süre (tick).
     pub settle: u64,
+    /// Snapshot sıklığı (bkz. `ClusterConfig::snapshot_every`); `None`: log hiç sıkıştırılmaz.
+    pub snapshot_every: Option<NonZeroU64>,
 }
 
 impl ScenarioConfig {
@@ -101,6 +103,7 @@ impl ScenarioConfig {
             fault_mix: FaultMix::CHAOS,
             horizon: 1_200,
             settle: 800,
+            snapshot_every: None,
         }
     }
 
@@ -139,6 +142,20 @@ impl ScenarioConfig {
             fault_mix: FaultMix::FIGURE8,
             horizon: 1_200,
             settle: 1_200,
+            snapshot_every: None,
+        }
+    }
+
+    /// Snapshot'lara ve log sıkıştırmaya (§7) odaklanan ayarlar: kaos profili, ama her düğüm
+    /// durum makinesi 16 girdi ilerledikçe snapshot alır ve log'unu sıkıştırır. Çöken, bölünmede
+    /// geride kalan ya da yeniden başlayan bir düğümün ihtiyaç duyduğu girdiler çoğu zaman liderin
+    /// log'undan atılmıştır: düğüm liderden snapshot kurar (Figure 13) ya da kendi diskindeki
+    /// snapshot'tan açılır.
+    #[must_use]
+    pub fn snapshots() -> Self {
+        Self {
+            snapshot_every: NonZeroU64::new(16),
+            ..Self::chaos()
         }
     }
 
@@ -433,6 +450,10 @@ pub struct RunStats {
     pub kept_writes: u64,
     /// Bir lider seçilen term'ler.
     pub terms_with_a_leader: u64,
+    /// Durum makinesi snapshot'ları (log sıkıştırmaları, §7).
+    pub compactions: u64,
+    /// Liderden kurulan snapshot'lar (Figure 13).
+    pub installs: u64,
     /// Koşunun kimliği: trace özeti.
     pub trace_hash: u64,
 }
@@ -534,6 +555,7 @@ pub fn run(scenario: &Scenario) -> Run {
     let cluster_config = ClusterConfig {
         disk: config.disk,
         raft: config.raft,
+        snapshot_every: config.snapshot_every,
         ..ClusterConfig::new(config.nodes, config.network)
     };
     // Kurulum da korunur: düğümlerin kurucusundaki bir panik de seed'li bir başarısızlıktır.
@@ -651,6 +673,8 @@ fn drive(scenario: &Scenario, cluster: &mut RaftCluster) -> Result<RunStats, Run
             .count(),
     )
     .unwrap_or(u64::MAX);
+    stats.compactions = cluster.compactions();
+    stats.installs = cluster.installs();
     stats.trace_hash = cluster.sim().trace_hash();
     Ok(stats)
 }

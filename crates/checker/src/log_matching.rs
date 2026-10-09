@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use crate::view::EntryView;
+use crate::view::LogView;
 
 /// Log Matching denetçisi.
 ///
@@ -44,25 +44,29 @@ impl LogMatching {
     /// sürücü, log'un yalnızca `from`'dan itibaren değiştiğini bildiğinde (ör. diske yazılan
     /// farktan) maliyeti değişen kısımla sınırlar. `from = 1` (ya da 0) bütün log'u denetler.
     ///
+    /// Sıkıştırılmış bir önek (§7) denetlenmez: snapshot commit edilmiş girdileri kapsar. Önekten
+    /// sonraki ilk girdinin "önceki term"i, önekin son girdisinin bilinen term'idir.
+    ///
     /// # Errors
     ///
     /// Bir girdi, daha önce görülen aynı `(index, term)` girdisinden farklı bir komut ya da farklı
     /// bir önceki term taşıyorsa [`LogMatchingViolation`].
-    pub fn observe(
+    pub fn observe<'a>(
         &mut self,
         node: u64,
-        log: &[EntryView<'_>],
+        log: impl Into<LogView<'a>>,
         from: u64,
     ) -> Result<(), LogMatchingViolation> {
-        let skip = usize::try_from(from.saturating_sub(1)).unwrap_or(usize::MAX);
-        for (position, entry) in log.iter().enumerate().skip(skip) {
-            let index = u64::try_from(position)
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
+        let log = log.into();
+        for (position, entry) in log.entries.iter().enumerate() {
+            let index = log.index_of(position);
+            if index < from {
+                continue;
+            }
             let previous_term = position
                 .checked_sub(1)
-                .and_then(|before| log.get(before))
-                .map_or(0, |before| before.term);
+                .and_then(|before| log.entries.get(before))
+                .map_or(log.compacted_term, |before| before.term);
             match self.seen.entry((index, entry.term)) {
                 Entry::Vacant(slot) => {
                     slot.insert(Seen {
@@ -137,7 +141,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{LogMatching, LogMatchingViolation};
-    use crate::view::EntryView;
+    use crate::view::{EntryView, LogView};
     use proptest::prelude::*;
     use proptest::test_runner::{Config as ProptestConfig, RngSeed};
 
@@ -381,5 +385,30 @@ mod tests {
             let found = checker.observe(2, &view(&corrupted), 1).is_err();
             prop_assert!(found);
         }
+    }
+
+    // Sıkıştırılmış bir log (§7): önekten sonraki ilk girdinin "önceki term"i snapshot'ın son
+    // term'idir. Doğru sınır term'iyle tam log'la uyumludur; yanlış sınır term'i, o girdinin
+    // önündeki farklı bir önektir.
+    #[test]
+    fn a_compacted_log_is_checked_from_its_snapshot_boundary() {
+        let full = log(&[(1, 10), (1, 11), (2, 12)]);
+        let mut checker = LogMatching::new();
+        assert_eq!(checker.observe(1, &view(&full), 1), Ok(()));
+        let suffix = log(&[(2, 12)]);
+        let suffix = view(&suffix);
+        assert_eq!(
+            checker.observe(2, LogView::compacted(2, 1, &suffix), 1),
+            Ok(())
+        );
+        assert_eq!(
+            checker.observe(3, LogView::compacted(2, 2, &suffix), 1),
+            Err(LogMatchingViolation::DifferentPrefix {
+                index: 3,
+                term: 2,
+                first: 1,
+                second: 3,
+            })
+        );
     }
 }

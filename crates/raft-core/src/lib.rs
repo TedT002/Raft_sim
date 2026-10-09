@@ -31,7 +31,9 @@
 //! ve tekilleştirme) durum makinesinin işidir: komutlar çekirdek için opaktır (C1). Okumalar log'a
 //! yazılmadan da cevaplanabilir (**ReadIndex**, tezin §6.4'ü): lider liderliğini bir doğrulama
 //! turuyla ([`Message::Probe`]) çoğunluğa onaylatır ve okumayı commitIndex'ine kadar uygulanmış
-//! durumdan cevaplatır ([`Input::Read`], [`Output::Read`]).
+//! durumdan cevaplatır ([`Input::Read`], [`Output::Read`]). Log, durum makinesinin bir
+//! snapshot'ıyla sıkıştırılabilir ve geride kalmış bir takipçiye snapshot gönderilir (§7:
+//! [`Input::Compact`], [`Message::InstallSnapshot`], [`Output::Restore`]).
 //!
 //! Yorumlarda geçen etiketler bu crate'in sözleşme maddeleridir (değişmezler ve kenar durumlar):
 //!
@@ -52,8 +54,8 @@
 //! - **O2:** Bir adım kalıcı durumu (`currentTerm`, `votedFor` ya da log) değiştirdiyse İLK
 //!   çıktısı, değişikliği (farkı) taşıyan tek bir `Persist`'tir; değiştirmediyse hiç `Persist`
 //!   yoktur. Farkı diskteki duruma uygulamak (`PersistentState::apply`) tam olarak bellekteki
-//!   durumu verir. Ardından `Send`'ler, sonra `Apply`'lar, sonra okumaların sonuçları (`Read`),
-//!   en sonda (varsa) `ClientResponse` gelir.
+//!   durumu verir. Ardından `Send`'ler, sonra varsa `Restore`, sonra `Apply`'lar, sonra okumaların
+//!   sonuçları (`Read`), en sonda (varsa) `ClientResponse` gelir.
 //! - **R1:** `Input::Restart` yalnızca diskte kalıcı olan durumu taşır; kurtarma ondan başlar.
 //!   Düğüm Follower olarak açılır ve bu adım hiç çıktı üretmez.
 //! - **T1:** Term asla azalmaz. Daha yüksek term taşıyan herhangi bir mesaj görülünce düğüm o
@@ -71,7 +73,17 @@
 //!   sayarak commit eder; önceki term'lerin girdileri dolaylı olarak commit olur (§5.4.2, Figure
 //!   8).
 //! - **A1:** Commit edilen girdiler index sırasıyla, her biri bir kez `Apply` olarak verilir;
-//!   yeniden başlatmadan sonra (lastApplied geçici olduğu için) baştan yeniden verilir.
+//!   yeniden başlatmadan sonra (lastApplied geçici olduğu için) yeniden verilir: diskte bir
+//!   snapshot varsa onun ardından, yoksa 1'den. Bir snapshot'ın kapsadığı girdiler `Apply` edilmez;
+//!   durum makinesi `Restore` ile (ya da yeniden başlatmada sürücü tarafından diskteki
+//!   snapshot'tan) kurulur (P1).
+//! - **P1:** Snapshot (§7, Figure 13): `Input::Compact` yalnızca uygulanmış bir öneki sıkıştırır.
+//!   Lider, bir takipçiye göndermesi gereken girdilerin öncesini snapshot'a almışsa
+//!   `InstallSnapshot` gönderir. Takipçi, commit ettiği önekten daha yeni bir snapshot'ı kurar
+//!   (eşleşen bir girdi varsa sonrasını korur, yoksa log'u atar), snapshot'ı persist eder ve
+//!   `Output::Restore` ile durum makinesini değiştirtir; `commitIndex` ve `lastApplied` snapshot'ın
+//!   sonuna gelir. Daha eski bir snapshot kurulmaz. Snapshot'lı bir diskle yeniden başlayan düğüm
+//!   `lastApplied = commitIndex = snapshot.last_index` ile açılır.
 //! - **Q1:** Her `Input::Read`, düğüm arada çökmedikçe tam olarak bir `Output::Read` alır. Lider
 //!   olmayan düğüm aynı adımda `NotLeader` döner. Lider `Ready`'yi yalnızca şu üçü birlikte
 //!   sağlanınca üretir: okuma geldikten SONRA başlattığı bir doğrulama turunu çoğunluk onayladı,
@@ -117,6 +129,10 @@
 //!             // Durum makinesine (raft-core dışında yaşayan KV store gibi) uygulanır.
 //!             let _ = (index, command);
 //!         }
+//!         Output::Restore(snapshot) => {
+//!             // Durum makinesi snapshot'la değiştirilir (§7).
+//!             let _ = snapshot;
+//!         }
 //!         Output::Read { id, outcome } => {
 //!             // Okuma (Input::Read) sonuçlandı: `Ready` ise durum makinesinden cevaplanır.
 //!             let _ = (id, outcome);
@@ -145,7 +161,8 @@ const ENABLED_MUTATIONS: usize = cfg!(feature = "mutation-no-election-restrictio
     + cfg!(feature = "mutation-skip-prev-log-term") as usize
     + cfg!(feature = "mutation-apply-before-commit") as usize
     + cfg!(feature = "mutation-read-without-quorum") as usize
-    + cfg!(feature = "mutation-read-before-term-commit") as usize;
+    + cfg!(feature = "mutation-read-before-term-commit") as usize
+    + cfg!(feature = "mutation-install-stale-snapshot") as usize;
 // `<= 1` yerine `matches!`: varsayılan derlemede sabit 0'dır ve clippy, türün en küçük değeriyle
 // yapılan her zaman doğru bir karşılaştırmayı (`absurd_extreme_comparisons`) hata sayar.
 const _: () = assert!(
@@ -176,6 +193,8 @@ pub const ENABLED_MUTATION: Option<&str> = if cfg!(feature = "mutation-no-electi
     Some("mutation-read-without-quorum")
 } else if cfg!(feature = "mutation-read-before-term-commit") {
     Some("mutation-read-before-term-commit")
+} else if cfg!(feature = "mutation-install-stale-snapshot") {
+    Some("mutation-install-stale-snapshot")
 } else {
     None
 };
@@ -197,11 +216,11 @@ pub use config::{Config, ConfigError};
 pub use input::Input;
 pub use log::LogEntry;
 pub use message::{
-    AppendEntries, AppendEntriesResponse, Message, Probe, ProbeResponse, RequestVote,
-    RequestVoteResponse,
+    AppendEntries, AppendEntriesResponse, InstallSnapshot, Message, Probe, ProbeResponse,
+    RequestVote, RequestVoteResponse,
 };
 pub use node::RaftNode;
 pub use output::{ClientResponse, Output, ReadOutcome};
-pub use persist::{LogUpdate, PersistUpdate, PersistentState};
+pub use persist::{LogUpdate, PersistUpdate, PersistentState, Snapshot};
 pub use role::Role;
 pub use types::{Command, LogIndex, NodeId, ReadId, Term};

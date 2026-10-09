@@ -29,7 +29,9 @@ mutation-skip-prev-log-term = ["sim/mutation-skip-prev-log-term"]
 mutation-apply-before-commit = ["sim/mutation-apply-before-commit"]
 mutation-read-without-quorum = ["sim/mutation-read-without-quorum"]
 mutation-read-before-term-commit = ["sim/mutation-read-before-term-commit"]
+mutation-install-stale-snapshot = ["sim/mutation-install-stale-snapshot"]
 mutation-no-dedup = ["sim/mutation-no-dedup"]
+mutation-snapshot-without-sessions = ["sim/mutation-snapshot-without-sessions"]
 
 [lints]
 workspace = true

@@ -57,17 +57,20 @@
 //! yapılır ve Log Matching yalnızca değişen kısmı karşılaştırır. Denetçiye verilen görünümü kurmak
 //! ve liderin log'unu saklamak ise hâlâ log boyuyla orantılıdır.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 use checker::{
     ElectionSafety, ElectionSafetyViolation, EntryView, LeaderAppendOnly,
     LeaderAppendOnlyViolation, LeaderCompleteness, LeaderCompletenessViolation, LogMatching,
-    LogMatchingViolation, StateMachineSafety, StateMachineSafetyViolation,
+    LogMatchingViolation, LogView, StateMachineSafety, StateMachineSafetyViolation,
 };
 use raft_core::{
-    AppendEntries, AppendEntriesResponse, ClientResponse, Command, Config, Input, LogEntry,
-    LogIndex, LogUpdate, Message, NodeId, Output, PersistUpdate, PersistentState, Probe,
-    ProbeResponse, RaftNode, ReadId, ReadOutcome, RequestVote, RequestVoteResponse, Role, Term,
+    AppendEntries, AppendEntriesResponse, ClientResponse, Command, Config, Input, InstallSnapshot,
+    LogEntry, LogIndex, LogUpdate, Message, NodeId, Output, PersistUpdate, PersistentState, Probe,
+    ProbeResponse, RaftNode, ReadId, ReadOutcome, RequestVote, RequestVoteResponse, Role, Snapshot,
+    Term,
 };
 
 use crate::disk::{DiskConfig, SimDisk};
@@ -88,6 +91,19 @@ pub struct AppliedEntry {
     pub command: Command,
 }
 
+/// Bir Raft düğümünün durum makinesine sırayla bıraktığı yerel etki (`NodeOutput::Apply`):
+/// commit edilmiş bir girdinin uygulanması ya da liderden kurulan bir snapshot'ın durum
+/// makinesinin yerine geçmesi (§7). İkisi aynı sıralı yoldan geçer: bir snapshot'tan sonraki
+/// uygulamalar onun ardından gelir ve ikisi de kendilerinden önce verilmiş yazmalar kalıcı olana
+/// kadar tutulur (O1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftApplied {
+    /// Commit edilmiş bir girdi (`Output::Apply`).
+    Entry(AppliedEntry),
+    /// Durum makinesini değiştiren snapshot (`Output::Restore`).
+    Restore(Snapshot),
+}
+
 /// Raft düğümüne verilen bir istemci isteği (`NodeInput::Client`): log'a yazılacak bir komut ya da
 /// log'a yazılmadan cevaplanacak bir okuma (ReadIndex, tezin §6.4'ü).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +112,16 @@ pub enum RaftRequest {
     Command(Command),
     /// Log'a girmeyen bir okuma (`Input::Read`).
     Read(ReadId),
+    /// İstemci isteği değil, sürücünün kendi işi: durum makinesinin `index`'teki snapshot'ı
+    /// (`Input::Compact`, §7). Aynı kanaldan verilir, çünkü simülatör bir düğüme dışarıdan
+    /// yalnızca tick, mesaj, yeniden başlatma ve "istek" verebilir; bkz.
+    /// [`RaftCluster::new`] (`snapshot_every`).
+    Compact {
+        /// Snapshot'ın kapsadığı son index.
+        index: LogIndex,
+        /// Durum makinesinin o index'teki hâli.
+        data: Vec<u8>,
+    },
 }
 
 /// Raft düğümünün istemciye cevabı (`NodeOutput::Reply`).
@@ -131,7 +157,7 @@ impl SimNode for RaftNode {
     type Msg = Message;
     type Durable = PersistentState;
     type Request = RaftRequest;
-    type Applied = AppliedEntry;
+    type Applied = RaftApplied;
     type Response = RaftResponse;
 
     fn step(&mut self, input: InputOf<Self>) -> Vec<OutputOf<Self>> {
@@ -139,7 +165,7 @@ impl SimNode for RaftNode {
         // kimliğini zaten taşır.
         let request = match &input {
             NodeInput::Client(RaftRequest::Command(command)) => Some(command.clone()),
-            NodeInput::Client(RaftRequest::Read(_))
+            NodeInput::Client(RaftRequest::Read(_) | RaftRequest::Compact { .. })
             | NodeInput::Tick
             | NodeInput::Message { .. }
             | NodeInput::Restart(_) => None,
@@ -150,6 +176,9 @@ impl SimNode for RaftNode {
             NodeInput::Restart(state) => Input::Restart(state),
             NodeInput::Client(RaftRequest::Command(command)) => Input::ClientRequest(command),
             NodeInput::Client(RaftRequest::Read(id)) => Input::Read(id),
+            NodeInput::Client(RaftRequest::Compact { index, data }) => {
+                Input::Compact { index, data }
+            }
         };
         // `RaftNode::step` yazımı raft-core'un kendi `step`'ini çağırır (yerleşik metot, trait
         // metodundan önce gelir). Çıktılar sırası korunarak çevrilir (O1).
@@ -159,7 +188,13 @@ impl SimNode for RaftNode {
                 Output::Send { to, msg } => Some(NodeOutput::Send { to, msg }),
                 Output::Persist(update) => Some(NodeOutput::Persist(update)),
                 Output::Apply { index, command } => {
-                    Some(NodeOutput::Apply(AppliedEntry { index, command }))
+                    Some(NodeOutput::Apply(RaftApplied::Entry(AppliedEntry {
+                        index,
+                        command,
+                    })))
+                }
+                Output::Restore(snapshot) => {
+                    Some(NodeOutput::Apply(RaftApplied::Restore(snapshot)))
                 }
                 // Çekirdek cevabı yalnızca bir istemci isteği adımında üretir (S1); başka bir
                 // adımda üretseydi bağlanacak bir istek olmazdı ve cevap düşerdi. `_` kolu bilerek
@@ -278,30 +313,57 @@ impl TraceEncode for Message {
                 put_u64(out, term.0);
                 put_u64(out, *round);
             }
+            Message::InstallSnapshot(InstallSnapshot { term, snapshot }) => {
+                out.push(7);
+                put_u64(out, term.0);
+                put_snapshot(out, snapshot);
+            }
         }
     }
 }
 
+/// Bir snapshot: son index, son term ve uzunluk önekli veri.
+fn put_snapshot(out: &mut Vec<u8>, snapshot: &Snapshot) {
+    let Snapshot {
+        last_index,
+        last_term,
+        data,
+    } = snapshot;
+    put_u64(out, last_index.0);
+    put_u64(out, last_term.0);
+    put_bytes(out, data);
+}
+
 impl TraceEncode for PersistentState {
-    // Term, oy ve log. Desen yine `..` olmadan açılır.
+    // Term, oy, log ve varsa snapshot. Desen yine `..` olmadan açılır. Snapshot yalnızca varken
+    // kodlanır (sona, bir etiketle): snapshot'sız durumların kodlaması (ve onları kullanan
+    // koşuların trace özetleri) snapshot'lar eklenmeden önceki hâliyle aynıdır; snapshot'lı bir
+    // durumun kodlaması daha uzundur ve onlarla karışmaz.
     fn encode(&self, out: &mut Vec<u8>) {
         let PersistentState {
             current_term,
             voted_for,
+            snapshot,
             log,
         } = self;
         put_u64(out, current_term.0);
         put_vote(out, *voted_for);
         put_entries(out, log);
+        if let Some(snapshot) = snapshot {
+            out.push(1);
+            put_snapshot(out, snapshot);
+        }
     }
 }
 
 impl TraceEncode for PersistUpdate {
-    // Term, oy ve varsa log farkı (0 = yok, 1 + `from` + girdiler = var).
+    // Term, oy, varsa log farkı (0 = yok, 1 + `from` + girdiler = var) ve varsa snapshot (yalnızca
+    // varken, sona; bkz. `PersistentState`'in kodlaması).
     fn encode(&self, out: &mut Vec<u8>) {
         let PersistUpdate {
             current_term,
             voted_for,
+            snapshot,
             log,
         } = self;
         put_u64(out, current_term.0);
@@ -313,6 +375,10 @@ impl TraceEncode for PersistUpdate {
                 put_u64(out, from.0);
                 put_entries(out, entries);
             }
+        }
+        if let Some(snapshot) = snapshot {
+            out.push(1);
+            put_snapshot(out, snapshot);
         }
     }
 }
@@ -331,6 +397,20 @@ impl TraceEncode for AppliedEntry {
     }
 }
 
+impl TraceEncode for RaftApplied {
+    // Girdi, `AppliedEntry`'nin kodlamasıyla (snapshot'sız koşuların özetleri değişmez); snapshot,
+    // index yerinde kendi işaretiyle (`RESTORE_MARK`: o index'li bir girdi olamaz).
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            RaftApplied::Entry(entry) => entry.encode(out),
+            RaftApplied::Restore(snapshot) => {
+                put_u64(out, RESTORE_MARK);
+                put_snapshot(out, snapshot);
+            }
+        }
+    }
+}
+
 impl TraceEncode for NotLeaderReply {
     fn encode(&self, out: &mut Vec<u8>) {
         let NotLeaderReply { request, hint } = self;
@@ -339,19 +419,31 @@ impl TraceEncode for NotLeaderReply {
     }
 }
 
-/// Okumaların kodlamasının başındaki işaret: uzunluk öneki yerinde `u64::MAX`. Bir komutun
-/// kodlaması uzunluk önekiyle başlar ve 2^64 - 1 baytlık bir komut olamaz; işaret, okumaları
-/// komutlardan ayırır. Komutlar etiketsiz kalır, böylece okumasız koşuların trace özetleri
-/// okumalar eklenmeden önceki hâliyle birebir aynıdır.
+/// Kodlamaların başındaki işaretler: bir uzunluk öneki ya da bir index'in yerinde, onların asla
+/// alamayacağı değerler (2^64 - 1, - 2, - 3 baytlık bir komut ya da o index'li bir girdi olamaz).
+/// Komutlar ve girdiler etiketsiz kalır, böylece okumasız ve snapshot'sız koşuların trace
+/// özetleri bu türler eklenmeden önceki hâliyle birebir aynıdır. Her türün kendi işareti vardır:
+/// bir kodlama başka bir türün kodlamasının öneki olamaz.
 const READ_MARK: u64 = u64::MAX;
+/// Sıkıştırma isteğinin işareti (bkz. `READ_MARK`).
+const COMPACT_MARK: u64 = u64::MAX - 1;
+/// Kurulan snapshot'ın işareti (bkz. `READ_MARK`).
+const RESTORE_MARK: u64 = u64::MAX - 2;
 
 impl TraceEncode for RaftRequest {
+    // Komut: uzunluk önekli baytlar (önek hiçbir zaman bir işaret değildir). Okuma: kendi işareti
+    // ve kimlik. Sıkıştırma: kendi işareti, index ve uzunluk önekli veri.
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
             RaftRequest::Command(command) => command.encode(out),
             RaftRequest::Read(id) => {
                 put_u64(out, READ_MARK);
                 put_u64(out, id.0);
+            }
+            RaftRequest::Compact { index, data } => {
+                put_u64(out, COMPACT_MARK);
+                put_u64(out, index.0);
+                put_bytes(out, data);
             }
         }
     }
@@ -445,7 +537,19 @@ pub enum DurabilityMismatch {
         /// Yazdırılmış değer.
         disk: Option<NodeId>,
     },
-    /// Log uzunluğu farklı.
+    /// Snapshot farklı (§7): son index'leri ve term'leri (snapshot yoksa `None`). İkisi aynıysa
+    /// veriler farklıdır.
+    #[error(
+        "snapshot (index, term) {memory:?} in memory, {disk:?} written (equal pairs: the data \
+         differs)"
+    )]
+    Snapshot {
+        /// Bellekteki snapshot'ın son index'i ve term'i.
+        memory: Option<(LogIndex, Term)>,
+        /// Yazdırılmış snapshot'ın son index'i ve term'i.
+        disk: Option<(LogIndex, Term)>,
+    },
+    /// Log uzunluğu (snapshot'tan sonraki girdi sayısı) farklı.
     #[error("{memory} log entries in memory, {disk} written")]
     LogLength {
         /// Bellekteki uzunluk.
@@ -509,6 +613,32 @@ pub enum Violation {
         /// Düğümün yazmadan önce commit ettiği gözlenen son index.
         commit_index: LogIndex,
     },
+    /// Bir düğümün durum makinesi bir index'te, o index'i uygulamış başka bir kopyanınkinden
+    /// farklı (§7: bir snapshot, durum makinesinin o index'teki hâli olmalıdır; snapshot'tan
+    /// kurulan bir kopya, girdileri tek tek uygulamış olanlarla aynı duruma gelmelidir).
+    #[error(
+        "snapshot safety violated: node {node:?} has a different state machine at index {index:?} \
+         than node {first:?} had there"
+    )]
+    StateDiverged {
+        /// Düğüm.
+        node: NodeId,
+        /// Index.
+        index: LogIndex,
+        /// O index'teki durumu ilk kaydeden kopya.
+        first: NodeId,
+    },
+    /// Bir düğüme kurulan (ya da diskinden yüklenen) snapshot'ın verisi çözülemiyor.
+    #[error(
+        "snapshot safety violated: node {node:?} got a snapshot through {index:?} that cannot be \
+         decoded"
+    )]
+    UndecodableSnapshot {
+        /// Düğüm.
+        node: NodeId,
+        /// Snapshot'ın son index'i.
+        index: LogIndex,
+    },
 }
 
 impl Violation {
@@ -525,6 +655,9 @@ impl Violation {
             Violation::Durability { .. } => "durability",
             Violation::PersistAfterOutput { .. } => "output order",
             Violation::CommittedEntryRewritten { .. } => "committed entry rewritten",
+            Violation::StateDiverged { .. } | Violation::UndecodableSnapshot { .. } => {
+                "snapshot safety"
+            }
         }
     }
 }
@@ -562,10 +695,14 @@ pub struct ClusterConfig {
     pub raft: Config,
     /// Simüle disk.
     pub disk: DiskConfig,
+    /// Snapshot sıklığı (§7): bir düğümün durum makinesi son snapshot'ından bu yana bu kadar girdi
+    /// uyguladığında küme onu snapshot'a alır ve log'u sıkıştırır (`Input::Compact`). `None`:
+    /// hiç sıkıştırılmaz (log sınırsız büyür).
+    pub snapshot_every: Option<NonZeroU64>,
 }
 
 impl ClusterConfig {
-    /// `size` düğümlü, verilen ağla, varsayılan Raft ve disk ayarlarıyla bir küme.
+    /// `size` düğümlü, verilen ağla, varsayılan Raft ve disk ayarlarıyla, sıkıştırmasız bir küme.
     #[must_use]
     pub fn new(size: u64, network: NetworkConfig) -> Self {
         Self {
@@ -573,6 +710,7 @@ impl ClusterConfig {
             network,
             raft: Config::default(),
             disk: DiskConfig::default(),
+            snapshot_every: None,
         }
     }
 }
@@ -633,6 +771,20 @@ pub struct RaftCluster {
     reads: BTreeMap<(NodeId, ReadId), ClientRead>,
     // Bir sonraki okuma kimliği: her deneme yeni bir kimlik alır.
     next_read: u64,
+    // Snapshot sıklığı (bkz. `ClusterConfig::snapshot_every`).
+    snapshot_every: Option<NonZeroU64>,
+    // Her düğümün KV durum makinesinin uyguladığı son index (snapshot'tan kurulduysa snapshot'ın
+    // sonu). Sıkıştırma bu index'te yapılır: snapshot, durum makinesinin o anki hâlidir.
+    applied: BTreeMap<NodeId, LogIndex>,
+    // Snapshot güvenliği (§7): index → o index uygulandıktan sonraki durum makinesinin parmak izi
+    // (`KvStore::fingerprint`) ve onu ilk kaydeden kopya. Sonraki her kopya ve kurulan ya da
+    // diskten yüklenen her snapshot aynı izi vermelidir. Yalnızca sıkıştırma açıkken tutulur:
+    // snapshot'sız bir koşuda kopyaların durumlarının eşitliğini State Machine Safety (aynı
+    // komutlar, aynı sıra) zaten verir.
+    digests: BTreeMap<LogIndex, (u64, NodeId)>,
+    // Sayaçlar: sıkıştırmalar ve liderden kurulan snapshot'lar.
+    compactions: u64,
+    installs: u64,
 }
 
 /// Cevap bekleyen bir okuma: kimin, hangi anahtarı.
@@ -678,6 +830,11 @@ impl RaftCluster {
             driver_seq: 0,
             reads: BTreeMap::new(),
             next_read: 0,
+            snapshot_every: config.snapshot_every,
+            applied: BTreeMap::new(),
+            digests: BTreeMap::new(),
+            compactions: 0,
+            installs: 0,
         })
     }
 
@@ -710,8 +867,9 @@ impl RaftCluster {
         self.sim.is_up(id)
     }
 
-    /// Bir düğümün KV durum makinesi: o düğümün uyguladığı komutların sonucu. Çökmede sıfırlanır ve
-    /// yeniden başlatmadan sonra yeniden uygulanan girdilerle kurulur.
+    /// Bir düğümün KV durum makinesi: o düğümün uyguladığı komutların (ve kurduğu snapshot'ların)
+    /// sonucu. Çökmede sıfırlanır; yeniden başlatmadan sonra diskteki snapshot'tan (varsa) ve
+    /// yeniden uygulanan girdilerle kurulur.
     #[must_use]
     pub fn kv(&self, id: NodeId) -> Option<&KvStore> {
         self.stores.get(&id)
@@ -744,6 +902,7 @@ impl RaftCluster {
         let progressed = self.sim.step();
         if progressed {
             self.check()?;
+            self.compact_due()?;
         }
         Ok(progressed)
     }
@@ -757,17 +916,96 @@ impl RaftCluster {
     pub fn run_until(&mut self, time: u64) -> Result<(), ClusterError> {
         while self.sim.step_until(time) {
             self.check()?;
+            self.compact_due()?;
         }
         Ok(())
     }
 
+    /// Sıkıştırmalar: alınan durum makinesi snapshot'ları (bkz. `ClusterConfig::snapshot_every`).
+    #[must_use]
+    pub fn compactions(&self) -> u64 {
+        self.compactions
+    }
+
+    /// Liderden kurulan snapshot'lar (Figure 13).
+    #[must_use]
+    pub fn installs(&self) -> u64 {
+        self.installs
+    }
+
+    /// Durum makinesi son snapshot'ından bu yana `snapshot_every` girdi uygulamış ayaktaki her
+    /// düğümün durum makinesini snapshot'a alır (§7) ve invariant'ları denetler. Neden sürücüde:
+    /// çekirdek durum makinesini görmez; ne zaman sıkıştırılacağına sürücü karar verir (bkz.
+    /// `Input::Compact`). Snapshot, durum makinesinin uyguladığı son index'teki hâlidir; çekirdek
+    /// o index'e kadar uygulamıştır (uygulamalar ondan gelir).
+    ///
+    /// Sıra önemlidir: bu fonksiyon her olayın `check`'inden SONRA çağrılır. `check`, bir girdinin
+    /// uygulandığı olayda düğümün görünen commitIndex'ini Leader Completeness'a kaydeder;
+    /// sıkıştırma ondan önce yapılsaydı, kaydedilmemiş commit edilmiş girdiler log'dan atılmış olur
+    /// ve kâhin onları hiç göremezdi (sıkıştırılmış önek "snapshot kapsamında" sayılır).
+    fn compact_due(&mut self) -> Result<(), ClusterError> {
+        let Some(every) = self.snapshot_every.map(NonZeroU64::get) else {
+            return Ok(());
+        };
+        let due: Vec<(NodeId, LogIndex)> = self
+            .sim
+            .hosts()
+            .filter(|host| host.up)
+            .filter_map(|host| {
+                let applied = self.applied.get(&host.id).copied()?;
+                let base = host
+                    .node
+                    .snapshot()
+                    .map_or(0, |snapshot| snapshot.last_index.0);
+                (applied.0 >= base.saturating_add(every)).then_some((host.id, applied))
+            })
+            .collect();
+        for (id, index) in due {
+            let data = self
+                .stores
+                .get(&id)
+                .map(KvStore::snapshot)
+                .unwrap_or_default();
+            self.sim.submit(id, RaftRequest::Compact { index, data })?;
+            self.compactions += 1;
+            self.check()?;
+        }
+        Ok(())
+    }
+
+    /// Bir düğümün durum makinesini snapshot'la değiştirir (liderden kurulan ya da yeniden
+    /// başlatmada diskten yüklenen snapshot) ve snapshot'ı kopyaların o index'teki durumuyla
+    /// karşılaştırır (snapshot güvenliği). State Machine Safety'ye düğümün uygulanmış öneki
+    /// bildirilir: snapshot onu geri alamaz.
+    fn restore(&mut self, id: NodeId, snapshot: &Snapshot) -> Result<(), ClusterError> {
+        let time = self.sim.now();
+        let violation = |violation: Violation| ClusterError::Violation { time, violation };
+        let index = snapshot.last_index;
+        self.state_machine
+            .observe_snapshot(id.0, index.0)
+            .map_err(|v| violation(v.into()))?;
+        // Önce çözülür, sonra çözülen durum makinesinin parmak izi karşılaştırılır: kâhin
+        // snapshot'ın kodlamasına değil, onun kurduğu duruma bakar. Kodlayıcı durumun bir
+        // parçasını düşürseydi (ör. oturumları), kurulan durum o index'teki durumdan ayrışır.
+        let Ok(store) = KvStore::restore(&snapshot.data) else {
+            return Err(violation(Violation::UndecodableSnapshot {
+                node: id,
+                index,
+            }));
+        };
+        record_or_compare(&mut self.digests, index, store.fingerprint(), id).map_err(violation)?;
+        self.stores.insert(id, store);
+        self.applied.insert(id, index);
+        Ok(())
+    }
+
     /// Bir düğümü çökertir (bkz. [`Simulation::crash`]). Düğümün durum makinesi de çökmeyle
-    /// kaybolur: KV tablosu boşaltılır ve yeniden başlatmadan sonra girdiler 1'den yeniden
-    /// uygulanır. Kâhinler düğümün geçici durumunu (commitIndex, uygulama sırası) ve Leader
-    /// Append-Only'nin onun liderliklerinden sakladığı log görüntülerini unutur; Election
-    /// Safety'nin term başına lider kaydı ise korunur. Ardından invariant'lar HEMEN denetlenir:
-    /// hiçbir düğüm adımlanmaz, ama çökmede bekleyen yazmaların bir öneki diske ulaşmış sayılabilir
-    /// ve diskteki log değişir.
+    /// kaybolur: KV tablosu boşaltılır ve yeniden başlatmadan sonra diskteki snapshot'tan (varsa)
+    /// kurulur, girdiler onun ardından (snapshot yoksa 1'den) yeniden uygulanır. Kâhinler düğümün
+    /// geçici durumunu (commitIndex, uygulama sırası) ve Leader Append-Only'nin onun
+    /// liderliklerinden sakladığı log görüntülerini unutur; Election Safety'nin term başına lider
+    /// kaydı ise korunur. Ardından invariant'lar HEMEN denetlenir: hiçbir düğüm adımlanmaz, ama
+    /// çökmede bekleyen yazmaların bir öneki diske ulaşmış sayılabilir ve diskteki log değişir.
     ///
     /// # Errors
     ///
@@ -778,6 +1016,7 @@ impl RaftCluster {
         // İstemcilerin bu düğüme açık istekleri bağlantıyla birlikte kopar: cevapları hiç gelmez.
         self.pending.remove(&id);
         self.reads.retain(|&(node, _), _| node != id);
+        self.applied.remove(&id);
         self.stores.insert(id, KvStore::default());
         self.state_machine.observe_restart(id.0);
         self.completeness.observe_restart(id.0);
@@ -797,6 +1036,16 @@ impl RaftCluster {
     /// invariant çiğnenmişse [`ClusterError::Violation`].
     pub fn restart(&mut self, id: NodeId) -> Result<(), ClusterError> {
         self.sim.restart(id)?;
+        // Diskte bir snapshot varsa durum makinesi ondan kurulur: düğüm de `lastApplied` ile oradan
+        // açılır (bkz. `Input::Restart`) ve girdiler snapshot'ın ardından uygulanır.
+        let snapshot = self
+            .sim
+            .hosts()
+            .find(|host| host.id == id)
+            .and_then(|host| host.disk.snapshot.clone());
+        if let Some(snapshot) = snapshot {
+            self.restore(id, &snapshot)?;
+        }
         self.check()
     }
 
@@ -925,10 +1174,29 @@ impl RaftCluster {
         // değiştirmez (bkz. `KvStore::apply`); her düğüm onu aynı biçimde yok sayar. Uygulanan
         // istek bu düğümde bir istemci tarafından bekleniyorsa sonucu ona döner.
         for (id, applied) in self.sim.take_applied() {
+            let applied = match applied {
+                RaftApplied::Entry(entry) => entry,
+                // Liderden kurulan bir snapshot: durum makinesi onunla değiştirilir (§7).
+                RaftApplied::Restore(snapshot) => {
+                    self.installs += 1;
+                    self.restore(id, &snapshot)?;
+                    continue;
+                }
+            };
             self.state_machine
                 .observe_apply(id.0, applied.index.0, applied.command.as_bytes())
                 .map_err(|v| violation(v.into()))?;
-            let outcome = self.stores.entry(id).or_default().apply(&applied.command);
+            let store = self.stores.entry(id).or_default();
+            let outcome = store.apply(&applied.command);
+            self.applied.insert(id, applied.index);
+            // Snapshot güvenliği: aynı index'teki durum makineleri aynı olmalıdır. Komutlar aynıysa
+            // (State Machine Safety) aynıdırlar; farklılaşmanın tek yolu bir snapshot'tır (ör.
+            // oturumları taşımayan bir snapshot'tan kurulan kopya, yeniden denenen bir isteği
+            // ikinci kez uygular).
+            if self.snapshot_every.is_some() {
+                record_or_compare(&mut self.digests, applied.index, store.fingerprint(), id)
+                    .map_err(violation)?;
+            }
             let (client, seq, done) = match outcome {
                 KvApplied::Executed {
                     client,
@@ -1012,8 +1280,9 @@ impl RaftCluster {
             // Çökmüş bir düğümün diski de denetlenir: çökmede diske ulaşmış sayılan önek de
             // kalıcıdır ve düğüm onunla açılacaktır.
             if let Some(from) = disk_changed_from {
+                let views = entry_views(&host.disk.log);
                 self.log_matching
-                    .observe(id.0, &entry_views(&host.disk.log), from.0)
+                    .observe(id.0, log_view(host.disk.snapshot.as_ref(), &views), from.0)
                     .map_err(|v| violation(v.into()))?;
             }
             // Çökmüş bir düğümün bellek durumu yoktur (yeniden başlatmada diskten kurulur); eski
@@ -1052,8 +1321,9 @@ impl RaftCluster {
                     let new_leadership = observed.leader_term != Some(term);
                     // Bellekteki log, yazmanın verildiği adımda (bkz. modül belgesi).
                     if new_leadership || log_written_from.is_some() {
+                        let views = entry_views(node.log());
                         self.append_only
-                            .observe(term.0, id.0, &entry_views(node.log()))
+                            .observe(term.0, id.0, log_view(node.snapshot(), &views))
                             .map_err(|v| violation(v.into()))?;
                     }
                     if new_leadership {
@@ -1078,9 +1348,10 @@ impl RaftCluster {
             if visible != observed.commit_index {
                 // Görünen kısımda bellekteki ve diskteki log aynıdır. Kâhine bellekteki log
                 // verilir: log'un ötesine geçen bir commitIndex (bir hata) ona göre bildirilsin.
+                let views = entry_views(node.log());
                 let mut newly = self
                     .completeness
-                    .observe_commit(id.0, term.0, visible.0, &entry_views(node.log()))
+                    .observe_commit(id.0, term.0, visible.0, log_view(node.snapshot(), &views))
                     .map_err(|v| violation(v.into()))?;
                 newly_committed.append(&mut newly);
                 observed.commit_index = visible;
@@ -1098,13 +1369,14 @@ impl RaftCluster {
                 continue;
             }
             let views = entry_views(&host.disk.log);
+            let log = log_view(host.disk.snapshot.as_ref(), &views);
             let result = if new_leaders.contains(&host.id) {
-                self.completeness.check_leader(host.id.0, term.0, &views)
+                self.completeness.check_leader(host.id.0, term.0, log)
             } else {
                 self.completeness.check_entries(
                     host.id.0,
                     term.0,
-                    &views,
+                    log,
                     newly_committed.iter().copied(),
                 )
             };
@@ -1165,35 +1437,74 @@ fn log_changes(updates: Vec<(NodeId, PersistUpdate)>) -> BTreeMap<NodeId, Option
 /// başlatma dışında) ya da bellekteki log'un ötesine geçtiyse.
 fn visible_commit(node: &RaftNode, disk: &PersistentState, observed: LogIndex) -> LogIndex {
     let commit = node.commit_index();
-    let memory = node.log();
-    let beyond_log = u64::try_from(memory.len()).is_ok_and(|length| commit.0 > length);
-    if commit <= observed || beyond_log {
+    let memory_base = node.snapshot().map_or(0, |snapshot| snapshot.last_index.0);
+    let memory_last =
+        memory_base.saturating_add(u64::try_from(node.log().len()).unwrap_or(u64::MAX));
+    if commit <= observed || commit.0 > memory_last {
         return commit;
     }
-    let start = usize::try_from(observed.0).unwrap_or(usize::MAX);
-    let end = usize::try_from(commit.0).unwrap_or(usize::MAX);
-    let fresh = memory.get(start..end).unwrap_or_default();
-    let on_disk = disk.log.get(start..).unwrap_or_default();
-    let agreeing = fresh
-        .iter()
-        .zip(on_disk)
-        .take_while(|(in_memory, durable)| in_memory == durable)
-        .count();
-    LogIndex(
-        observed
-            .0
-            .saturating_add(u64::try_from(agreeing).unwrap_or(u64::MAX)),
+    // Index'ler mutlaktır: bellekteki ve diskteki log'lar farklı snapshot'lardan sonra başlayabilir
+    // (sıkıştırmanın yazması henüz kalıcı değilse). Diskteki snapshot'ın kapsadığı bir index
+    // kalıcıdır ve commit edilmiştir (snapshot yalnızca commit edilmiş girdiler içerir). Bellekte
+    // sıkıştırılmış ama diskte hâlâ log'da olan bir index karşılaştırılamaz: görünürlük, sıkıştırma
+    // kalıcı olana kadar orada durur.
+    let disk_base = disk.snapshot_index().0;
+    let mut visible = observed.0;
+    for index in observed.0.saturating_add(1)..=commit.0 {
+        if index > disk_base {
+            let in_memory = node.entry(LogIndex(index));
+            let durable = disk.entry(LogIndex(index));
+            if in_memory.is_none() || in_memory != durable {
+                break;
+            }
+        }
+        visible = index;
+    }
+    LogIndex(visible)
+}
+
+/// Bir index'teki durum makinesi parmak izini kaydeder ya da kayıtlı olanla karşılaştırır
+/// (snapshot güvenliği): ilk kopya kaydeder, sonrakiler aynı izi vermelidir.
+fn record_or_compare(
+    digests: &mut BTreeMap<LogIndex, (u64, NodeId)>,
+    index: LogIndex,
+    fingerprint: u64,
+    node: NodeId,
+) -> Result<(), Violation> {
+    match digests.entry(index) {
+        Entry::Occupied(recorded) if recorded.get().0 != fingerprint => {
+            Err(Violation::StateDiverged {
+                node,
+                index,
+                first: recorded.get().1,
+            })
+        }
+        Entry::Occupied(_) => Ok(()),
+        Entry::Vacant(slot) => {
+            slot.insert((fingerprint, node));
+            Ok(())
+        }
+    }
+}
+
+/// Bir log'un denetçiye görünen hâli: snapshot'tan sonraki girdiler ve snapshot'ın tabanı (§7).
+fn log_view<'a>(snapshot: Option<&Snapshot>, views: &'a [EntryView<'a>]) -> LogView<'a> {
+    snapshot.map_or_else(
+        || LogView::full(views),
+        |snapshot| LogView::compacted(snapshot.last_index.0, snapshot.last_term.0, views),
     )
 }
 
 /// Düğümün belleği ile diske yazdırdığı en son durum arasındaki ilk fark.
 ///
-/// Term, oy ve log uzunluğu her olayda karşılaştırılır. Log'un içeriği, düğüm bu olayda bir yazma
-/// verdiyse baştan sona; vermediyse yalnızca son girdisi karşılaştırılır. Neden: yazma vermeyen bir
-/// adım log'u değiştirmemelidir ve log'u değiştiren hatalar (ekleme, kesme, kuyruk değiştirme)
-/// uzunluğu ya da son girdiyi değiştirir; her olayda bütün log'u karşılaştırmak ise log boyu × olay
-/// sayısı kadar iş olurdu. Ortadaki bir girdiyi sessizce değiştiren bir hata, düğümün bir sonraki
-/// yazmasında tam karşılaştırmaya takılır.
+/// Term, oy, snapshot'ın son index'i ve term'i ve log uzunluğu her olayda karşılaştırılır. Log'un
+/// içeriği ve snapshot'ın verisi, düğüm bu olayda bir yazma verdiyse tamamen; vermediyse log'un
+/// yalnızca son girdisi karşılaştırılır. Neden: yazma vermeyen bir adım log'u ve snapshot'ı
+/// değiştirmemelidir ve log'u değiştiren hatalar (ekleme, kesme, kuyruk değiştirme) uzunluğu ya da
+/// son girdiyi, snapshot'ı değiştiren hatalar onun son index'ini ya da term'ini değiştirir; her
+/// olayda bütün log'u ve snapshot verisini karşılaştırmak ise log boyu × olay sayısı kadar iş
+/// olurdu. Ortadaki bir girdiyi ya da snapshot verisini sessizce değiştiren bir hata, düğümün bir
+/// sonraki yazmasında tam karşılaştırmaya takılır.
 fn durability_mismatch(
     node: &RaftNode,
     latest: &PersistentState,
@@ -1212,6 +1523,22 @@ fn durability_mismatch(
             disk: latest.voted_for,
         });
     }
+    // Snapshot (§7) da kalıcı durumun parçasıdır; ikisi aynıysa log'lar aynı tabandan başlar.
+    let point = |snapshot: Option<&Snapshot>| {
+        snapshot.map(|snapshot| (snapshot.last_index, snapshot.last_term))
+    };
+    let (in_memory, written) = (node.snapshot(), latest.snapshot.as_ref());
+    let differs = if wrote {
+        in_memory != written
+    } else {
+        point(in_memory) != point(written)
+    };
+    if differs {
+        return Some(DurabilityMismatch::Snapshot {
+            memory: point(in_memory),
+            disk: point(written),
+        });
+    }
     let memory = node.log();
     if memory.len() != latest.log.len() {
         return Some(DurabilityMismatch::LogLength {
@@ -1227,27 +1554,50 @@ fn durability_mismatch(
     } else {
         (memory.last() != latest.log.last()).then(|| memory.len().saturating_sub(1))
     };
+    let base = latest.snapshot_index().0;
     first_difference.map(|position| DurabilityMismatch::LogEntry {
-        index: LogIndex(length(&memory[..position]).saturating_add(1)),
+        index: LogIndex(
+            base.saturating_add(length(&memory[..position]))
+                .saturating_add(1),
+        ),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::num::NonZeroU64;
 
     use super::{
-        AppliedEntry, ClusterConfig, ClusterError, DurabilityMismatch, RaftCluster, Violation,
+        AppliedEntry, ClusterConfig, ClusterError, DurabilityMismatch, RaftApplied, RaftCluster,
+        RaftRequest, Violation,
     };
     use crate::disk::DiskConfig;
-    use crate::kv::KvCommand;
+    use crate::kv::{KvCommand, KvStore};
     use crate::network::NetworkConfig;
     use crate::trace::{TraceKind, digest};
-    use checker::EntryView;
+    use checker::{EntryView, StateMachineSafetyViolation};
     use raft_core::{
-        AppendEntries, AppendEntriesResponse, Command, LogEntry, LogIndex, LogUpdate, Message,
-        NodeId, PersistUpdate, PersistentState, RequestVote, RequestVoteResponse, Term,
+        AppendEntries, AppendEntriesResponse, Command, InstallSnapshot, LogEntry, LogIndex,
+        LogUpdate, Message, NodeId, PersistUpdate, PersistentState, ReadId, RequestVote,
+        RequestVoteResponse, Snapshot, Term,
     };
+
+    /// Tek baytlık verili bir snapshot.
+    fn snap(last_index: u64, last_term: u64, byte: u8) -> Snapshot {
+        Snapshot {
+            last_index: LogIndex(last_index),
+            last_term: Term(last_term),
+            data: vec![byte],
+        }
+    }
+
+    fn install(term: u64, snapshot: Snapshot) -> Message {
+        Message::InstallSnapshot(InstallSnapshot {
+            term: Term(term),
+            snapshot,
+        })
+    }
 
     fn entry(term: u64, byte: u8) -> LogEntry {
         LogEntry {
@@ -1285,6 +1635,17 @@ mod tests {
             max_fsync_delay: 3,
             partial_write_prob,
         }
+    }
+
+    /// Gecikmesiz diskli, güvenilir ağlı, her 4 girdide snapshot alan 3 düğümlü bir küme: durum
+    /// makinesi parmak izleri (snapshot güvenliği) kaydedilir.
+    fn compacting_cluster(seed: u64) -> RaftCluster {
+        let config = ClusterConfig {
+            disk: DiskConfig::instant(),
+            snapshot_every: NonZeroU64::new(4),
+            ..ClusterConfig::new(3, NetworkConfig::reliable(1))
+        };
+        RaftCluster::new(seed, config).expect("valid config")
     }
 
     /// Lider seçilene kadar koşturur ve lideri döndürür.
@@ -1359,13 +1720,23 @@ mod tests {
             reply(false, 0),
             reply(true, 0),
             reply(true, 1),
+            install(1, snap(1, 1, 1)),
+            install(2, snap(1, 1, 1)),
+            install(1, snap(2, 1, 1)),
+            install(1, snap(1, 2, 1)),
+            install(1, snap(1, 1, 2)),
         ];
         assert_distinct(messages.iter().map(digest).collect());
 
         let state = |term, vote: Option<u64>, log: Vec<LogEntry>| PersistentState {
             current_term: Term(term),
             voted_for: vote.map(NodeId),
+            snapshot: None,
             log,
+        };
+        let with_snapshot = |snapshot| PersistentState {
+            snapshot: Some(snapshot),
+            ..state(0, None, Vec::new())
         };
         let states = [
             state(0, None, Vec::new()),
@@ -1374,12 +1745,16 @@ mod tests {
             state(0, Some(1), Vec::new()),
             state(0, None, vec![entry(1, 1)]),
             state(0, None, vec![entry(1, 2)]),
+            with_snapshot(snap(1, 1, 1)),
+            with_snapshot(snap(2, 1, 1)),
+            with_snapshot(snap(1, 1, 2)),
         ];
         assert_distinct(states.iter().map(digest).collect());
 
         let update = |vote: Option<u64>, log: Option<(u64, Vec<LogEntry>)>| PersistUpdate {
             current_term: Term(1),
             voted_for: vote.map(NodeId),
+            snapshot: None,
             log: log.map(|(from, entries)| LogUpdate {
                 from: LogIndex(from),
                 entries,
@@ -1391,6 +1766,14 @@ mod tests {
             update(None, Some((1, Vec::new()))),
             update(None, Some((2, Vec::new()))),
             update(None, Some((1, vec![entry(1, 1)]))),
+            PersistUpdate {
+                snapshot: Some(snap(1, 1, 1)),
+                ..update(None, None)
+            },
+            PersistUpdate {
+                snapshot: Some(snap(1, 1, 2)),
+                ..update(None, None)
+            },
         ];
         assert_distinct(updates.iter().map(digest).collect());
 
@@ -1404,6 +1787,28 @@ mod tests {
             digest(&applied(1, 2)),
             digest(&Command::new(vec![1])),
             digest(&Command::new(vec![1, 1])),
+        ]);
+        // Uygulamalar ve istekler: snapshot'lar ve sıkıştırmalar girdilerden, komutlardan ve
+        // okumalardan ayrışır; bir girdinin kodlaması `AppliedEntry`'ninkiyle aynıdır (snapshot'sız
+        // koşuların özetleri değişmez).
+        assert_eq!(
+            digest(&RaftApplied::Entry(applied(1, 1))),
+            digest(&applied(1, 1))
+        );
+        assert_distinct(vec![
+            digest(&RaftApplied::Entry(applied(1, 1))),
+            digest(&RaftApplied::Restore(snap(1, 1, 1))),
+            digest(&RaftApplied::Restore(snap(1, 1, 2))),
+            digest(&RaftRequest::Command(Command::new(vec![1]))),
+            digest(&RaftRequest::Read(ReadId(1))),
+            digest(&RaftRequest::Compact {
+                index: LogIndex(1),
+                data: Vec::new(),
+            }),
+            digest(&RaftRequest::Compact {
+                index: LogIndex(1),
+                data: vec![1],
+            }),
         ]);
     }
 
@@ -1667,5 +2072,98 @@ mod tests {
         }
         assert!(kept_counts.contains(&Some(0)), "{kept_counts:?}");
         assert!(kept_counts.len() >= 2, "{kept_counts:?}");
+    }
+
+    /// Sıkıştıran bir kümede beş yazma uygulatır: liderin no-op'u ile 6 girdi, her düğümde.
+    /// Bir takipçiyi ve onun uyguladığı son index'i döndürür.
+    fn applied_follower(cluster: &mut RaftCluster) -> (NodeId, LogIndex) {
+        let (leader, _) = elect(cluster);
+        for key in [b"a", b"b", b"c", b"d", b"e"] {
+            cluster.submit(leader, put(key)).expect("the leader is up");
+        }
+        let target = cluster.now() + 100;
+        cluster.run_until(target).expect("no violation");
+        let follower = cluster
+            .node_ids()
+            .find(|&id| id != leader)
+            .expect("a follower");
+        let applied = cluster.applied[&follower];
+        assert_eq!(applied, LogIndex(6), "every write is applied");
+        (follower, applied)
+    }
+
+    // Snapshot güvenliği, kurulan snapshot'ın kurduğu duruma bakar: kopyaların o index'teki
+    // durumuyla aynı veriyi taşıyan bir snapshot kabul edilir; aynı index'te farklı bir durum
+    // (burada boş tablo) kuran snapshot, durumu ilk kaydeden kopyayla birlikte bildirilir.
+    #[test]
+    fn a_restored_snapshot_must_rebuild_the_recorded_state() {
+        let mut cluster = compacting_cluster(31);
+        let (follower, applied) = applied_follower(&mut cluster);
+        let snapshot = |data: Vec<u8>| Snapshot {
+            last_index: applied,
+            last_term: Term(1),
+            data,
+        };
+
+        let same = cluster.kv(follower).expect("a store").snapshot();
+        cluster
+            .restore(follower, &snapshot(same))
+            .expect("the same state at the same index");
+
+        let error = cluster
+            .restore(follower, &snapshot(KvStore::default().snapshot()))
+            .expect_err("an empty table is not the state at that index");
+        let first = cluster.digests[&applied].1;
+        assert_eq!(
+            violation_of(error),
+            Violation::StateDiverged {
+                node: follower,
+                index: applied,
+                first,
+            }
+        );
+    }
+
+    // Bir snapshot düğümün zaten uyguladığı girdileri geri alamaz (State Machine Safety): son
+    // uygulanan index'in gerisindeki bir snapshot, veri doğru olsa bile reddedilir.
+    #[test]
+    fn a_snapshot_cannot_roll_back_applied_entries() {
+        let mut cluster = compacting_cluster(32);
+        let (follower, applied) = applied_follower(&mut cluster);
+        let behind = Snapshot {
+            last_index: LogIndex(applied.0 - 1),
+            last_term: Term(1),
+            data: cluster.kv(follower).expect("a store").snapshot(),
+        };
+        let error = cluster
+            .restore(follower, &behind)
+            .expect_err("the snapshot is behind the applied entries");
+        assert!(matches!(
+            violation_of(error),
+            Violation::StateMachineSafety(StateMachineSafetyViolation::RolledBack { .. })
+        ));
+    }
+
+    // Çözülemeyen bir snapshot boş bir tabloya dönüştürülmez (bu, hatayı bir sonraki
+    // karşılaştırmaya erteler ve nedenini gizlerdi): kurulduğu anda bildirilir.
+    #[test]
+    fn an_undecodable_snapshot_is_reported_when_it_is_restored() {
+        let mut cluster = compacting_cluster(33);
+        let (follower, applied) = applied_follower(&mut cluster);
+        let garbage = Snapshot {
+            last_index: applied,
+            last_term: Term(1),
+            data: vec![0xff],
+        };
+        let error = cluster
+            .restore(follower, &garbage)
+            .expect_err("the data does not decode");
+        assert_eq!(
+            violation_of(error),
+            Violation::UndecodableSnapshot {
+                node: follower,
+                index: applied,
+            }
+        );
     }
 }

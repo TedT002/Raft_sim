@@ -1,14 +1,15 @@
 //! Düğümler arası protokol mesajları: Raft makalesinin Figure 2'sindeki RPC'ler.
 
 use crate::log::LogEntry;
+use crate::persist::Snapshot;
 use crate::types::{LogIndex, Term};
 
 /// İki düğüm arasında değiş tokuş edilen Raft RPC'si.
 ///
 /// Her varyant, Figure 2'deki argümanları taşıyan ayrı bir yapıyı sarar. Varyant isimleri Faz 0'da
 /// §5.2/§5.3'teki RPC sözlüğüyle sabitlendi; `sim` ve testlerdeki exhaustive (`_` kolu olmayan)
-/// `match` ifadeleri her şekil değişikliğini derleme zamanında yakalar. `InstallSnapshot` kasıtlı
-/// olarak burada YOK: o Faz 6'nın (snapshot/log compaction) kapsamı.
+/// `match` ifadeleri her şekil değişikliğini derleme zamanında yakalar. `InstallSnapshot` (§7,
+/// Figure 13) Faz 6'da (snapshot ve log sıkıştırma) eklendi.
 ///
 /// Figure 2'deki `candidateId` ve `leaderId` argümanları bilerek taşınmaz: göndereni taşıma katmanı
 /// zaten bildirir (`Input::Message { from, .. }`). Aynı bilginin iki kopyası birbirini tutmayabilir
@@ -38,6 +39,11 @@ pub enum Message {
     Probe(Probe),
     /// `Probe`'a verilen cevap: cevaplayanın term'i ve turun numarası.
     ProbeResponse(ProbeResponse),
+    /// §7, Figure 13: lider, takipçiye göndermesi gereken girdileri log'undan atmışsa (snapshot'a
+    /// almışsa) onların yerine snapshot'ı gönderir. Cevabı bir `AppendEntriesResponse`'tur:
+    /// başarılıysa `match_index` snapshot'ın son index'idir. Lider, takipçinin ilerlemesini aynı
+    /// kodla günceller; ayrı bir cevap tipi aynı bilgiyi ikinci kez taşırdı.
+    InstallSnapshot(InstallSnapshot),
 }
 
 impl Message {
@@ -54,6 +60,7 @@ impl Message {
             Message::AppendEntriesResponse(response) => response.term,
             Message::Probe(request) => request.term,
             Message::ProbeResponse(response) => response.term,
+            Message::InstallSnapshot(request) => request.term,
         }
     }
 }
@@ -135,4 +142,16 @@ pub struct ProbeResponse {
     /// "cevaplayan, bu term'in liderini o turdan sonra tanıdı" demektir: başka bir term'in turuna
     /// verilen cevap, aynı numaralı yeni bir turun onayı sanılamaz.
     pub round: u64,
+}
+
+/// `InstallSnapshot` argümanları (Figure 13). Snapshot tek mesajda gönderilir: makaledeki `offset`
+/// ve `done` alanları (parçalara bölme) taşınmaz, çünkü simüle ağın mesaj boyu sınırı yoktur.
+/// Figure 13'teki `leaderId` taşınmaz (bkz. `Message` belgesi: gönderen `from`'dur).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSnapshot {
+    /// Liderin term'i.
+    pub term: Term,
+    /// Snapshot: son girdinin index'i ve term'i (`lastIncludedIndex`, `lastIncludedTerm`) ve durum
+    /// makinesinin o index'teki hâli.
+    pub snapshot: Snapshot,
 }

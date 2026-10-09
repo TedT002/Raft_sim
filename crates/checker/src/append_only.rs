@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::view::EntryView;
+use crate::view::LogView;
 
 /// Leader Append-Only denetçisi: her term'in liderinin en son gözlenen log'unu saklar ve bir
 /// sonraki gözlemin onun devamı olduğunu doğrular.
@@ -17,10 +17,11 @@ pub struct LeaderAppendOnly {
     observed: BTreeMap<u64, LeaderSnapshot>,
 }
 
-/// Bir liderin en son gözlenen log'u: `(term, komut)` girdileri.
+/// Bir liderin en son gözlenen log'u: `first` index'inden başlayan `(term, komut)` girdileri.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeaderSnapshot {
     node: u64,
+    first: u64,
     log: Vec<(u64, Vec<u8>)>,
 }
 
@@ -37,36 +38,42 @@ impl LeaderAppendOnly {
     /// Aynı term'de farklı bir lider gözlenirse (Election Safety ihlali, ayrıca denetlenir) yeni
     /// lider için yeniden başlanır: burada iki ihlal birbirine karışmasın.
     ///
+    /// Liderin kendi log'unu sıkıştırması (§7) bir silme sayılmaz: sıkıştırılmış önekteki girdiler
+    /// karşılaştırılmaz, geri kalanlar aynen kalmalıdır.
+    ///
     /// # Errors
     ///
     /// Önceki gözlemdeki bir girdi silinmiş ya da değiştirilmişse [`LeaderAppendOnlyViolation`].
-    pub fn observe(
+    pub fn observe<'a>(
         &mut self,
         term: u64,
         node: u64,
-        log: &[EntryView<'_>],
+        log: impl Into<LogView<'a>>,
     ) -> Result<(), LeaderAppendOnlyViolation> {
+        let log = log.into();
         if let Some(previous) = self.observed.get(&term)
             && previous.node == node
         {
             for (position, (old_term, old_command)) in previous.log.iter().enumerate() {
+                let index = previous
+                    .first
+                    .saturating_add(u64::try_from(position).unwrap_or(u64::MAX));
+                if index <= log.compacted {
+                    continue;
+                }
                 let kept = log
-                    .get(position)
+                    .entry(index)
                     .is_some_and(|entry| entry.term == *old_term && entry.command == old_command);
                 if !kept {
-                    return Err(LeaderAppendOnlyViolation {
-                        term,
-                        node,
-                        index: u64::try_from(position)
-                            .unwrap_or(u64::MAX)
-                            .saturating_add(1),
-                    });
+                    return Err(LeaderAppendOnlyViolation { term, node, index });
                 }
             }
         }
         let snapshot = LeaderSnapshot {
             node,
+            first: log.compacted.saturating_add(1),
             log: log
+                .entries
                 .iter()
                 .map(|entry| (entry.term, entry.command.to_vec()))
                 .collect(),
@@ -107,7 +114,7 @@ pub struct LeaderAppendOnlyViolation {
 #[cfg(test)]
 mod tests {
     use super::{LeaderAppendOnly, LeaderAppendOnlyViolation};
-    use crate::view::EntryView;
+    use crate::view::{EntryView, LogView};
 
     fn view(entries: &[(u64, Vec<u8>)]) -> Vec<EntryView<'_>> {
         entries
@@ -175,6 +182,30 @@ mod tests {
                 term: 2,
                 node: 2,
                 index: 2,
+            })
+        );
+    }
+
+    // Liderin kendi log'unu sıkıştırması (§7) silme sayılmaz: sıkıştırılmış önek karşılaştırılmaz,
+    // index'ler mutlaktır. Ama sonekteki bir girdinin değişmesi, sıkıştırmadan sonra da bir
+    // ihlaldir.
+    #[test]
+    fn compaction_is_not_a_removal_but_a_changed_suffix_is() {
+        let mut checker = LeaderAppendOnly::new();
+        let log = vec![(1, vec![1]), (1, vec![2]), (2, vec![3])];
+        assert_eq!(checker.observe(2, 1, &view(&log)), Ok(()));
+        let rest = vec![(2, vec![3]), (2, vec![4])];
+        assert_eq!(
+            checker.observe(2, 1, LogView::compacted(2, 1, &view(&rest))),
+            Ok(())
+        );
+        let changed = vec![(2, vec![9]), (2, vec![4])];
+        assert_eq!(
+            checker.observe(2, 1, LogView::compacted(2, 1, &view(&changed))),
+            Err(LeaderAppendOnlyViolation {
+                term: 2,
+                node: 1,
+                index: 3,
             })
         );
     }

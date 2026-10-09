@@ -15,8 +15,9 @@
 //!   senaryoyu yeniden üretir.
 //!
 //! `--profile` senaryo ayarlarını seçer: `chaos` (varsayılan; kayıplı ağ, çökmeler, bölünmeler),
-//! `figure8` (mesaj başına tek girdi ve sık lider değişimi, §5.4.2'nin tuzağı için) ya da `reads`
-//! (okumaların çoğu log'a yazılmadan ReadIndex'le cevaplanır, tezin §6.4'ü).
+//! `figure8` (mesaj başına tek girdi ve sık lider değişimi, §5.4.2'nin tuzağı için), `reads`
+//! (okumaların çoğu log'a yazılmadan ReadIndex'le cevaplanır, tezin §6.4'ü) ya da `snapshots`
+//! (chaos ve her 16 girdide bir snapshot ile log sıkıştırma, §7).
 //!
 //! Paket adı `cli`, ikili adı `raftsim` olduğundan yeniden üretme komutu
 //! `cargo run -p cli -- replay --seed <N>` olur. Çıkış kodları: 0 başarı, 1 başarısız bir koşu, 2

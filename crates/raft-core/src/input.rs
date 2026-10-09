@@ -2,7 +2,7 @@
 
 use crate::message::Message;
 use crate::persist::PersistentState;
-use crate::types::{Command, NodeId, ReadId};
+use crate::types::{Command, LogIndex, NodeId, ReadId};
 
 /// Sans-IO çekirdeğe dışarıdan gelebilecek tüm olaylar.
 ///
@@ -37,12 +37,28 @@ pub enum Input {
     /// adımda `NotLeader { hint }` döner. Her okuma, düğüm çökmedikçe tam olarak bir `Output::Read`
     /// alır.
     Read(ReadId),
+    /// Sürücü, durum makinesini `index`'te (dahil) snapshot'a aldı (§7): `data` o anki hâlidir.
+    /// Çekirdek `1..=index` girdilerini log'dan atar ve snapshot'ı persist eder; lider, artık
+    /// log'unda olmayan girdilere ihtiyacı olan bir takipçiye bu snapshot'ı gönderir
+    /// (`Message::InstallSnapshot`). Snapshot'ın NE ZAMAN alınacağına sürücü karar verir (ör. log
+    /// belli bir boyu aşınca): çekirdek durum makinesini görmez. `index` uygulanmış bir girdi
+    /// olmalıdır (en fazla `lastApplied`) ve mevcut snapshot'ın ilerisinde olmalıdır; değilse
+    /// girdi etkisizdir.
+    Compact {
+        /// Snapshot'ın kapsadığı son index.
+        index: LogIndex,
+        /// Durum makinesinin o index'teki hâli (çekirdek için opak, C1).
+        data: Vec<u8>,
+    },
     /// Düğüm çöktü ve yeniden başlatıldı; sürücü, simüle diskte `fsync` olmuş (dolayısıyla çökmeden
     /// sağ çıkan) kalıcı durumu geri veriyor. Çekirdek diski kendisi okuyamadığı için (sans-IO)
     /// kurtarma yalnızca bu değere dayanır; bellekte kalmış ama henüz persist edilmemiş
     /// `currentTerm`/`votedFor` burada YOKTUR — aksi hâlde "votedFor diske yazılmadan cevap
     /// verildi" gibi hatalar simülasyonda asla yakalanamazdı. R1: `Restart` bütün geçici durumu
     /// siler, kalıcı durumu bu değerden yükler ve düğümü Follower olarak başlatır (Figure 2: geçici
-    /// durum çökmede kaybolur). Hiç çıktı üretmez: yüklenen durum zaten diskteki durumdur.
+    /// durum çökmede kaybolur). Hiç çıktı üretmez: yüklenen durum zaten diskteki durumdur. Diskte
+    /// bir snapshot varsa düğüm `lastApplied = commitIndex = snapshot.last_index` ile açılır;
+    /// sürücü de durum makinesini o snapshot'tan kendisi kurar (snapshot'ın verisi diskteki
+    /// durumdadır).
     Restart(PersistentState),
 }

@@ -30,6 +30,7 @@ mutation-skip-prev-log-term = []
 mutation-apply-before-commit = []
 mutation-read-without-quorum = []
 mutation-read-before-term-commit = []
+mutation-install-stale-snapshot = []
 
 [lints]
 workspace = true

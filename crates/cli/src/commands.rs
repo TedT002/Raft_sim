@@ -395,7 +395,7 @@ fn write_state(cluster: &RaftCluster, out: &mut impl Write) -> io::Result<()> {
             node.role(),
             node.current_term().0,
             node.commit_index().0,
-            log_terms(node.log().iter().map(|entry| entry.term.0)),
+            log_summary(node),
         )?;
     }
     let leaders: Vec<String> = cluster
@@ -410,12 +410,31 @@ fn write_state(cluster: &RaftCluster, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  leaders (term:node): {}", leaders.join(" "))
 }
 
+/// Bir düğümün log'unun özeti: varsa snapshot (`snapshot≤12:t3`, §7) ve ardından gelen girdilerin
+/// term aralıkları.
+fn log_summary(node: &sim::RaftNode) -> String {
+    let terms = node.log().iter().map(|entry| entry.term.0);
+    match node.snapshot() {
+        None => log_terms(1, terms),
+        Some(snapshot) => {
+            let base = snapshot.last_index.0;
+            let rest = log_terms(base + 1, terms);
+            let rest = if rest == "empty" {
+                String::new()
+            } else {
+                format!(" {rest}")
+            };
+            format!("snapshot≤{base}:t{}{rest}", snapshot.last_term.0)
+        }
+    }
+}
+
 /// Log'un term'leri; aynı term'li ardışık girdiler tek aralıkta toplanır: `1-2:t1 3:t2`. Boş log
-/// `empty` yazılır. Index'ler 1'den başlar (§5.3).
-fn log_terms(terms: impl Iterator<Item = u64>) -> String {
+/// `empty` yazılır. İlk girdinin index'i `first`'tür (snapshot yoksa 1, §5.3).
+fn log_terms(first: u64, terms: impl Iterator<Item = u64>) -> String {
     // (ilk index, son index, term)
     let mut runs: Vec<(u64, u64, u64)> = Vec::new();
-    for (index, term) in (1_u64..).zip(terms) {
+    for (index, term) in (first..).zip(terms) {
         match runs.last_mut() {
             Some((_, last, run_term)) if *run_term == term => *last = index,
             _ => runs.push((index, index, term)),
@@ -487,11 +506,12 @@ mod tests {
     #[test]
     fn logs_are_summarized_by_term_runs() {
         assert_eq!(
-            log_terms([1, 1, 3, 3, 3, 5].into_iter()),
+            log_terms(1, [1, 1, 3, 3, 3, 5].into_iter()),
             "1-2:t1 3-5:t3 6:t5"
         );
-        assert_eq!(log_terms([2].into_iter()), "1:t2");
-        assert_eq!(log_terms(std::iter::empty()), "empty");
+        assert_eq!(log_terms(1, [2].into_iter()), "1:t2");
+        assert_eq!(log_terms(1, std::iter::empty()), "empty");
+        assert_eq!(log_terms(13, [4, 4].into_iter()), "13-14:t4");
     }
 
     /// Basılan bir `cargo run -p cli ... -- replay ...` komutunun `--` sonrasını `raftsim`

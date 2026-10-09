@@ -13,12 +13,14 @@ commands with consistency-checked `AppendEntries`, starts every term with a no-o
 only entries of its own term by counting replicas (§5.4.2, the Figure 8 trap); followers answer
 clients with `NotLeader` and a hint, and client sessions make retried requests take effect at most
 once (§8). Reads can skip the log: a leader answers them after confirming its leadership with a
-majority (ReadIndex, §6.4 of the Raft thesis). `raftsim fuzz` runs seeded chaos scenarios (crashes,
+majority (ReadIndex, §6.4 of the Raft thesis). Logs can be compacted into state machine snapshots,
+and a leader sends its snapshot to a follower that needs entries it no longer has (§7, Figure 13).
+`raftsim fuzz` runs seeded chaos scenarios (crashes,
 restarts, partitions, message loss, duplication and reordering, a disk that loses unsynced writes,
 clients that retry and lose replies). It checks all five safety properties of Figure 3 after every
 simulated event and the linearizability of the client history at the end of every run, and it
 shrinks a failing scenario to a small one that `raftsim replay` reproduces exactly. Every push
-fuzzes 3000 seeds and proves that nine deliberately planted bugs are still caught.
+fuzzes 4000 seeds and proves that eleven deliberately planted bugs are still caught.
 
 ## Quick start
 
@@ -32,6 +34,9 @@ cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 8 --profile figure8
 # most reads skip the log (ReadIndex) while leaders crash or get isolated and 1% of the messages
 # take a long-tail delay of up to 120 ticks, mostly beyond the election timeouts
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 8 --profile reads
+
+# every node snapshots its state machine and compacts its log every 16 entries
+cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 8 --profile snapshots
 
 # replay one seed exactly: the fault schedule, every event and the final state of every node
 cargo run --release -p cli -- replay --seed 42 --trace | less
@@ -145,6 +150,19 @@ a round of an earlier term, cannot confirm a newer read. A leader that steps dow
 pending reads with `NotLeader`. Probes are separate messages rather than a field of `AppendEntries`,
 so runs without such reads are unchanged, byte for byte, down to their trace hashes.
 
+Log compaction follows §7 and Figure 13 of the paper. The host decides when to take a snapshot (the
+core never sees the state machine) and hands the core its state machine's encoding at the index it
+has applied; the core drops that prefix of its log and persists the snapshot. A leader that no
+longer has the entries a follower needs sends `InstallSnapshot` instead of `AppendEntries`; the
+follower keeps the part of its log that matches the snapshot's last entry, discards the rest,
+persists the snapshot and replaces its state machine, and a node that restarts boots from the
+snapshot on its disk. The state machine's snapshot includes the client sessions, or a replica built
+from it would apply a retried request twice. The oracles treat a compacted prefix as covered by its
+snapshot, and the simulator checks the snapshots themselves when they are used: with compaction
+on, every replica's state machine after applying an index, and the state machine rebuilt from every
+snapshot that a node installs from its leader or loads from its disk at that index, must equal the
+state the first replica had there. Snapshot-free runs are unchanged byte for byte.
+
 A chaos scenario is generated before it is executed: the seed's scenario stream yields an explicit,
 timed list of fault intents (crash an up node, crash the leader, restart a down node, partition,
 isolate the leader, heal, change the loss rate), and each intent picks its target from the cluster's
@@ -163,8 +181,8 @@ Crates and their dependency direction (`raft-core` depends on no workspace crate
 
 | Crate | Responsibility |
 |---|---|
-| `raft-core` | Pure, sans-IO Raft state machine (Figure 2): leader election, log replication, `NotLeader` replies, the leader's no-op entry (§8) and reads that skip the log (ReadIndex, thesis §6.4) |
-| `sim` | Deterministic simulator: virtual clock, event queue, seeded network and disk, crash/restart, trace hash; Raft adapter with a session-aware key-value state machine, checking invariants after every event; simulated clients that record their history; chaos scenarios and shrinking |
+| `raft-core` | Pure, sans-IO Raft state machine (Figure 2): leader election, log replication, `NotLeader` replies, the leader's no-op entry (§8), reads that skip the log (ReadIndex, thesis §6.4), snapshots and log compaction (§7) |
+| `sim` | Deterministic simulator: virtual clock, event queue, seeded network and disk, crash/restart, trace hash; Raft adapter with a session-aware key-value state machine, checking invariants after every event; simulated clients that record their history; log compaction with snapshot safety checks; chaos scenarios and shrinking |
 | `checker` | The five Raft safety properties of Figure 3 and a linearizability checker for key-value histories, independent of `raft-core`'s types |
 | `cli` | `raftsim` binary: `fuzz --seeds A..B [--threads N] [--profile P] [--shrink]` and `replay --seed N [--profile P] [--trace] [--faults i,j,...\|none] [--horizon H]` |
 
@@ -221,25 +239,29 @@ the mutation, the same seed with the same 23 faults passes.
 
 ## Mutation testing
 
-Nine bugs are planted behind Cargo features (`mutation-<name>`, never part of a default build), and
-the fuzzer must catch each of them. The columns count the failing seeds among the first 1000 of each
-profile:
+Eleven bugs are planted behind Cargo features (`mutation-<name>`, never part of a default build),
+and the fuzzer must catch each of them. The columns count the failing seeds among the first 1000 of
+each profile:
 
-| Feature `mutation-…` | Planted bug | Caught by | chaos | figure8 | reads |
-|---|---|---|---|---|---|
-| `no-election-restriction` | a node votes for a candidate with a stale log (§5.4.1) | leader completeness | 797 | 997 | 669 |
-| `commit-old-terms` | a leader commits earlier-term entries by counting replicas (§5.4.2) | leader completeness | 0 | 16 | 0 |
-| `forget-vote` | `votedFor` is not persisted (Figure 2) | durability | 1000 | 1000 | 1000 |
-| `truncate-on-append` | every `AppendEntries` truncates the log after `prevLogIndex` (§5.3) | committed entry rewritten | 1000 | 1000 | 1000 |
-| `skip-prev-log-term` | a follower accepts `AppendEntries` whose `prevLogTerm` differs from its entry at `prevLogIndex` (§5.3) | log matching | 297 | 926 | 589 |
-| `apply-before-commit` | entries are applied before they are committed (Figure 2) | state machine safety | 605 | 1000 | 767 |
-| `no-dedup` | the state machine applies a retried request again (§8) | linearizability | 562 | 149 | 353 |
-| `read-without-quorum` | a leader serves a read without confirming its leadership (thesis §6.4) | linearizability | 0 | 0 | 37 |
-| `read-before-term-commit` | a new leader serves reads before committing an entry of its term (§6.4) | linearizability | 0 | 0 | 122 |
+| Feature `mutation-…` | Planted bug | Caught by | chaos | figure8 | reads | snapshots |
+|---|---|---|---|---|---|---|
+| `no-election-restriction` | a node votes for a candidate with a stale log (§5.4.1) | leader completeness | 797 | 997 | 669 | 788 |
+| `commit-old-terms` | a leader commits earlier-term entries by counting replicas (§5.4.2) | leader completeness | 0 | 16 | 0 | 0 |
+| `forget-vote` | `votedFor` is not persisted (Figure 2) | durability | 1000 | 1000 | 1000 | 1000 |
+| `truncate-on-append` | every `AppendEntries` truncates the log after `prevLogIndex` (§5.3) | committed entry rewritten | 1000 | 1000 | 1000 | 1000 |
+| `skip-prev-log-term` | a follower accepts `AppendEntries` whose `prevLogTerm` differs from its entry at `prevLogIndex` (§5.3) | log matching | 297 | 926 | 589 | 226 |
+| `apply-before-commit` | entries are applied before they are committed (Figure 2) | state machine safety | 605 | 1000 | 767 | 958 |
+| `no-dedup` | the state machine applies a retried request again (§8) | linearizability | 562 | 149 | 353 | 538 |
+| `read-without-quorum` | a leader serves a read without confirming its leadership (thesis §6.4) | linearizability | 0 | 0 | 37 | 0 |
+| `read-before-term-commit` | a new leader serves reads before committing an entry of its term (§6.4) | linearizability | 0 | 0 | 122 | 0 |
+| `install-stale-snapshot` | a follower installs a snapshot older than its commit index (§7) | state machine safety | 0 | 0 | 0 | 782 |
+| `snapshot-without-sessions` | the state machine's snapshot leaves out the client sessions (§7) | snapshot safety | 0 | 0 | 0 | 972 |
 
 `durability` and `committed entry rewritten` are the simulator's write-time checks (a node's memory
 must match what it wrote; no node rewrites its log at or below its commit index): they catch those
-bugs at the first faulty step, before the damage surfaces as a violation of Figure 3.
+bugs at the first faulty step, before the damage surfaces as a violation of Figure 3. `snapshot
+safety` compares the replicas' state machines index by index while logs are compacted, including
+the ones rebuilt from installed or reloaded snapshots.
 [`docs/mutation-table.md`](docs/mutation-table.md) lists, for every row, the seed that
 `scripts/check_mutations.sh` replays on every push, with the feature (the run must fail with the
 listed check) and without it (the run must pass), so the seeds and checks cannot go stale; the
@@ -267,7 +289,7 @@ deterministic tests instead of a row in the table.
       testing, fuzzed seeds on every push
 - [ ] Phase 6 (optional) — Deepening:
   - [x] Linearizable reads that skip the log (ReadIndex, thesis §6.4)
-  - [ ] Snapshots and log compaction (§7)
+  - [x] Snapshots and log compaction (§7)
   - [ ] A run visualizer
   - [ ] Leader leases, cluster membership changes (§6), a real network runner
 
@@ -298,6 +320,7 @@ CI also fuzzes 1000 seeds of each profile and checks the mutation table:
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile figure8
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile reads
+cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile snapshots
 ./scripts/check_mutations.sh
 ```
 

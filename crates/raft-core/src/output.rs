@@ -1,7 +1,7 @@
 //! `RaftNode::step`'in ürettiği, sürücünün sırayla yürütmesi gereken tek çıktı tipi.
 
 use crate::message::Message;
-use crate::persist::PersistUpdate;
+use crate::persist::{PersistUpdate, Snapshot};
 use crate::types::{Command, LogIndex, NodeId, ReadId};
 
 /// Bir `step` çağrısının sonucunda yapılması istenen eylemlerden biri.
@@ -27,9 +27,10 @@ pub enum Output {
     /// diskteki duruma `PersistentState::apply` ile uygulanır.
     Persist(PersistUpdate),
     /// Verilen komutun durum makinesine uygulanması istenir: yalnızca commit edilmiş girdiler için,
-    /// index sırasıyla ve her index bir kez (`commitIndex`/`lastApplied`, Figure 2). Yeniden
-    /// başlatmadan sonra `lastApplied` 0'dan başladığı için girdiler baştan yeniden uygulanır;
-    /// durum makinesi de çökmeyle kaybolan geçici bir yapı olarak baştan kurulmalıdır.
+    /// index sırasıyla ve her index bir kez (`commitIndex`/`lastApplied`, Figure 2). Durum makinesi
+    /// çökmeyle kaybolan geçici bir yapıdır: yeniden başlatmada sürücü onu diskteki snapshot'tan
+    /// (§7; snapshot yoksa boş) kurar ve girdiler snapshot'ın ardından (yoksa 1'den) yeniden
+    /// uygulanır. Bir snapshot'ın kapsadığı girdiler hiç `Apply` edilmez (bkz. `Restore`).
     ///
     /// `index`, girdinin log'daki yeridir. Neden komutla birlikte taşınıyor: State Machine Safety
     /// ("hiçbir iki düğüm aynı index'te farklı komut uygulamaz") doğrudan bu index üzerinden
@@ -42,6 +43,12 @@ pub enum Output {
         /// Uygulanacak komut.
         command: Command,
     },
+    /// Durum makinesini bu snapshot'la DEĞİŞTİR (§7, Figure 13'ün 8. adımı): düğüm liderden bir
+    /// snapshot kurdu; `snapshot.last_index`'e kadar bütün girdiler uygulanmış sayılır
+    /// (`lastApplied`). Sonraki `Apply`'lar `last_index + 1`'den devam eder. Bir `Apply` gibi
+    /// sırayla yürütülür ve aynı adımın `Persist`'inden sonra gelir (O1): snapshot önce kalıcı
+    /// olur.
+    Restore(Snapshot),
     /// Bir okuma isteğinin (`Input::Read`) sonucu. Aynı adımın `Apply`'larından SONRA gelir:
     /// `Ready` geldiğinde sürücünün durum makinesi, çekirdeğin o ana kadar ürettiği bütün
     /// `Apply`'ları uygulamış olur (çıktılar sırayla yürütülür, O1) ve okuma o durumdan

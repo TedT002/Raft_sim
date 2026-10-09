@@ -113,8 +113,9 @@
 // mutasyonu bu crate'in özellikleriyle değil `raft_core::ENABLED_MUTATION` ile sayılır: çekirdeğin
 // özelliği doğrudan (`raft-core/mutation-…`) açılsa bile sayılmış olur ve `mutation-no-dedup` ile
 // birlikte açılması derlenmez.
-const ENABLED_MUTATIONS: usize =
-    raft_core::ENABLED_MUTATION.is_some() as usize + cfg!(feature = "mutation-no-dedup") as usize;
+const ENABLED_MUTATIONS: usize = raft_core::ENABLED_MUTATION.is_some() as usize
+    + cfg!(feature = "mutation-no-dedup") as usize
+    + cfg!(feature = "mutation-snapshot-without-sessions") as usize;
 // `<= 1` yerine `matches!`: varsayılan derlemede sabit 0'dır ve clippy, türün en küçük değeriyle
 // yapılan her zaman doğru bir karşılaştırmayı (`absurd_extreme_comparisons`) hata sayar.
 const _: () = assert!(
@@ -128,6 +129,8 @@ const _: () = assert!(
 /// `raft_core::ENABLED_MUTATION`'dan gelir; özellik adları `cli`, `sim` ve `raft-core`'da aynıdır.
 pub const ENABLED_MUTATION: Option<&str> = if cfg!(feature = "mutation-no-dedup") {
     Some("mutation-no-dedup")
+} else if cfg!(feature = "mutation-snapshot-without-sessions") {
+    Some("mutation-snapshot-without-sessions")
 } else {
     raft_core::ENABLED_MUTATION
 };
@@ -165,7 +168,7 @@ pub use node::{DurableState, InputOf, NodeInput, NodeOutput, OutputOf, SimNode, 
 pub use queue::{EventQueue, Scheduled};
 pub use raft::{
     AppliedEntry, ClientReply, ClusterConfig, ClusterError, DurabilityMismatch, Election,
-    NotLeaderReply, RaftCluster, RaftRequest, RaftResponse, ReplyOutcome, Violation,
+    NotLeaderReply, RaftApplied, RaftCluster, RaftRequest, RaftResponse, ReplyOutcome, Violation,
 };
 pub use raft_core::NodeId;
 // `RaftCluster`'ın genel API'sinde görünen raft-core tipleri de aynı gerekçeyle buradan dışa
@@ -174,7 +177,7 @@ pub use raft_core::NodeId;
 // `ConfigError` takma adla verilir: sim'in kendi `ConfigError`'ıyla karışmasınlar.
 pub use raft_core::{
     Command, Config as RaftConfig, ConfigError as RaftConfigError, LogEntry, LogIndex, LogUpdate,
-    PersistUpdate, PersistentState, RaftNode, ReadId, ReadOutcome, Role, Term,
+    PersistUpdate, PersistentState, RaftNode, ReadId, ReadOutcome, Role, Snapshot, Term,
 };
 pub use rng::{ChaCha8Rng, Component, SeedTree, chance, uniform_inclusive};
 pub use scenario::{

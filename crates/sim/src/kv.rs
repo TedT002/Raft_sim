@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 
 use raft_core::Command;
 
+use crate::fnv::Fnv1a64;
+
 /// Durum makinesinin komutu: bir istemci işlemi.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvCommand {
@@ -366,6 +368,117 @@ impl KvStore {
     pub fn last_seq(&self, client: u64) -> Option<u64> {
         self.sessions.get(&client).map(|session| session.seq)
     }
+
+    /// Durum makinesinin kanonik bayt kodlaması: bir snapshot'ın verisi (§7). Tablo ve istemci
+    /// oturumları, `BTreeMap` sırasıyla: aynı durum her zaman aynı baytları verir (snapshot'lı
+    /// koşuların trace'i de deterministik kalır). İki kopyanın durumunu karşılaştırmak için bu
+    /// kodlama değil [`KvStore::fingerprint`] kullanılır (bkz. orada neden).
+    ///
+    /// Oturumlar snapshot'ın PARÇASIDIR (tezin §6.3'ü): snapshot'tan kurulan bir düğüm, aynı isteği
+    /// ikinci kez uygulamamak için hangi isteklerin uygulandığını bilmelidir. Mutasyon
+    /// `mutation-snapshot-without-sessions` (Faz 6) oturumları yazmaz: snapshot'tan kurulan bir
+    /// düğüm, yeniden denenen bir isteği bir kez daha uygular.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        put_count(&mut bytes, self.data.len());
+        for (key, value) in &self.data {
+            put_field(&mut bytes, key);
+            put_field(&mut bytes, value);
+        }
+        if cfg!(feature = "mutation-snapshot-without-sessions") {
+            put_count(&mut bytes, 0);
+            return bytes;
+        }
+        put_count(&mut bytes, self.sessions.len());
+        for (client, Session { seq, result }) in &self.sessions {
+            bytes.extend_from_slice(&client.to_le_bytes());
+            bytes.extend_from_slice(&seq.to_le_bytes());
+            match result {
+                KvResult::Ok => bytes.push(0),
+                KvResult::Value(None) => bytes.push(1),
+                KvResult::Value(Some(value)) => {
+                    bytes.push(2);
+                    put_field(&mut bytes, value);
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Durum makinesinin parmak izi: tablo ve oturumların tamamının FNV-1a özeti. Snapshot
+    /// güvenliğini denetleyen kâhin (`RaftCluster`) bunu kullanır.
+    ///
+    /// Neden [`KvStore::snapshot`]'tan ayrı: kâhin, denetlediği kodun kodlayıcısına
+    /// güvenmemelidir. Snapshot kodlayıcısı durumun bir parçasını düşürürse (ör. oturumları), aynı
+    /// kodlayıcıyla alınan bir özet bu farkı göremezdi; parmak izi her zaman bütün durumu kapsar.
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        // Uzunluk önekli alanlar: ardışık iki alanın sınırı belirsiz kalmasın.
+        fn field(hasher: &mut Fnv1a64, bytes: &[u8]) {
+            hasher.write_u64(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            hasher.write(bytes);
+        }
+        let mut hasher = Fnv1a64::new();
+        hasher.write_u64(u64::try_from(self.data.len()).unwrap_or(u64::MAX));
+        for (key, value) in &self.data {
+            field(&mut hasher, key);
+            field(&mut hasher, value);
+        }
+        hasher.write_u64(u64::try_from(self.sessions.len()).unwrap_or(u64::MAX));
+        for (client, Session { seq, result }) in &self.sessions {
+            hasher.write_u64(*client);
+            hasher.write_u64(*seq);
+            match result {
+                KvResult::Ok => hasher.write_u8(0),
+                KvResult::Value(None) => hasher.write_u8(1),
+                KvResult::Value(Some(value)) => {
+                    hasher.write_u8(2);
+                    field(&mut hasher, value);
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// [`KvStore::snapshot`]'ın kodlamasından bir durum makinesi kurar.
+    ///
+    /// # Errors
+    ///
+    /// Eksik, fazla ya da bilinmeyen bir bayt varsa [`KvDecodeError`].
+    pub fn restore(bytes: &[u8]) -> Result<Self, KvDecodeError> {
+        let mut rest = bytes;
+        let mut store = KvStore::default();
+        for _ in 0..take_u64(&mut rest)? {
+            let key = take_field(&mut rest)?;
+            let value = take_field(&mut rest)?;
+            store.data.insert(key, value);
+        }
+        for _ in 0..take_u64(&mut rest)? {
+            let client = take_u64(&mut rest)?;
+            let seq = take_u64(&mut rest)?;
+            let (&tag, tail) = rest.split_first().ok_or(KvDecodeError::Truncated)?;
+            rest = tail;
+            let result = match tag {
+                0 => KvResult::Ok,
+                1 => KvResult::Value(None),
+                2 => KvResult::Value(Some(take_field(&mut rest)?)),
+                other => return Err(KvDecodeError::UnknownTag(other)),
+            };
+            store.sessions.insert(client, Session { seq, result });
+        }
+        if rest.is_empty() {
+            Ok(store)
+        } else {
+            Err(KvDecodeError::TrailingBytes)
+        }
+    }
+}
+
+/// Bir sayıyı (öğe sayısı) little-endian `u64` olarak yazar.
+fn put_count(bytes: &mut Vec<u8>, count: usize) {
+    let count = u64::try_from(count).unwrap_or(u64::MAX);
+    bytes.extend_from_slice(&count.to_le_bytes());
 }
 
 #[cfg(test)]
@@ -398,6 +511,54 @@ mod tests {
 
     fn get(key: &[u8]) -> KvCommand {
         KvCommand::Get { key: key.to_vec() }
+    }
+
+    // Snapshot gidiş-dönüş (§7): tablo ve oturumlar aynen geri gelir; geri kurulan durum makinesi
+    // aynı isteğin yeniden denemesini yine oturumdan cevaplar (tekilleştirme snapshot'tan sağ
+    // çıkar). Bozuk bir kodlama reddedilir.
+    #[test]
+    fn a_snapshot_restores_the_table_and_the_sessions() {
+        let mut store = KvStore::default();
+        let _ = store.apply(&request(1, 1, put(b"k", b"v")));
+        let _ = store.apply(&request(2, 1, append(b"k", b"+")));
+        let _ = store.apply(&request(3, 1, get(b"k")));
+        let _ = store.apply(&request(3, 2, get(b"missing")));
+        let bytes = store.snapshot();
+        let mut restored = KvStore::restore(&bytes).expect("a valid snapshot");
+        assert_eq!(restored, store);
+        assert_eq!(restored.snapshot(), bytes);
+        assert_eq!(
+            restored.apply(&request(2, 1, append(b"k", b"+"))),
+            KvApplied::Duplicate {
+                client: 2,
+                seq: 1,
+                result: KvResult::Ok,
+            }
+        );
+        assert_eq!(restored.get(b"k"), Some(&b"v+"[..]));
+        assert_eq!(
+            KvStore::restore(&KvStore::default().snapshot()),
+            Ok(KvStore::default())
+        );
+        assert_eq!(
+            KvStore::restore(&bytes[..bytes.len() - 1]),
+            Err(KvDecodeError::Truncated)
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            KvStore::restore(&trailing),
+            Err(KvDecodeError::TrailingBytes)
+        );
+        // Parmak izi bütün durumu kapsar: aynı tabloyu taşıyan ama oturumları farklı iki durum
+        // makinesi ayrışır; aynı durum aynı izi verir.
+        assert_eq!(restored.fingerprint(), store.fingerprint());
+        let mut table = KvStore::default();
+        let _ = table.apply(&request(1, 1, put(b"k", b"v")));
+        let mut other_session = KvStore::default();
+        let _ = other_session.apply(&request(1, 7, put(b"k", b"v")));
+        assert_eq!(table.get(b"k"), other_session.get(b"k"));
+        assert_ne!(table.fingerprint(), other_session.fingerprint());
     }
 
     // Kodlama gidiş-dönüş: her istek kendi baytlarından aynen geri çözülür; boş anahtar ve değer

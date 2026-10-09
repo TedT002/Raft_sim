@@ -38,4 +38,4 @@ pub use linearizability::{
 };
 pub use log_matching::{LogMatching, LogMatchingViolation};
 pub use state_machine::{StateMachineSafety, StateMachineSafetyViolation};
-pub use view::EntryView;
+pub use view::{EntryView, LogView};
