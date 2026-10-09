@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sim::ScenarioConfig;
@@ -76,7 +77,7 @@ impl Profile {
 #[derive(Debug, Args)]
 pub struct FuzzArgs {
     /// Seeds to run, as `A..B` (B excluded).
-    #[arg(long, value_parser = parse_seeds)]
+    #[arg(long, value_parser = parse_range)]
     pub seeds: Range<u64>,
     /// Scenario profile.
     #[arg(long, value_enum, default_value_t = Profile::Chaos)]
@@ -108,6 +109,12 @@ pub struct ReplayArgs {
     /// End the fault phase at this tick.
     #[arg(long)]
     pub horizon: Option<u64>,
+    /// Draw the run's timeline (roles, terms, crashes, partitions, the violation) as an SVG file.
+    #[arg(long, value_name = "FILE")]
+    pub svg: Option<PathBuf>,
+    /// Draw only the ticks `A..B` (B excluded), with every message delivered in that window.
+    #[arg(long, value_parser = parse_range, requires = "svg")]
+    pub window: Option<Range<u64>>,
 }
 
 /// `--faults` değeri: tutulacak hataların sıraları; boş liste `none` yazılır.
@@ -149,8 +156,8 @@ fn parse_faults(text: &str) -> Result<FaultList, String> {
         .map(FaultList)
 }
 
-/// `A..B` biçiminde bir seed aralığı (`B` hariç, `A < B`).
-fn parse_seeds(text: &str) -> Result<Range<u64>, String> {
+/// `A..B` biçiminde bir aralık (`B` hariç, `A < B`): seed'ler ya da çizilecek tick'ler.
+fn parse_range(text: &str) -> Result<Range<u64>, String> {
     let (start, end) = text
         .split_once("..")
         .ok_or_else(|| format!("expected a range like 0..100, got {text:?}"))?;
@@ -170,18 +177,18 @@ fn parse_seeds(text: &str) -> Result<Range<u64>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FaultList, parse_faults, parse_seeds};
+    use super::{FaultList, parse_faults, parse_range};
 
     // Aralık ayrıştırma: geçerli aralık, boş ve ters aralık, bozuk sayılar.
     #[test]
-    fn seed_ranges_are_parsed_strictly() {
-        assert_eq!(parse_seeds("0..100"), Ok(0..100));
-        assert_eq!(parse_seeds("7..8"), Ok(7..8));
-        assert!(parse_seeds("5..5").is_err());
-        assert!(parse_seeds("9..3").is_err());
-        assert!(parse_seeds("x..3").is_err());
-        assert!(parse_seeds("3").is_err());
-        assert!(parse_seeds("-1..3").is_err());
+    fn ranges_are_parsed_strictly() {
+        assert_eq!(parse_range("0..100"), Ok(0..100));
+        assert_eq!(parse_range("7..8"), Ok(7..8));
+        assert!(parse_range("5..5").is_err());
+        assert!(parse_range("9..3").is_err());
+        assert!(parse_range("x..3").is_err());
+        assert!(parse_range("3").is_err());
+        assert!(parse_range("-1..3").is_err());
     }
 
     // Hata listesi: `none` boş listedir; sıralar virgülle ayrılır; bozuk ya da eksik bir sıra

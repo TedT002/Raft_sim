@@ -168,7 +168,8 @@ pub use node::{DurableState, InputOf, NodeInput, NodeOutput, OutputOf, SimNode, 
 pub use queue::{EventQueue, Scheduled};
 pub use raft::{
     AppliedEntry, ClientReply, ClusterConfig, ClusterError, DurabilityMismatch, Election,
-    NotLeaderReply, RaftApplied, RaftCluster, RaftRequest, RaftResponse, ReplyOutcome, Violation,
+    NodeStatus, NotLeaderReply, RaftApplied, RaftCluster, RaftRequest, RaftResponse, ReplyOutcome,
+    StatusChange, Violation,
 };
 pub use raft_core::NodeId;
 // `RaftCluster`'ın genel API'sinde görünen raft-core tipleri de aynı gerekçeyle buradan dışa

@@ -139,3 +139,8 @@ jobs:
         run: rustup toolchain install
       - name: Every mutation is caught as listed
         run: ./scripts/check_mutations.sh
+      # README'deki zaman çizelgesi (docs/figure8-seed3.svg) koddan yeniden çizilir ve depodakiyle
+      # bayt bayt aynı olmalıdır: resim, kodun bugün ürettiğinden sessizce ayrışamaz. Mutant
+      # derleme yukarıdaki adımın önbelleğini (target/mutations) kullanır.
+      - name: The README's timeline is what the code draws
+        run: ./scripts/check_timeline.sh

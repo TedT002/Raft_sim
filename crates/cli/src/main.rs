@@ -9,10 +9,12 @@
 //!   bağımsızdır. Başarısız her seed, seed'iyle ve tek satırlık yeniden üretme komutuyla
 //!   raporlanır; `--shrink` her başarısız senaryoyu aynı hatayı veren daha küçük bir senaryoya
 //!   indirir.
-//! - `raftsim replay --seed N [--profile P] [--trace] [--faults i,j,...|none] [--horizon H]`: bir
-//!   seed'in koşusunu birebir tekrarlar; isteğe bağlı olarak hata programını,
-//!   olay izini ve kümenin son hâlini yazdırır. `--faults` ve `--horizon`, küçültülmüş (shrink) bir
-//!   senaryoyu yeniden üretir.
+//! - `raftsim replay --seed N [--profile P] [--trace] [--faults i,j,...|none] [--horizon H]
+//!   [--svg FILE [--window A..B]]`: bir seed'in koşusunu birebir tekrarlar; isteğe bağlı olarak
+//!   hata programını, olay izini ve kümenin son hâlini yazdırır. `--faults` ve `--horizon`,
+//!   küçültülmüş (shrink) bir senaryoyu yeniden üretir. `--svg` koşunun zaman çizelgesini (her
+//!   düğümün rolü ve term'i, çökmeler, bölünmeler, ihlalin anı) bir SVG dosyasına çizer;
+//!   `--window` çizimi bir tick aralığına daraltır ve o aralıkta teslim edilen mesajları da çizer.
 //!
 //! `--profile` senaryo ayarlarını seçer: `chaos` (varsayılan; kayıplı ağ, çökmeler, bölünmeler),
 //! `figure8` (mesaj başına tek girdi ve sık lider değişimi, §5.4.2'nin tuzağı için), `reads`
@@ -22,13 +24,16 @@
 //! Paket adı `cli`, ikili adı `raftsim` olduğundan yeniden üretme komutu
 //! `cargo run -p cli -- replay --seed <N>` olur. Çıkış kodları: 0 başarı, 1 başarısız bir koşu, 2
 //! geçersiz argüman (clap) ya da senaryoyla uyuşmayan bir argüman (ör. var olmayan bir hata
-//! sırası), 3 aracın kendi hatası (çıktı yazılamadı, iş parçacığı açılamadı). 1 ile 3 bilerek
-//! ayrıdır: CI'da bulunan bir hata, altyapının bir aksaklığıyla karışmamalı.
+//! sırası ya da koşu bittikten sonra başlayan bir çizim penceresi), 3 aracın kendi hatası (çıktı ya
+//! da çizim dosyası yazılamadı, iş parçacığı açılamadı). 1 ile 3 bilerek ayrıdır: CI'da bulunan bir
+//! hata, altyapının bir aksaklığıyla karışmamalı.
 
 #![forbid(unsafe_code)]
 
 mod args;
+mod chart;
 mod commands;
+mod svg;
 
 use std::io::{self, Write};
 use std::process::ExitCode;

@@ -9,8 +9,10 @@
 //! çıkış kodu yine koşuların sonucudur (bkz. `finish`).
 
 use std::fmt;
+use std::fs;
 use std::io::{self, Write};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -19,6 +21,7 @@ use std::thread;
 use sim::{Fault, RaftCluster, Run, RunError, Scenario, ScenarioConfig, Shrunk, run, shrink};
 
 use crate::args::{Cli, Command, FaultList, FuzzArgs, Profile, ReplayArgs};
+use crate::{chart, svg};
 
 /// Küçültmede denenecek en fazla koşu.
 const SHRINK_BUDGET: usize = 400;
@@ -40,6 +43,13 @@ pub enum CommandError {
     Write(io::Error),
     /// Koşuları yürütecek iş parçacığı açılamadı.
     Spawn(io::Error),
+    /// Zaman çizelgesi (`--svg`) dosyaya yazılamadı.
+    Svg {
+        /// Dosya.
+        path: PathBuf,
+        /// Neden.
+        error: io::Error,
+    },
 }
 
 impl fmt::Display for CommandError {
@@ -50,6 +60,9 @@ impl fmt::Display for CommandError {
             CommandError::Spawn(error) => {
                 write!(formatter, "cannot start a worker thread: {error}")
             }
+            CommandError::Svg { path, error } => {
+                write!(formatter, "cannot write {}: {error}", path.display())
+            }
         }
     }
 }
@@ -58,8 +71,8 @@ impl fmt::Display for CommandError {
 ///
 /// # Errors
 ///
-/// Argümanlar senaryoyla uyuşmazsa, rapor yazılamazsa ya da iş parçacığı açılamazsa
-/// [`CommandError`].
+/// Argümanlar senaryoyla uyuşmazsa, rapor ya da çizim dosyası (`replay --svg`) yazılamazsa ya da iş
+/// parçacığı açılamazsa [`CommandError`].
 pub fn execute(cli: Cli, out: &mut impl Write) -> Result<ExitCode, CommandError> {
     match cli.command {
         Command::Fuzz(args) => fuzz(&args, out),
@@ -327,8 +340,55 @@ fn replay(args: &ReplayArgs, out: &mut impl Write) -> Result<ExitCode, CommandEr
         scenario = scenario.with_horizon(horizon);
     }
     let result = run(&scenario);
+    if let Some(path) = &args.svg {
+        draw(args, &result, path)?;
+    }
     let written = write_replay(args, &scenario, &indices, &result, out);
     finish(verdict(result.outcome.is_err()), written)
+}
+
+/// `--svg`: koşunun zaman çizelgesini çizer ve dosyaya yazar. Rapordan ÖNCE yapılır: koşudan
+/// sonra anlaşılan bir argüman hatası (koşu bittikten sonra başlayan bir pencere) da, diğer
+/// argüman hataları gibi stdout'a hiçbir şey yazılmadan reddedilir.
+fn draw(args: &ReplayArgs, result: &Run, path: &Path) -> Result<(), CommandError> {
+    let chart = match &result.cluster {
+        Some(cluster) => chart::collect(
+            chart_titles(args, result),
+            cluster,
+            &result.outcome,
+            args.window.as_ref(),
+        )
+        .map_err(CommandError::Usage)?,
+        // Küme kurulamadıysa (geçersiz ayar ya da kurucuda panik) çizilecek bir koşu yoktur. Dosya
+        // yine yazılır (başlık ve hata): aynı yolda kalmış eski bir çizim yeni sanılmasın.
+        None => chart::without_run(chart_titles(args, result), &result.outcome),
+    };
+    fs::write(path, svg::render(&chart)).map_err(|error| CommandError::Svg {
+        path: path.to_owned(),
+        error,
+    })
+}
+
+/// Çizelgenin başlığı ve alt başlığı: seed, profil, (varsa) derlemenin mutasyonu ve sonuç; altında
+/// koşuyu yeniden üreten komut. Resim tek başına paylaşıldığında da hangi koşuyu gösterdiği ve
+/// nasıl yeniden üretileceği okunabilsin.
+fn chart_titles(args: &ReplayArgs, result: &Run) -> (String, String) {
+    let mut title = format!("seed {}, profile {}", args.seed, args.profile.name());
+    if let Some(feature) = sim::ENABLED_MUTATION {
+        title.push_str(&format!(", built with {feature}"));
+    }
+    match &result.outcome {
+        Ok(_) => title.push_str(": passed"),
+        Err(error) => title.push_str(&format!(": FAILED ({})", error.signature())),
+    }
+    let mut command = reproduce(args.seed, args.profile);
+    if let Some(faults) = &args.faults {
+        command.push_str(&format!(" --faults {faults}"));
+    }
+    if let Some(horizon) = args.horizon {
+        command.push_str(&format!(" --horizon {horizon}"));
+    }
+    (title, command)
 }
 
 fn write_replay(

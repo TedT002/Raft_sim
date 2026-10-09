@@ -19,8 +19,9 @@ and a leader sends its snapshot to a follower that needs entries it no longer ha
 restarts, partitions, message loss, duplication and reordering, a disk that loses unsynced writes,
 clients that retry and lose replies). It checks all five safety properties of Figure 3 after every
 simulated event and the linearizability of the client history at the end of every run, and it
-shrinks a failing scenario to a small one that `raftsim replay` reproduces exactly. Every push
-fuzzes 4000 seeds and proves that eleven deliberately planted bugs are still caught.
+shrinks a failing scenario to a small one that `raftsim replay` reproduces exactly and can draw as
+a timeline. Every push fuzzes 4000 seeds and proves that eleven deliberately planted bugs are still
+caught.
 
 ## Quick start
 
@@ -40,11 +41,17 @@ cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 8 --profile snapsho
 
 # replay one seed exactly: the fault schedule, every event and the final state of every node
 cargo run --release -p cli -- replay --seed 42 --trace | less
+
+# draw the same run as an SVG timeline (roles, terms, crashes, partitions, the violation);
+# --window zooms into a range of ticks and adds every message delivered in it
+cargo run --release -p cli -- replay --seed 42 --svg run.svg
+cargo run --release -p cli -- replay --seed 42 --svg zoom.svg --window 100..200
 ```
 
 Exit codes: 0 when every run passes, 1 when a run fails, 2 for invalid arguments (including a
-fault index that the seed's schedule does not have), 3 when the tool itself fails (it cannot write
-its output or start a worker thread). `--shrink` shrinks the first 10 failing seeds.
+fault index that the seed's schedule does not have, or a drawing window that starts after the run
+ended), 3 when the tool itself fails (it cannot write its output or the SVG file, or start a worker
+thread). `--shrink` shrinks the first 10 failing seeds.
 
 ## Why
 
@@ -184,7 +191,7 @@ Crates and their dependency direction (`raft-core` depends on no workspace crate
 | `raft-core` | Pure, sans-IO Raft state machine (Figure 2): leader election, log replication, `NotLeader` replies, the leader's no-op entry (§8), reads that skip the log (ReadIndex, thesis §6.4), snapshots and log compaction (§7) |
 | `sim` | Deterministic simulator: virtual clock, event queue, seeded network and disk, crash/restart, trace hash; Raft adapter with a session-aware key-value state machine, checking invariants after every event; simulated clients that record their history; log compaction with snapshot safety checks; chaos scenarios and shrinking |
 | `checker` | The five Raft safety properties of Figure 3 and a linearizability checker for key-value histories, independent of `raft-core`'s types |
-| `cli` | `raftsim` binary: `fuzz --seeds A..B [--threads N] [--profile P] [--shrink]` and `replay --seed N [--profile P] [--trace] [--faults i,j,...\|none] [--horizon H]` |
+| `cli` | `raftsim` binary: `fuzz --seeds A..B [--threads N] [--profile P] [--shrink]` and `replay --seed N [--profile P] [--trace] [--faults i,j,...\|none] [--horizon H] [--svg FILE [--window A..B]]` |
 
 ```
 cli -> sim
@@ -236,6 +243,17 @@ node 3 holds a term 6 entry at index 9, so the new leader lacks a committed entr
 overwrite it on every follower; the oracle flags the violation the moment node 3 is elected.
 (Commit indexes are volatile: nodes 3 and 5 restarted and have not learned theirs yet.) Without
 the mutation, the same seed with the same 23 faults passes.
+
+Adding `--svg` draws the shrunk run as a timeline. Each node is a lane, colored by its role, with
+every leadership labeled by its term; the dashed lines are the faults that actually took effect,
+and the red line is the violation:
+
+![Timeline of the shrunk Figure 8 run](docs/figure8-seed3.svg)
+
+Node 4 leads term 13 from tick 377 and commits index 9 by counting replicas. After it steps down,
+node 3 wins term 15 at tick 435 and the oracle fires. The drawing is deterministic like everything
+else: the same seed and arguments produce the same bytes, and CI redraws this image from the code
+on every push (`scripts/check_timeline.sh`), so it cannot drift from what the code does.
 
 ## Mutation testing
 
@@ -290,7 +308,7 @@ deterministic tests instead of a row in the table.
 - [ ] Phase 6 (optional) — Deepening:
   - [x] Linearizable reads that skip the log (ReadIndex, thesis §6.4)
   - [x] Snapshots and log compaction (§7)
-  - [ ] A run visualizer
+  - [x] A run visualizer (`raftsim replay --svg`, a deterministic SVG timeline)
   - [ ] Leader leases, cluster membership changes (§6), a real network runner
 
 ## Development
@@ -322,6 +340,7 @@ cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile figure8
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile reads
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile snapshots
 ./scripts/check_mutations.sh
+./scripts/check_timeline.sh
 ```
 
 ## License

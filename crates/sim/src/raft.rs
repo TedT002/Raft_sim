@@ -724,6 +724,29 @@ struct Observed {
     commit_index: LogIndex,
 }
 
+/// Bir düğümün bir andaki hâli: ayakta mı, rolü ve term'i (zaman çizelgesi için; bkz.
+/// [`RaftCluster::timeline`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeStatus {
+    /// Düğüm ayakta mı?
+    pub up: bool,
+    /// Rol. Çökmüş bir düğümün rolü, belleğinin çöktüğü andaki (donmuş) hâlidir.
+    pub role: Role,
+    /// Term.
+    pub term: Term,
+}
+
+/// Zaman çizelgesinin bir kaydı: `at` anında `node` düğümünün hâli `status` oldu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusChange {
+    /// An (tick).
+    pub at: u64,
+    /// Düğüm.
+    pub node: NodeId,
+    /// Yeni hâl.
+    pub status: NodeStatus,
+}
+
 /// Raft düğümlerinden oluşan ve her olaydan sonra invariant'ları denetleyen simülasyon.
 ///
 /// Bütün rastgelelik tek bir ana seed'den türetilir: ağ `Component::Network`, disk
@@ -785,6 +808,10 @@ pub struct RaftCluster {
     // Sayaçlar: sıkıştırmalar ve liderden kurulan snapshot'lar.
     compactions: u64,
     installs: u64,
+    // Zaman çizelgesi (bkz. `timeline`) ve her düğümün en son kaydedilen hâli. Yalnızca gözlemdir:
+    // koşuyu etkilemez, trace'e girmez.
+    timeline: Vec<StatusChange>,
+    statuses: BTreeMap<NodeId, NodeStatus>,
 }
 
 /// Cevap bekleyen bir okuma: kimin, hangi anahtarı.
@@ -815,7 +842,7 @@ impl RaftCluster {
             (id, RaftNode::new(id, ids.clone(), config.raft, seed))
         });
         let sim = Simulation::with_options(SimConfig::default(), network, nodes, options)?;
-        Ok(Self {
+        let mut cluster = Self {
             sim,
             election_safety: ElectionSafety::new(),
             append_only: LeaderAppendOnly::new(),
@@ -835,7 +862,11 @@ impl RaftCluster {
             digests: BTreeMap::new(),
             compactions: 0,
             installs: 0,
-        })
+            timeline: Vec::new(),
+            statuses: BTreeMap::new(),
+        };
+        cluster.record_statuses();
+        Ok(cluster)
     }
 
     /// Alttaki simülasyon (salt okunur): trace, zaman, düğümler, diskler.
@@ -919,6 +950,34 @@ impl RaftCluster {
             self.compact_due()?;
         }
         Ok(())
+    }
+
+    /// Koşunun zaman çizelgesi: her düğümün hâlinin (ayakta mı, rol, term) her değişimi, zaman
+    /// sırasıyla. İlk kayıtlar 0 anındaki başlangıç hâlleridir. Hâller her olayın sonunda
+    /// okunur: bir olayın içindeki ara hâller (ör. aynı adımda aday olup hemen lider olmak) değil,
+    /// olaydan sonraki hâl kaydedilir. `raftsim replay --svg` çizelgeyi bundan çizer.
+    #[must_use]
+    pub fn timeline(&self) -> &[StatusChange] {
+        &self.timeline
+    }
+
+    /// Hâli değişen düğümleri zaman çizelgesine ekler.
+    fn record_statuses(&mut self) {
+        let at = self.sim.now();
+        for host in self.sim.hosts() {
+            let status = NodeStatus {
+                up: host.up,
+                role: host.node.role(),
+                term: host.node.current_term(),
+            };
+            if self.statuses.insert(host.id, status) != Some(status) {
+                self.timeline.push(StatusChange {
+                    at,
+                    node: host.id,
+                    status,
+                });
+            }
+        }
     }
 
     /// Sıkıştırmalar: alınan durum makinesi snapshot'ları (bkz. `ClusterConfig::snapshot_every`).
@@ -1036,6 +1095,9 @@ impl RaftCluster {
     /// invariant çiğnenmişse [`ClusterError::Violation`].
     pub fn restart(&mut self, id: NodeId) -> Result<(), ClusterError> {
         self.sim.restart(id)?;
+        // Düğüm artık ayakta: aşağıdaki snapshot yüklemesi bir ihlalle bitse bile zaman çizelgesi
+        // onu ayakta gösterir (`check` o durumda çağrılmaz).
+        self.record_statuses();
         // Diskte bir snapshot varsa durum makinesi ondan kurulur: düğüm de `lastApplied` ile oradan
         // açılır (bkz. `Input::Restart`) ve girdiler snapshot'ın ardından uygulanır.
         let snapshot = self
@@ -1157,6 +1219,8 @@ impl RaftCluster {
 
     /// Son olaydan sonra bütün invariant'ları denetler ve gözlem kayıtlarını günceller.
     fn check(&mut self) -> Result<(), ClusterError> {
+        // Önce zaman çizelgesi: bu olay bir ihlalle bitse bile, ihlale yol açan hâller kayıtlıdır.
+        self.record_statuses();
         let time = self.sim.now();
         let violation = |violation: Violation| ClusterError::Violation { time, violation };
 
@@ -1565,12 +1629,12 @@ fn durability_mismatch(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
 
     use super::{
-        AppliedEntry, ClusterConfig, ClusterError, DurabilityMismatch, RaftApplied, RaftCluster,
-        RaftRequest, Violation,
+        AppliedEntry, ClusterConfig, ClusterError, DurabilityMismatch, NodeStatus, RaftApplied,
+        RaftCluster, RaftRequest, Violation,
     };
     use crate::disk::DiskConfig;
     use crate::kv::{KvCommand, KvStore};
@@ -1580,7 +1644,7 @@ mod tests {
     use raft_core::{
         AppendEntries, AppendEntriesResponse, Command, InstallSnapshot, LogEntry, LogIndex,
         LogUpdate, Message, NodeId, PersistUpdate, PersistentState, ReadId, RequestVote,
-        RequestVoteResponse, Snapshot, Term,
+        RequestVoteResponse, Role, Snapshot, Term,
     };
 
     /// Tek baytlık verili bir snapshot.
@@ -2165,5 +2229,70 @@ mod tests {
                 index: applied,
             }
         );
+    }
+
+    // Zaman çizelgesi her düğümün hâlinin (ayakta mı, rol, term) her değişimini zaman sırasıyla
+    // kaydeder: 0 anındaki başlangıç hâlleri, seçilen lider, çökme (donmuş rolüyle, ayakta değil)
+    // ve yeniden başlatma (ayakta, takipçi). Bir düğümün ardışık iki kaydı hiç aynı değildir.
+    // (Çizelge yalnızca gözlemdir: koşuyu değiştirmediğini, altın Raft trace özetinin çizelge
+    // eklendiğinde aynı kalması gösterir; bkz. `tests/determinism.rs`.)
+    #[test]
+    fn the_timeline_records_every_status_change() {
+        let mut cluster = quiet_cluster(41);
+        let (leader, term) = elect(&mut cluster);
+        cluster.crash(leader).expect("the leader is up");
+        let crashed_at = cluster.now();
+        let later = crashed_at + 50;
+        cluster.run_until(later).expect("no violation");
+        cluster.restart(leader).expect("the leader is down");
+
+        let timeline = cluster.timeline();
+        let initial = NodeStatus {
+            up: true,
+            role: Role::Follower,
+            term: Term(0),
+        };
+        assert_eq!(
+            timeline[..3]
+                .iter()
+                .map(|change| (change.at, change.node, change.status))
+                .collect::<Vec<_>>(),
+            [1, 2, 3].map(|id| (0, NodeId(id), initial))
+        );
+        assert!(timeline.windows(2).all(|pair| pair[0].at <= pair[1].at));
+        let leading = NodeStatus {
+            up: true,
+            role: Role::Leader,
+            term,
+        };
+        assert!(
+            timeline
+                .iter()
+                .any(|change| change.node == leader && change.status == leading)
+        );
+        assert!(timeline.iter().any(|change| change.node == leader
+            && change.at == crashed_at
+            && change.status
+                == NodeStatus {
+                    up: false,
+                    ..leading
+                }));
+        let last = timeline
+            .iter()
+            .rev()
+            .find(|change| change.node == leader)
+            .expect("the leader has records");
+        assert_eq!(
+            (last.at, last.status.up, last.status.role),
+            (later, true, Role::Follower)
+        );
+        let mut current = BTreeMap::new();
+        for change in timeline {
+            assert_ne!(
+                current.insert(change.node, change.status),
+                Some(change.status),
+                "{change:?} repeats the previous status"
+            );
+        }
     }
 }
