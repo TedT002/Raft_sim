@@ -805,9 +805,11 @@ pub struct RaftCluster {
     // snapshot'sız bir koşuda kopyaların durumlarının eşitliğini State Machine Safety (aynı
     // komutlar, aynı sıra) zaten verir.
     digests: BTreeMap<LogIndex, (u64, NodeId)>,
-    // Sayaçlar: sıkıştırmalar ve liderden kurulan snapshot'lar.
+    // Sayaçlar: sıkıştırmalar, liderden kurulan snapshot'lar ve geldiği adımda cevaplanan
+    // (kiralamalı) okumalar.
     compactions: u64,
     installs: u64,
+    lease_reads: u64,
     // Zaman çizelgesi (bkz. `timeline`) ve her düğümün en son kaydedilen hâli. Yalnızca gözlemdir:
     // koşuyu etkilemez, trace'e girmez.
     timeline: Vec<StatusChange>,
@@ -862,6 +864,7 @@ impl RaftCluster {
             digests: BTreeMap::new(),
             compactions: 0,
             installs: 0,
+            lease_reads: 0,
             timeline: Vec::new(),
             statuses: BTreeMap::new(),
         };
@@ -990,6 +993,27 @@ impl RaftCluster {
     #[must_use]
     pub fn installs(&self) -> u64 {
         self.installs
+    }
+
+    /// Geldiği adımda `Ready` ile cevaplanan okumalar: birden çok düğümlü bir kümede bunlar lider
+    /// kiralamasıyla (tezin §6.4.1) cevaplanmıştır, çünkü ReadIndex'in doğrulama turu en az bir
+    /// gidiş-dönüş sürer. Bekledikten sonra kiralamayla cevaplanan okumaları saymaz: bir alt
+    /// sınırdır.
+    #[must_use]
+    pub fn lease_reads(&self) -> u64 {
+        self.lease_reads
+    }
+
+    /// Bir düğümün saatini ileri sıçratır (bkz. [`Simulation::jump_clock`]) ve invariant'ları
+    /// denetler. Sıçrama tek bir olaydır: ek tick'lerin hepsi verildikten sonra denetlenir.
+    ///
+    /// # Errors
+    ///
+    /// Düğüm yoksa ya da çökmüşse [`ClusterError::Lifecycle`]; ardından bir invariant çiğnenmişse
+    /// [`ClusterError::Violation`].
+    pub fn jump_clock(&mut self, id: NodeId, ticks: u64) -> Result<(), ClusterError> {
+        self.sim.jump_clock(id, ticks)?;
+        self.check()
     }
 
     /// Durum makinesi son snapshot'ından bu yana `snapshot_every` girdi uygulamış ayaktaki her
@@ -1186,7 +1210,17 @@ impl RaftCluster {
         // cevapları işlemeden önce kaydedilir.
         self.reads
             .insert((id, read), ClientRead { client, seq, key });
-        self.check()
+        let replies_before = self.client_replies.len();
+        self.check()?;
+        let answered_at_once = self.client_replies[replies_before..].iter().any(|reply| {
+            reply.node == id
+                && (reply.client, reply.seq) == (client, seq)
+                && matches!(reply.outcome, ReplyOutcome::Done { .. })
+        });
+        if answered_at_once && self.sim.hosts().count() > 1 {
+            self.lease_reads += 1;
+        }
+        Ok(())
     }
 
     /// Son çağrıdan bu yana üretilen istemci cevapları, üretilme sırasıyla.

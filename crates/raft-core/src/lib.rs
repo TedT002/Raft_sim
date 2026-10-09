@@ -31,7 +31,9 @@
 //! ve tekilleştirme) durum makinesinin işidir: komutlar çekirdek için opaktır (C1). Okumalar log'a
 //! yazılmadan da cevaplanabilir (**ReadIndex**, tezin §6.4'ü): lider liderliğini bir doğrulama
 //! turuyla ([`Message::Probe`]) çoğunluğa onaylatır ve okumayı commitIndex'ine kadar uygulanmış
-//! durumdan cevaplatır ([`Input::Read`], [`Output::Read`]). Log, durum makinesinin bir
+//! durumdan cevaplatır ([`Input::Read`], [`Output::Read`]). Lider kiralaması açıksa
+//! ([`Config::with_lease`], tezin §6.4.1) lider, çoğunluğun onayladığı son turun gönderiminden
+//! sonraki bir süre boyunca okumaları tur beklemeden cevaplar. Log, durum makinesinin bir
 //! snapshot'ıyla sıkıştırılabilir ve geride kalmış bir takipçiye snapshot gönderilir (§7:
 //! [`Input::Compact`], [`Message::InstallSnapshot`], [`Output::Restore`]).
 //!
@@ -59,9 +61,10 @@
 //! - **R1:** `Input::Restart` yalnızca diskte kalıcı olan durumu taşır; kurtarma ondan başlar.
 //!   Düğüm Follower olarak açılır ve bu adım hiç çıktı üretmez.
 //! - **T1:** Term asla azalmaz. Daha yüksek term taşıyan herhangi bir mesaj görülünce düğüm o
-//!   term'i benimser ve Follower'a döner (§5.1). Tek istisna `Restart`'tır: verilen disk durumunu
-//!   olduğu gibi yükler. Doğru bir sürücüde disk her zaman son persist edilen durumu taşıdığından
-//!   term yine azalmaz.
+//!   term'i benimser ve Follower'a döner (§5.1). İki istisna vardır. `Restart` verilen disk
+//!   durumunu olduğu gibi yükler; doğru bir sürücüde disk her zaman son persist edilen durumu
+//!   taşıdığından term yine azalmaz. Kiralama açıkken korumalı bir Follower oy isteklerini
+//!   bütünüyle yok sayar, term'lerini de benimsemez (Q2).
 //! - **E1:** Bir term'de en fazla bir oy: `votedFor` bir term içinde bir kez yazılır, sonra
 //!   değişmez (§5.2).
 //! - **E2:** Oylar küme olarak sayılır: yalnızca eşlerden ve yalnızca mevcut term'e ait olumlu
@@ -88,8 +91,17 @@
 //!   olmayan düğüm aynı adımda `NotLeader` döner. Lider `Ready`'yi yalnızca şu üçü birlikte
 //!   sağlanınca üretir: okuma geldikten SONRA başlattığı bir doğrulama turunu çoğunluk onayladı,
 //!   kendi term'inden bir girdiyi commit etti (okumanın `readIndex`'i o andan sonraki
-//!   commitIndex'idir) ve `readIndex`'e kadar uyguladı. Okuma tamamlanmadan liderliği bırakan
-//!   düğüm bekleyen okumaları `NotLeader` ile bitirir.
+//!   commitIndex'idir) ve `readIndex`'e kadar uyguladı. Okuma tamamlanmadan liderliği bırakan düğüm
+//!   bekleyen okumaları `NotLeader` ile bitirir.
+//! - **Q2:** Kiralama açıksa ([`Config::with_lease`]) Q1'in tur koşulunun yerine şu da geçer:
+//!   `Ready` ya okumanın geldiği adımda ya da üretildiği adımda lider, çoğunluğun onayladığı bir
+//!   turun GÖNDERİMİNDEN bu yana `lease` tick'ten az zaman geçmiş bir kiralamaya sahipti ve kendi
+//!   term'inden bir girdiyi commit etmişti. Kiralaması o an geçerli olan lider gelen okumayı tur
+//!   başlatmadan kabul eder (`readIndex` o anki commitIndex'idir). Kiralama açıkken bir Follower,
+//!   bir liderden son haber aldığından (ya da açıldığından) bu yana T tick geçmeden gelen HER
+//!   `RequestVote`'u, term'i ne olursa olsun, bütünüyle yok sayar (§4.2.3; T1'in istisnası).
+//!   Güvenlik, saatlerin bir kiralama süresi içinde birbirinden `T - lease` tick'ten fazla
+//!   ayrışmamasına dayanır.
 //!
 //! Aşağıdaki örnek, gerçek bir sürücünün (ör. simülatör) çekirdekle nasıl konuşacağını gösterir:
 //! üç düğümlü bir kümenin bir düğümünü kurar, seçim zaman aşımı dolana kadar `Tick` verir ve dönen

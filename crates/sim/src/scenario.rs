@@ -189,12 +189,32 @@ impl ScenarioConfig {
             ..chaos
         }
     }
+
+    /// Lider kiralamasına (tezin §6.4.1) odaklanan ayarlar: `reads` profili, ama lider okumaları
+    /// kiralaması sürdükçe doğrulama turu beklemeden cevaplar (T = 20, kiralama 16 tick; takipçiler
+    /// liderden haber aldıktan sonraki 20 tick boyunca oy vermez). Saatler aynı hızla akar:
+    /// kiralamanın varsayımı (saatler bir kiralama süresinde 4 tick'ten fazla ayrışmaz) burada hep
+    /// sağlanır. Varsayım bozulunca (saat sıçraması, `RaftCluster::jump_clock`) kiralamanın
+    /// gerçekten bayat okuma verdiğini ayrı bir test gösterir.
+    #[must_use]
+    pub fn leases() -> Self {
+        let reads = Self::reads();
+        Self {
+            // `expect` imkânsız bir durumu belgeler: 16 < T = 20 sabittir (`Config::with_lease`).
+            raft: reads
+                .raft
+                .with_lease(16)
+                .expect("a 16-tick lease is below the 20-tick election timeout"),
+            ..reads
+        }
+    }
 }
 
 /// Hata karışımı: her adımda bir hata türünün seçilme ağırlığı.
 ///
 /// Tür, ağırlıkların toplamı üzerinden TEK bir çekilişle seçilir; aralıklar sabit sırayla dizilir
-/// (çökme, lideri çökertme, yeniden başlatma, bölünme, iyileşme, kayıp oranı, sessizlik). Ağırlığı
+/// (çökme, lideri çökertme, yeniden başlatma, bölünme, iyileşme, kayıp oranı, sessizlik, lideri
+/// yalıtma). Ağırlığı
 /// 0 olan bir tür karışımda hiç yokmuş gibi davranır: toplam ve aralıklar, o tür listede olmasaydı
 /// ne olacaksa odur. Bu yüzden yeni bir tür, ağırlığı 0 olan karışımların ürettiği programları
 /// değiştirmeden eklenebilir (`CHAOS`'ta lideri çökertme böyledir). Sıfır OLMAYAN bir ağırlığı
@@ -454,6 +474,8 @@ pub struct RunStats {
     pub compactions: u64,
     /// Liderden kurulan snapshot'lar (Figure 13).
     pub installs: u64,
+    /// Geldiği adımda kiralamayla cevaplanan okumalar (bkz. `RaftCluster::lease_reads`).
+    pub lease_reads: u64,
     /// Koşunun kimliği: trace özeti.
     pub trace_hash: u64,
 }
@@ -675,6 +697,7 @@ fn drive(scenario: &Scenario, cluster: &mut RaftCluster) -> Result<RunStats, Run
     .unwrap_or(u64::MAX);
     stats.compactions = cluster.compactions();
     stats.installs = cluster.installs();
+    stats.lease_reads = cluster.lease_reads();
     stats.trace_hash = cluster.sim().trace_hash();
     Ok(stats)
 }

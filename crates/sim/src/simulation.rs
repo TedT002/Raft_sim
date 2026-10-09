@@ -558,6 +558,41 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
         Ok(())
     }
 
+    /// Bir düğümün saatini ileri sıçratır: düğüm şu an, düzenli tick'lerine ek olarak `ticks` tick
+    /// daha alır; her biri bir `Tick` kaydıyla ve çıktıları her olayınki gibi sırayla
+    /// yönlendirilerek. Düzenli tick zinciri değişmez: düğümün saati diğerlerinin `ticks` önüne
+    /// geçer ve orada kalır.
+    ///
+    /// Neden: simülasyonda bütün saatler aynı hızla akar. Gerçek saatler ise sapar ve sıçrar; saate
+    /// dayanan bir mekanizmanın (ör. lider kiralaması, tezin §6.4.1) varsayımları ancak saat
+    /// bozulduğunda sınanabilir.
+    ///
+    /// # Errors
+    ///
+    /// Düğüm simülasyonda yoksa ya da çökmüşse [`LifecycleError`]; o durumda simülasyon değişmez.
+    pub fn jump_clock(&mut self, id: NodeId, ticks: u64) -> Result<(), LifecycleError> {
+        let host = self.hosts.get(&id).ok_or(LifecycleError::UnknownNode(id))?;
+        if !host.up {
+            return Err(LifecycleError::Down(id));
+        }
+        self.trace.record(TraceEvent {
+            time: self.now,
+            kind: TraceKind::ClockJump { node: id, ticks },
+        });
+        for _ in 0..ticks {
+            let Some(host) = self.hosts.get_mut(&id) else {
+                break;
+            };
+            self.trace.record(TraceEvent {
+                time: self.now,
+                kind: TraceKind::Tick { node: id },
+            });
+            let outputs = host.node.step(NodeInput::Tick);
+            self.apply_outputs(id, outputs);
+        }
+        Ok(())
+    }
+
     /// Ayaktaki bir düğüme bir istemci isteği verir: düğüm hemen adımlanır ve çıktıları her
     /// olayınki gibi sırayla uygulanır.
     ///

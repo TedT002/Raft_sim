@@ -13,14 +13,15 @@ commands with consistency-checked `AppendEntries`, starts every term with a no-o
 only entries of its own term by counting replicas (§5.4.2, the Figure 8 trap); followers answer
 clients with `NotLeader` and a hint, and client sessions make retried requests take effect at most
 once (§8). Reads can skip the log: a leader answers them after confirming its leadership with a
-majority (ReadIndex, §6.4 of the Raft thesis). Logs can be compacted into state machine snapshots,
+majority (ReadIndex, §6.4 of the Raft thesis), or, with leader leases, without any round at all
+while its lease lasts (§6.4.1). Logs can be compacted into state machine snapshots,
 and a leader sends its snapshot to a follower that needs entries it no longer has (§7, Figure 13).
 `raftsim fuzz` runs seeded chaos scenarios (crashes,
 restarts, partitions, message loss, duplication and reordering, a disk that loses unsynced writes,
 clients that retry and lose replies). It checks all five safety properties of Figure 3 after every
 simulated event and the linearizability of the client history at the end of every run, and it
 shrinks a failing scenario to a small one that `raftsim replay` reproduces exactly and can draw as
-a timeline. Every push fuzzes 4000 seeds and proves that eleven deliberately planted bugs are still
+a timeline. Every push fuzzes 5000 seeds and proves that eleven deliberately planted bugs are still
 caught.
 
 ## Quick start
@@ -38,6 +39,9 @@ cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 8 --profile reads
 
 # every node snapshots its state machine and compacts its log every 16 entries
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 8 --profile snapshots
+
+# the reads profile with leader leases: a leader answers reads without a round while its lease lasts
+cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 8 --profile leases
 
 # replay one seed exactly: the fault schedule, every event and the final state of every node
 cargo run --release -p cli -- replay --seed 42 --trace | less
@@ -157,6 +161,19 @@ a round of an earlier term, cannot confirm a newer read. A leader that steps dow
 pending reads with `NotLeader`. Probes are separate messages rather than a field of `AppendEntries`,
 so runs without such reads are unchanged, byte for byte, down to their trace hashes.
 
+Leader leases (thesis §6.4.1, off by default) trade that round for a clock assumption. With a
+lease of `L` ticks below the election timeout `T`, the leader starts a round with every heartbeat
+and holds a lease until `L` ticks after the *sending* of the newest round a majority acknowledged.
+While the lease lasts it answers reads at once. Followers do their part: within `T` ticks of hearing
+from a leader, or of restarting, they ignore every vote request entirely, whatever its term
+(§4.2.3). Every follower in the acknowledging majority heard from the leader after the round was
+sent and votes for nobody for `T` ticks. The leader itself can be deposed, but only by stepping down,
+which ends its lease. So while it leads and its lease lasts, no other leader exists. This holds as
+long as clocks do not drift apart by more than `T - L` ticks within a lease. The simulator can break that
+on purpose (`RaftCluster::jump_clock`): when two followers' clocks jump ahead, an isolated leader
+serves a stale value from its lease, while the same run with ReadIndex answers nothing. The test is
+`clocks_that_jump_past_the_margin_break_leases_but_not_read_index`.
+
 Log compaction follows §7 and Figure 13 of the paper. The host decides when to take a snapshot (the
 core never sees the state machine) and hands the core its state machine's encoding at the index it
 has applied; the core drops that prefix of its log and persists the snapshot. A leader that no
@@ -188,8 +205,8 @@ Crates and their dependency direction (`raft-core` depends on no workspace crate
 
 | Crate | Responsibility |
 |---|---|
-| `raft-core` | Pure, sans-IO Raft state machine (Figure 2): leader election, log replication, `NotLeader` replies, the leader's no-op entry (§8), reads that skip the log (ReadIndex, thesis §6.4), snapshots and log compaction (§7) |
-| `sim` | Deterministic simulator: virtual clock, event queue, seeded network and disk, crash/restart, trace hash; Raft adapter with a session-aware key-value state machine, checking invariants after every event; simulated clients that record their history; log compaction with snapshot safety checks; chaos scenarios and shrinking |
+| `raft-core` | Pure, sans-IO Raft state machine (Figure 2): leader election, log replication, `NotLeader` replies, the leader's no-op entry (§8), reads that skip the log (ReadIndex, thesis §6.4) or rely on a leader lease (§6.4.1), snapshots and log compaction (§7) |
+| `sim` | Deterministic simulator: virtual clock, event queue, seeded network and disk, crash/restart, clock jumps, trace hash; Raft adapter with a session-aware key-value state machine, checking invariants after every event; simulated clients that record their history; log compaction with snapshot safety checks; chaos scenarios and shrinking |
 | `checker` | The five Raft safety properties of Figure 3 and a linearizability checker for key-value histories, independent of `raft-core`'s types |
 | `cli` | `raftsim` binary: `fuzz --seeds A..B [--threads N] [--profile P] [--shrink]` and `replay --seed N [--profile P] [--trace] [--faults i,j,...\|none] [--horizon H] [--svg FILE [--window A..B]]` |
 
@@ -261,19 +278,19 @@ Eleven bugs are planted behind Cargo features (`mutation-<name>`, never part of 
 and the fuzzer must catch each of them. The columns count the failing seeds among the first 1000 of
 each profile:
 
-| Feature `mutation-…` | Planted bug | Caught by | chaos | figure8 | reads | snapshots |
-|---|---|---|---|---|---|---|
-| `no-election-restriction` | a node votes for a candidate with a stale log (§5.4.1) | leader completeness | 797 | 997 | 669 | 788 |
-| `commit-old-terms` | a leader commits earlier-term entries by counting replicas (§5.4.2) | leader completeness | 0 | 16 | 0 | 0 |
-| `forget-vote` | `votedFor` is not persisted (Figure 2) | durability | 1000 | 1000 | 1000 | 1000 |
-| `truncate-on-append` | every `AppendEntries` truncates the log after `prevLogIndex` (§5.3) | committed entry rewritten | 1000 | 1000 | 1000 | 1000 |
-| `skip-prev-log-term` | a follower accepts `AppendEntries` whose `prevLogTerm` differs from its entry at `prevLogIndex` (§5.3) | log matching | 297 | 926 | 589 | 226 |
-| `apply-before-commit` | entries are applied before they are committed (Figure 2) | state machine safety | 605 | 1000 | 767 | 958 |
-| `no-dedup` | the state machine applies a retried request again (§8) | linearizability | 562 | 149 | 353 | 538 |
-| `read-without-quorum` | a leader serves a read without confirming its leadership (thesis §6.4) | linearizability | 0 | 0 | 37 | 0 |
-| `read-before-term-commit` | a new leader serves reads before committing an entry of its term (§6.4) | linearizability | 0 | 0 | 122 | 0 |
-| `install-stale-snapshot` | a follower installs a snapshot older than its commit index (§7) | state machine safety | 0 | 0 | 0 | 782 |
-| `snapshot-without-sessions` | the state machine's snapshot leaves out the client sessions (§7) | snapshot safety | 0 | 0 | 0 | 972 |
+| Feature `mutation-…` | Planted bug | Caught by | chaos | figure8 | reads | snapshots | leases |
+|---|---|---|---|---|---|---|---|
+| `no-election-restriction` | a node votes for a candidate with a stale log (§5.4.1) | leader completeness | 797 | 997 | 669 | 788 | 633 |
+| `commit-old-terms` | a leader commits earlier-term entries by counting replicas (§5.4.2) | leader completeness | 0 | 16 | 0 | 0 | 0 |
+| `forget-vote` | `votedFor` is not persisted (Figure 2) | durability | 1000 | 1000 | 1000 | 1000 | 1000 |
+| `truncate-on-append` | every `AppendEntries` truncates the log after `prevLogIndex` (§5.3) | committed entry rewritten | 1000 | 1000 | 1000 | 1000 | 1000 |
+| `skip-prev-log-term` | a follower accepts `AppendEntries` whose `prevLogTerm` differs from its entry at `prevLogIndex` (§5.3) | log matching | 297 | 926 | 589 | 226 | 575 |
+| `apply-before-commit` | entries are applied before they are committed (Figure 2) | state machine safety | 605 | 1000 | 767 | 958 | 738 |
+| `no-dedup` | the state machine applies a retried request again (§8) | linearizability | 562 | 149 | 353 | 538 | 378 |
+| `read-without-quorum` | a leader serves a read without confirming its leadership (thesis §6.4) | linearizability | 0 | 0 | 37 | 0 | 30 |
+| `read-before-term-commit` | a new leader serves reads before committing an entry of its term (§6.4) | linearizability | 0 | 0 | 122 | 0 | 253 |
+| `install-stale-snapshot` | a follower installs a snapshot older than its commit index (§7) | state machine safety | 0 | 0 | 0 | 782 | 0 |
+| `snapshot-without-sessions` | the state machine's snapshot leaves out the client sessions (§7) | snapshot safety | 0 | 0 | 0 | 972 | 0 |
 
 `durability` and `committed entry rewritten` are the simulator's write-time checks (a node's memory
 must match what it wrote; no node rewrites its log at or below its commit index): they catch those
@@ -285,12 +302,16 @@ the ones rebuilt from installed or reloaded snapshots.
 listed check) and without it (the run must pass), so the seeds and checks cannot go stale; the
 counts are a measurement snapshot.
 
-Random fault injection has limits, and the project records one honestly. Code review found a bug in
-the first ReadIndex version: a follower answered a probe of an earlier term with that probe's round
-number, so a delayed answer could confirm a later read of the same leader and return a stale value.
-The bug needs a delayed probe, a delayed answer and a change of leadership to line up, and the
-fuzzer did not find it in 1000 seeds even with long-tail delays. It is fixed and guarded by
-deterministic tests instead of a row in the table.
+Random fault injection has limits, and the project records them honestly. Code review found a bug
+in the first ReadIndex version: a follower answered a probe of an earlier term with that probe's
+round number, so a delayed answer could confirm a later read of the same leader and return a stale
+value. The bug needs a delayed probe, a delayed answer and a change of leadership to line up, and
+the fuzzer did not find it in 1000 seeds even with long-tail delays. It is fixed and guarded by
+deterministic tests instead of a row in the table. The same holds for two lease bugs: measuring the
+lease from when the acknowledgements arrive rather than when the round was sent, and letting
+followers vote inside a lease. Both need a narrow intersection of partitions, timeouts and client
+operations within one lease period, so deterministic tests guard them instead
+([`docs/mutation-table.md`](docs/mutation-table.md) has the details).
 
 ## Roadmap
 
@@ -309,7 +330,8 @@ deterministic tests instead of a row in the table.
   - [x] Linearizable reads that skip the log (ReadIndex, thesis §6.4)
   - [x] Snapshots and log compaction (§7)
   - [x] A run visualizer (`raftsim replay --svg`, a deterministic SVG timeline)
-  - [ ] Leader leases, cluster membership changes (§6), a real network runner
+  - [x] Leader leases (thesis §6.4.1), with the clock assumption broken on purpose in a test
+  - [ ] Cluster membership changes (§6), a real network runner
 
 ## Development
 
@@ -339,6 +361,7 @@ cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile figure8
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile reads
 cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile snapshots
+cargo run --release -p cli -- fuzz --seeds 0..1000 --threads 4 --profile leases
 ./scripts/check_mutations.sh
 ./scripts/check_timeline.sh
 ```

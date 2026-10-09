@@ -1,5 +1,5 @@
-//! Düğümün ayarları: seçim zaman aşımı ve heartbeat aralığı (tick cinsinden) ve bir AppendEntries
-//! mesajının taşıyabileceği en fazla girdi sayısı.
+//! Düğümün ayarları: seçim zaman aşımı ve heartbeat aralığı (tick cinsinden), bir AppendEntries
+//! mesajının taşıyabileceği en fazla girdi sayısı ve isteğe bağlı lider kiralaması (tezin §6.4.1).
 
 use std::num::NonZeroUsize;
 
@@ -19,6 +19,7 @@ pub struct Config {
     election_timeout: u64,
     heartbeat_interval: u64,
     max_entries: NonZeroUsize,
+    lease: Option<u64>,
 }
 
 impl Config {
@@ -50,7 +51,38 @@ impl Config {
             election_timeout,
             heartbeat_interval,
             max_entries: DEFAULT_MAX_ENTRIES,
+            lease: None,
         })
+    }
+
+    /// Lider kiralamasını açar (tezin §6.4.1): çoğunluğun onayladığı bir doğrulama turunun
+    /// GÖNDERİLDİĞİ andan sonraki `lease` tick boyunca lider, okumaları tur beklemeden cevaplar
+    /// (bkz. `Input::Read`, Q2). Kiralama açıkken takipçiler bir liderden haber aldıktan (ya da
+    /// açıldıktan) sonraki T tick boyunca bütün oy isteklerini yok sayar (§4.2.3): kiralamanın
+    /// güvenliği buna dayanır.
+    ///
+    /// Neden `lease < T`: onay veren her takipçi, liderden haber aldığı andan (≥ turun gönderimi)
+    /// sonraki T tick boyunca kimseye oy vermez; lider ise ancak liderliği bırakarak oy verebilir
+    /// ve bırakınca kiralaması biter. Yani lider kaldığı ve kiralaması sürdüğü sürece başka bir
+    /// lider yoktur. Aradaki `T - lease` tick, saatlerin hızları arasındaki sapmaya (drift) ayrılan
+    /// paydır: kiralama ancak saatler bir kiralama süresinde bu paydan fazla ayrışmıyorsa
+    /// güvenlidir.
+    ///
+    /// # Errors
+    ///
+    /// `lease` sıfırsa ya da seçim zaman aşımı tabanından (T) küçük değilse [`ConfigError`].
+    pub const fn with_lease(mut self, lease: u64) -> Result<Self, ConfigError> {
+        if lease == 0 {
+            return Err(ConfigError::ZeroLease);
+        }
+        if lease >= self.election_timeout {
+            return Err(ConfigError::LeaseNotBelowElectionTimeout {
+                lease,
+                election_timeout: self.election_timeout,
+            });
+        }
+        self.lease = Some(lease);
+        Ok(self)
     }
 
     /// Bir AppendEntries'in taşıyabileceği en fazla girdi sayısını değiştirir (varsayılan 64).
@@ -81,6 +113,12 @@ impl Config {
     pub const fn max_entries(&self) -> usize {
         self.max_entries.get()
     }
+
+    /// Lider kiralamasının süresi (tick); kiralama kapalıysa `None` (varsayılan).
+    #[must_use]
+    pub const fn lease(&self) -> Option<u64> {
+        self.lease
+    }
 }
 
 impl Default for Config {
@@ -91,6 +129,7 @@ impl Default for Config {
             election_timeout: 20,
             heartbeat_interval: 4,
             max_entries: DEFAULT_MAX_ENTRIES,
+            lease: None,
         }
     }
 }
@@ -112,6 +151,18 @@ pub enum ConfigError {
         /// Verilen heartbeat aralığı.
         heartbeat_interval: u64,
         /// Verilen seçim zaman aşımı tabanı.
+        election_timeout: u64,
+    },
+    /// Kiralama süresi sıfır: hiçbir okumayı kapsamayan bir kiralama anlamsızdır.
+    #[error("lease must be at least 1 tick")]
+    ZeroLease,
+    /// Kiralama, seçim zaman aşımı tabanından kısa değil: yeni bir lider, eskinin kiralaması
+    /// bitmeden seçilebilir (bkz. `Config::with_lease`).
+    #[error("lease ({}) must be below election_timeout ({})", .lease, .election_timeout)]
+    LeaseNotBelowElectionTimeout {
+        /// Verilen kiralama süresi.
+        lease: u64,
+        /// Seçim zaman aşımı tabanı.
         election_timeout: u64,
     },
 }
@@ -149,6 +200,35 @@ mod tests {
         assert_eq!(
             Config::new(default.election_timeout(), default.heartbeat_interval()),
             Ok(default)
+        );
+        assert_eq!(default.lease(), None, "leases are off by default");
+    }
+
+    // Kiralama, seçim zaman aşımı tabanının (T) altında ve sıfırdan büyük olmalıdır.
+    #[test]
+    fn leases_are_validated() {
+        let config = Config::default();
+        assert_eq!(config.with_lease(0), Err(ConfigError::ZeroLease));
+        assert_eq!(
+            config.with_lease(20),
+            Err(ConfigError::LeaseNotBelowElectionTimeout {
+                lease: 20,
+                election_timeout: 20
+            })
+        );
+        let leased = config.with_lease(19).expect("below T");
+        assert_eq!(leased.lease(), Some(19));
+        assert_eq!(
+            (leased.election_timeout(), leased.heartbeat_interval()),
+            (20, 4)
+        );
+        assert_eq!(
+            ConfigError::LeaseNotBelowElectionTimeout {
+                lease: 20,
+                election_timeout: 20
+            }
+            .to_string(),
+            "lease (20) must be below election_timeout (20)"
         );
     }
 }

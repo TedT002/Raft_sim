@@ -122,6 +122,11 @@ jobs:
         run: >-
           cargo run --release --locked -p cli --
           fuzz --seeds 0..1000 --threads 4 --profile snapshots
+      # Okumaların çoğu lider kiralamasıyla, doğrulama turu beklemeden cevaplanır (tezin §6.4.1).
+      - name: Fuzz 1000 seeds (leases profile)
+        run: >-
+          cargo run --release --locked -p cli --
+          fuzz --seeds 0..1000 --threads 4 --profile leases
 
   mutations:
     name: Mutations

@@ -191,6 +191,15 @@ pub enum TraceKind {
         /// Yeni ayarların özeti.
         digest: u64,
     },
+    /// Bir düğümün saati ileri sıçradı: düğüm aynı anda `ticks` ek tick aldı (ardından gelen `Tick`
+    /// kayıtları). Gerçek saatlerin sıçramasını ve sapmasını taklit eder (ör. bir NTP düzeltmesi
+    /// ya da duraklayıp devam eden bir sanal makine).
+    ClockJump {
+        /// Saati sıçrayan düğüm.
+        node: NodeId,
+        /// Ek tick sayısı.
+        ticks: u64,
+    },
 }
 
 /// Belirli bir zamanda gerçekleşen bir trace olayı.
@@ -314,6 +323,11 @@ impl TraceEvent {
                 hasher.write_u8(15);
                 hasher.write_u64(*digest);
             }
+            TraceKind::ClockJump { node, ticks } => {
+                hasher.write_u8(16);
+                hasher.write_u64(node.0);
+                hasher.write_u64(*ticks);
+            }
         }
     }
 }
@@ -429,6 +443,8 @@ mod tests {
             TraceKind::Reply { node, digest: 1 },
             TraceKind::Network { digest: 1 },
             TraceKind::Network { digest: 2 },
+            TraceKind::ClockJump { node, ticks: 1 },
+            TraceKind::ClockJump { node, ticks: 2 },
         ];
         let count = kinds.len();
         let mut hashes: Vec<u64> = kinds

@@ -87,7 +87,7 @@ fn invalid_arguments_exit_with_code_2() {
 
 // Bir seed aralığı taranır; hepsi geçer ve özet satırı sayıları verir. Çıktı iş parçacığı
 // sayısından bağımsızdır: her koşu yalnızca seed'ine bağlıdır ve sonuçlar seed sırasıyla yazılır.
-// Diğer profiller (figure8, reads, snapshots) de taranır.
+// Diğer profiller (figure8, reads, snapshots, leases) de taranır.
 #[test]
 fn fuzz_reports_a_passing_range_independently_of_threads() {
     let single = raftsim(&["fuzz", "--seeds", "0..4", "--threads", "1"]);
@@ -98,7 +98,7 @@ fn fuzz_reports_a_passing_range_independently_of_threads() {
     );
     let parallel = raftsim(&["fuzz", "--seeds", "0..4", "--threads", "3"]);
     assert_eq!(stdout(&parallel), stdout(&single));
-    for profile in ["figure8", "reads", "snapshots"] {
+    for profile in ["figure8", "reads", "snapshots", "leases"] {
         let other = raftsim(&["fuzz", "--seeds", "0..4", "--profile", profile]);
         assert!(other.status.success(), "{profile}: {}", stdout(&other));
         assert_eq!(

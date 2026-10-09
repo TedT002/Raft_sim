@@ -5,9 +5,10 @@
 //! istemci arayüzünün çekirdekteki kısmı (§8): lider olmayan düğümün `NotLeader { hint }` cevabı ve
 //! yeni liderin term başında eklediği no-op girdi. Tekrarlanan isteklerin ayıklanması (aynı
 //! `(client_id, seq)`'in bir kez uygulanması) durum makinesinin işidir: komutlar çekirdek için
-//! opaktır (C1). Okumalar log'a yazılmadan da cevaplanabilir (ReadIndex, tezin §6.4'ü; Q1). Log,
-//! durum makinesinin snapshot'ıyla sıkıştırılabilir; log'unda olmayan girdilere ihtiyacı olan bir
-//! takipçiye lider snapshot'ı gönderir (§7, Figure 13; P1).
+//! opaktır (C1). Okumalar log'a yazılmadan da cevaplanabilir (ReadIndex, tezin §6.4'ü; Q1); lider
+//! kiralaması açıksa tur da beklenmez (tezin §6.4.1; Q2). Log, durum makinesinin snapshot'ıyla
+//! sıkıştırılabilir; log'unda olmayan girdilere ihtiyacı olan bir takipçiye lider snapshot'ı
+//! gönderir (§7, Figure 13; P1).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,7 +51,8 @@ struct PendingRead {
     id: ReadId,
     /// Okumayı onaylayabilecek ilk doğrulama turu: okuma geldikten SONRA başlatılan tur. Daha
     /// önce başlamış bir turun onayı, okuma gelmeden önceki bir anı anlatır; o anla okumanın
-    /// gelişi arasında yeni bir lider seçilip yazma tamamlamış olabilir.
+    /// gelişi arasında yeni bir lider seçilip yazma tamamlamış olabilir. 0: liderlik, okuma
+    /// geldiği anda geçerli olan kiralamayla zaten doğrulandı (Q2); tur beklenmez.
     round: u64,
     /// Okumanın `readIndex`'i: liderin kendi term'inden bir girdiyi commit ettiği andaki (ya da
     /// sonraki) commitIndex'i; o ana kadar `None`.
@@ -120,6 +122,18 @@ pub struct RaftNode {
     // Bu adımda liderden kurulan snapshot: sürücü durum makinesini onunla değiştirir
     // (`Output::Restore`).
     restored: Option<Snapshot>,
+    // Düğümün kendi saati: açılıştan bu yana aldığı tick sayısı. Yalnızca lider kiralamasının
+    // (tezin §6.4.1) zamanlaması içindir; geçicidir.
+    clock: u64,
+    // Bir liderden (bu term'in liderinin AppendEntries'i, doğrulama turu ya da snapshot'ı) son
+    // haber alındığından ya da açılıştan bu yana geçen tick sayısı. Kiralama açıkken bu süre T'den
+    // kısaysa takipçi daha yüksek term'li oy isteklerini yok sayar (§4.2.3; bkz. `guards_lease`).
+    contact_elapsed: u64,
+    // Kiralama: bu liderlikte gönderilmiş ama henüz çoğunlukça onaylanmamış doğrulama turlarının
+    // gönderim anları (`clock`) ve kiralamanın bittiği an (`clock < lease_until` iken geçerli).
+    // BTreeMap: turlar numara sırasıyla budanır.
+    probe_sent: BTreeMap<u64, u64>,
+    lease_until: u64,
 }
 
 impl RaftNode {
@@ -187,6 +201,12 @@ impl RaftNode {
             probe_round: 0,
             pending_reads: Vec::new(),
             restored: None,
+            clock: 0,
+            // Açılış, bir liderden haber almak gibi sayılır: düğüm çökmeden hemen önce bir liderin
+            // turunu onaylamış olabilir ve o liderin kiralaması hâlâ sürüyor olabilir (§4.2.3).
+            contact_elapsed: 0,
+            probe_sent: BTreeMap::new(),
+            lease_until: 0,
         }
     }
 
@@ -360,16 +380,24 @@ impl RaftNode {
 
     /// Mantıksal zaman bir tick ilerledi.
     fn on_tick(&mut self, outbox: &mut Outbox) {
+        self.clock = self.clock.saturating_add(1);
+        self.contact_elapsed = self.contact_elapsed.saturating_add(1);
         match self.role {
             Role::Leader => {
                 self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(1);
                 if self.heartbeat_elapsed >= self.config.heartbeat_interval() {
                     self.broadcast_append_entries(outbox);
-                    // Onaylanmamış bir okuma varsa doğrulama turu heartbeat'le yenilenir: tur
-                    // mesajları ya da cevapları kaybolmuş olabilir. Daha sonraki bir turun onayı
-                    // da okumayı onaylar (o tur da okumadan sonra başladı). Bekleyen okuma yoksa
-                    // hiçbir şey hesaplanmaz: okumasız koşular bu yolun bedelini ödemez.
-                    if !self.pending_reads.is_empty() {
+                    if self.config.lease().is_some() {
+                        // Kiralama açıksa her heartbeat bir doğrulama turudur: çoğunluğun onayı
+                        // kiralamayı turun gönderim anından itibaren uzatır (`extend_lease`) ve
+                        // bekleyen okumaları da onaylar.
+                        self.start_probe_round(outbox);
+                    } else if !self.pending_reads.is_empty() {
+                        // Onaylanmamış bir okuma varsa doğrulama turu heartbeat'le yenilenir: tur
+                        // mesajları ya da cevapları kaybolmuş olabilir. Daha sonraki bir turun
+                        // onayı da okumayı onaylar (o tur da okumadan sonra başladı). Bekleyen
+                        // okuma yoksa hiçbir şey hesaplanmaz: okumasız koşular bu yolun bedelini
+                        // ödemez.
                         let confirmed = self.confirmed_round();
                         if self.pending_reads.iter().any(|read| read.round > confirmed) {
                             self.start_probe_round(outbox);
@@ -449,8 +477,11 @@ impl RaftNode {
             .collect();
         // Doğrulama turları liderlik başına 1'den sayılır. Eski bir liderliğin turlarına verilen
         // cevaplar ya term denetiminde elenir ya da, cevaplayan o an başka bir term'deyse, tur 0
-        // taşır ve hiçbir okumayı onaylamaz (bkz. `on_probe`).
+        // taşır ve hiçbir okumayı onaylamaz (bkz. `on_probe`). Kiralama da liderlikle başlar:
+        // önceki bir liderliğin kiralaması bu liderliğe taşınmaz.
         self.probe_round = 0;
+        self.probe_sent.clear();
+        self.lease_until = 0;
         // §8: yeni lider term'inin başında log'una bir no-op girdi ekler. Neden: lider önceki
         // term'lerin girdilerini kopyalarını sayarak commit edemez (§5.4.2); onlar ancak liderin
         // kendi term'inden bir girdi commit edilince dolaylı olarak commit olur. İstemci komutu
@@ -470,6 +501,11 @@ impl RaftNode {
         // liderliği öğrenip Follower'a döner, takipçiler de yeni seçim başlatmaz. Bu ilk mesaj
         // no-op girdiyi de taşır.
         self.broadcast_append_entries(outbox);
+        // Kiralama açıksa ilk doğrulama turu da hemen başlar: kiralama, no-op'un commit'iyle aynı
+        // gidiş-dönüşte kurulur ve ilk okumalar bir heartbeat aralığı beklemez.
+        if self.config.lease().is_some() {
+            self.start_probe_round(outbox);
+        }
     }
 
     /// Bütün eşlere AppendEntries gönderir ve heartbeat sayacını sıfırlar. Her mesaj, o takipçinin
@@ -547,8 +583,9 @@ impl RaftNode {
     }
 
     /// Bir okuma isteği geldi (ReadIndex, tezin §6.4'ü; Q1). Lider olmayan düğüm hemen `NotLeader`
-    /// döner. Lider okumayı bekletir ve liderliğini doğrulayacak yeni bir tur başlatır; okuma
-    /// `settle_reads`'te sonuçlanır.
+    /// döner. Kiralaması geçerli olan lider okumanın `readIndex`'ini hemen belirler (Q2); değilse
+    /// okumayı bekletir ve liderliğini doğrulayacak yeni bir tur başlatır. Okuma `settle_reads`'te
+    /// sonuçlanır.
     fn on_read(&mut self, id: ReadId, outbox: &mut Outbox) -> Option<Output> {
         if self.role != Role::Leader {
             return Some(Output::Read {
@@ -557,6 +594,20 @@ impl RaftNode {
                     hint: self.leader_id,
                 },
             });
+        }
+        // Q2, tezin §6.4.1: kiralama geçerliyse okuma geldiği anda başka bir lider yoktur (bkz.
+        // `extend_lease`); kendi term'inden bir girdiyi commit etmiş liderin commitIndex'i, okuma
+        // gelmeden önce tamamlanmış her yazmayı kapsar. Okuma bir tur beklemeden bu `readIndex`'e
+        // kadar uygulanmış durumdan cevaplanabilir: doğrulama, okumanın geldiği âna aittir.
+        if self.lease_valid()
+            && let Some(read_index) = self.term_commit_index()
+        {
+            self.pending_reads.push(PendingRead {
+                id,
+                round: 0,
+                read_index: Some(read_index),
+            });
+            return None;
         }
         // Lider kendini lider sanıyor, ama daha yüksek bir term'de yeni bir lider seçilmiş ve
         // yazmalar tamamlamış olabilir (ör. lider azınlıkta kaldıysa). Bu yüzden okuma ancak
@@ -601,7 +652,70 @@ impl RaftNode {
         for &peer in &self.peers {
             outbox.push((peer, Message::Probe(probe.clone())));
         }
+        if self.config.lease().is_some() {
+            self.probe_sent.insert(self.probe_round, self.clock);
+            // Tek düğümlü kümede tur başladığı anda çoğunlukça onaylıdır.
+            self.extend_lease();
+        }
         self.probe_round
+    }
+
+    /// Kiralamayı uzatır (tezin §6.4.1): çoğunluğun onayladığı en yüksek turun GÖNDERİLDİĞİ andan
+    /// itibaren `lease` tick.
+    ///
+    /// Neden bu kiralama güvenli: turu onaylayan her takipçi onu gönderimden SONRA aldı ve o andan
+    /// sonraki T tick boyunca hiçbir oy isteğine oy vermez (`guards_lease`). Yeni bir lider bir
+    /// çoğunluğun oyunu ister ve iki çoğunluk kesişir. Kesişimdeki düğüm ya korumalı bir
+    /// takipçidir, ya da bu liderin kendisidir; lider korunmaz (bir oy isteği onu devirebilir), ama
+    /// oy vermeden önce liderliği bırakmak zorundadır ve bırakınca kiralaması biter
+    /// (`lease_valid`). Yani bu düğüm lider kaldıkça ve `clock < lease_until` oldukça başka bir
+    /// lider yoktur: kiralama `lease < T` tick sürer, korumalı takipçiler ise en erken turun
+    /// gönderiminden T tick sonra oy verebilir. Neden gönderim anı: onayın lidere ulaştığı an
+    /// gönderimden bir gidiş-dönüş sonradır; ondan ölçülen bir kiralama, uzun gecikmeli bir
+    /// onayla, korumaların bittiği âna taşabilirdi.
+    ///
+    /// Kiralamayı onayın geldiği andan ölçen bir hatayı rastgele tarama bulamadı (bkz.
+    /// `docs/mutation-table.md`): onu `a_lease_runs_from_the_send_of_the_confirmed_round` ve
+    /// kiralamalı sözleşme testi korur.
+    fn extend_lease(&mut self) {
+        let Some(lease) = self.config.lease() else {
+            return;
+        };
+        let confirmed = self.confirmed_round();
+        let Some(&sent) = self.probe_sent.get(&confirmed) else {
+            return;
+        };
+        self.lease_until = self.lease_until.max(sent.saturating_add(lease));
+        // Onaylanan tur ve öncekiler artık kiralamayı uzatamaz: onaylanan tur yalnızca ileri gider,
+        // sonraki uzatmalar daha yeni turlardan gelir.
+        self.probe_sent = self.probe_sent.split_off(&confirmed.saturating_add(1));
+    }
+
+    /// Kiralama geçerli mi (Q2)? Yalnızca kiralama açık bir liderde ve onaylanmış son turun
+    /// gönderiminden bu yana `lease` tick geçmemişken.
+    fn lease_valid(&self) -> bool {
+        self.role == Role::Leader && self.config.lease().is_some() && self.clock < self.lease_until
+    }
+
+    /// Bu takipçi bir liderin kiralamasını korumak için oy isteklerini yok sayıyor mu (§4.2.3,
+    /// tezin §6.4.1)? Kiralama açıkken, bir liderden haber aldıktan ya da açıldıktan sonraki T
+    /// tick boyunca evet. Koruma HER oy isteğine uygulanır, term'i ne olursa olsun: takipçi daha
+    /// yüksek bir term'i başka bir mesajdan (ör. bir cevaptan) benimsemiş olabilir ve o term'in
+    /// adayından gelen istek artık "daha yüksek term'li" görünmez. Neden açılış da: düğüm
+    /// çökmeden hemen önce bir turu onaylamış olabilir; çökme onun "liderden haber aldım"
+    /// bilgisini silse de liderin kiralaması o onaya dayanmaya devam eder. Lider korunmaz
+    /// (bilinçli: etcd'nin aksine): onu devirmek kiralamasını da bitirir, güvenliği bozmaz; bedeli
+    /// yalnızca erişilebilirliktir.
+    ///
+    /// Korumasız bir takipçi, kiralaması süren bir liderin yanında yeni bir lider seçtirebilir. Bu
+    /// hatayı da rastgele tarama bulamadı (bkz. `docs/mutation-table.md`): onu
+    /// `followers_ignore_vote_requests_while_a_lease_may_last`,
+    /// `a_restarted_follower_waits_before_voting_while_leases_are_on` ve kiralamalı sözleşme testi
+    /// korur.
+    fn guards_lease(&self) -> bool {
+        self.config.lease().is_some()
+            && self.role == Role::Follower
+            && self.contact_elapsed < self.config.election_timeout()
     }
 
     /// Çoğunluğun (lider dahil) onayladığı en yüksek doğrulama turu. Lider başlattığı her turu
@@ -627,9 +741,13 @@ impl RaftNode {
     ///   `NotLeader` ile biter: liderliği doğrulanamaz ve istemci başka bir düğüme gitmelidir.
     /// - Lider kendi term'inden bir girdiyi commit ettiyse `readIndex`'i henüz belli olmayan
     ///   okumalar o anki commitIndex'i alır.
-    /// - Okuma geldikten sonra başlatılan bir tur çoğunlukça onaylandıysa ve durum makinesi
-    ///   `readIndex`'e kadar uygulandıysa okuma `Ready` olur. Okumalar geliş sırasıyla hazır olur:
-    ///   sonra gelenin turu ve `readIndex`'i öncekininkinden küçük olamaz.
+    /// - Okuma geldikten sonra başlatılan bir tur çoğunlukça onaylandıysa (ya da okuma kiralamayla
+    ///   kabul edildiyse ya da kiralama şu an geçerliyse, Q2) ve durum makinesi `readIndex`'e kadar
+    ///   uygulandıysa okuma `Ready` olur.
+    ///   Tur bekleyen okumalar geliş sırasıyla hazır olur: sonra gelenin turu ve `readIndex`'i
+    ///   öncekininkinden küçük olamaz. Kiralamayla kabul edilen bir okuma, kendisinden önce gelmiş
+    ///   ve hâlâ tur bekleyen bir okumadan önce hazır olabilir; ikisi de okumanın aralığı içinde
+    ///   doğrulandığı için sonuç yine doğrusaldır.
     fn settle_reads(&mut self) -> Vec<Output> {
         if self.pending_reads.is_empty() {
             return Vec::new();
@@ -651,6 +769,10 @@ impl RaftNode {
             }
         }
         let confirmed = self.confirmed_round();
+        // Q2: kiralama ŞU AN geçerliyse ve lider kendi term'inden bir girdiyi commit ettiyse şu an
+        // başka bir lider yoktur ve uygulanmış durum, şu ana kadar tamamlanmış her yazmayı içerir:
+        // tur bekleyen okumalar da şimdi cevaplanabilir (okuma şu âna yerleştirilir).
+        let leased = self.lease_valid() && self.term_commit_index().is_some();
         let last_applied = self.last_applied;
         let mut ready = Vec::new();
         self.pending_reads.retain(|read| {
@@ -658,7 +780,7 @@ impl RaftNode {
             // kalmış eski bir lider, çoğunluk tarafında tamamlanmış yazmaları görmeden okuma
             // cevaplar.
             let confirmed =
-                read.round <= confirmed || cfg!(feature = "mutation-read-without-quorum");
+                read.round <= confirmed || leased || cfg!(feature = "mutation-read-without-quorum");
             let applied = read.read_index.is_some_and(|index| index <= last_applied);
             if confirmed && applied {
                 ready.push(Output::Read {
@@ -678,6 +800,16 @@ impl RaftNode {
         // benimsenseydi küme dışından biri liderleri devirebilirdi. Üyelik değişikliği (§6) Faz
         // 6'nın kapsamıdır.
         if !self.peers.contains(&from) {
+            return;
+        }
+        // §4.2.3, tezin §6.4.1: kiralama açıkken, bir liderden haber aldıktan (ya da açıldıktan)
+        // sonraki T tick içinde gelen HER oy isteği bütünüyle yok sayılır: term benimsenmez, oy
+        // verilmez, cevap gönderilmez. Liderin kiralaması, onu onaylayan her takipçinin bu süre
+        // boyunca kimseye oy vermemesine dayanır (bkz. `extend_lease`). Yalnızca daha yüksek
+        // term'li istekler yok sayılsaydı koruma dolanılabilirdi: takipçi o term'i önce başka bir
+        // mesajdan benimser, adayın isteği sonra gelir ve artık aynı term'dedir. T1'in `Restart`
+        // dışındaki tek istisnası budur ve yalnızca kiralama açıkken geçerlidir.
+        if matches!(msg, Message::RequestVote(_)) && self.guards_lease() {
             return;
         }
         // T1, Figure 2 ("All Servers"): RPC isteği ya da cevabı daha yüksek bir term taşıyorsa,
@@ -1034,6 +1166,8 @@ impl RaftNode {
         self.votes.clear();
         self.leader_id = Some(leader);
         self.reset_election_timer();
+        // Kiralama açıkken bundan sonraki T tick boyunca oy istekleri yok sayılır (`guards_lease`).
+        self.contact_elapsed = 0;
     }
 
     /// `Probe` cevabını işler: takipçinin onayladığı en yüksek turu günceller.
@@ -1052,6 +1186,7 @@ impl RaftNode {
             // Yalnızca ileri gider: geciken eski bir cevap onayı geri almaz.
             progress.probe_round = progress.probe_round.max(response.round);
         }
+        self.extend_lease();
     }
 
     /// Liderin commitIndex'ini ilerletir (Figure 2, Leaders; §5.3, §5.4.2).
@@ -2649,6 +2784,172 @@ mod tests {
         rng.next_u64() % n
     }
 
+    /// Kiralamalı ayarlar (tezin §6.4.1): T = 20, heartbeat = 4, kiralama 16 tick.
+    fn leased_config() -> Config {
+        Config::default().with_lease(16).expect("below T")
+    }
+
+    /// Kiralamalı bir küme düğümü.
+    fn leased_node(id: u64, cluster: &[u64], seed: u64) -> RaftNode {
+        RaftNode::new(NodeId(id), ids(cluster), leased_config(), seed_bytes(seed))
+    }
+
+    /// Kiralamalı bir lider ve seçildiği andaki saati: seçim adımında AppendEntries'le birlikte ilk
+    /// doğrulama turu da gönderilir (tur 1).
+    fn leased_leader(id: u64, cluster: &[u64], seed: u64) -> (RaftNode, u64) {
+        let mut node = leased_node(id, cluster, seed);
+        let (ticks, _) = tick_until_output(&mut node);
+        for &peer in cluster.iter().filter(|&&peer| peer != id) {
+            if node.role() == Role::Leader {
+                break;
+            }
+            let outputs = node.step(message(peer, vote(1, true)));
+            if node.role() == Role::Leader {
+                assert!(
+                    outputs.contains(&send(peer, probe(1, 1))),
+                    "Q2: a leased leader starts its first round when it is elected"
+                );
+            }
+        }
+        assert_eq!(node.role(), Role::Leader);
+        (node, ticks)
+    }
+
+    fn tick_n(node: &mut RaftNode, ticks: u64) {
+        for _ in 0..ticks {
+            let _ = node.step(Input::Tick);
+        }
+    }
+
+    // Q2 (tezin §6.4.1): no-op'u commit edilmiş ve bir turu çoğunlukça onaylanmış (lider + bir
+    // eş, üç düğümde) lider, okumayı tur başlatmadan, geldiği adımda cevaplar. Kiralamasız aynı
+    // lider bir tur başlatırdı (bkz. Q1 testleri).
+    #[test]
+    fn a_leased_leader_answers_reads_without_a_round() {
+        let (mut node, _) = leased_leader(1, &[1, 2, 3], 60);
+        let _ = node.step(message(2, append_reply(1, true, 1)));
+        assert_eq!(node.commit_index(), LogIndex(1), "the no-op is committed");
+        assert!(node.step(message(2, probe_reply(1, 1))).is_empty());
+        let log = node.log().to_vec();
+        assert_eq!(node.step(read(1)), vec![ready(1)]);
+        assert_eq!(node.log(), log.as_slice(), "a read never touches the log");
+    }
+
+    // Kiralama, onaylanan turun GÖNDERİLDİĞİ andan `lease` tick sürer; onayın ne zaman geldiği
+    // önemli değildir. Tur 1 seçimde (saat s) gönderildi, onayı 10 tick sonra geliyor: kiralama
+    // yine s + 16'da biter. s + 15'te okuma hemen cevaplanır; s + 16'da kiralama dolmuştur ve
+    // okuma yeni bir tur başlatır (Q1). O turun onayı okumayı cevaplatır ve kiralamayı yeniler.
+    #[test]
+    fn a_lease_runs_from_the_send_of_the_confirmed_round() {
+        let (mut node, _) = leased_leader(1, &[1, 2, 3], 61);
+        let _ = node.step(message(2, append_reply(1, true, 1)));
+        tick_n(&mut node, 10);
+        let _ = node.step(message(3, probe_reply(1, 1)));
+        tick_n(&mut node, 5);
+        assert_eq!(
+            node.step(read(1)),
+            vec![ready(1)],
+            "15 ticks after the send"
+        );
+        tick_n(&mut node, 1);
+        let outputs = node.step(read(2));
+        let round = node.probe_round;
+        assert_eq!(
+            outputs,
+            vec![send(2, probe(1, round)), send(3, probe(1, round))],
+            "16 ticks after the send the lease is over: the read starts a round"
+        );
+        assert_eq!(node.step(message(2, probe_reply(1, round))), vec![ready(2)]);
+        assert_eq!(
+            node.step(read(3)),
+            vec![ready(3)],
+            "the confirmed round renews the lease"
+        );
+    }
+
+    // Kiralama yalnızca kendi term'inden bir girdiyi commit etmiş lidere okuma cevaplatır: no-op
+    // commit edilmeden önce tur onaylı olsa da okuma bekler ve no-op commit edilince cevaplanır.
+    #[test]
+    fn a_lease_waits_for_the_first_commit_of_the_leaders_term() {
+        let (mut node, _) = leased_leader(1, &[1, 2, 3], 62);
+        let _ = node.step(message(2, probe_reply(1, 1)));
+        let outputs = node.step(read(1));
+        assert!(
+            !outputs.contains(&ready(1)),
+            "nothing of term 1 is committed yet: {outputs:?}"
+        );
+        let outputs = node.step(message(3, append_reply(1, true, 1)));
+        assert!(outputs.contains(&ready(1)), "{outputs:?}");
+    }
+
+    // §4.2.3: kiralama açıkken, bir liderden haber aldıktan sonraki T tick boyunca daha yüksek
+    // term'li bir oy isteği bütünüyle yok sayılır (term benimsenmez, oy ve cevap yok); T tick
+    // geçtikten sonra aynı istek T1'e göre işlenir. Kiralamasız bir takipçi isteği hemen işler.
+    #[test]
+    fn followers_ignore_vote_requests_while_a_lease_may_last() {
+        let mut follower = leased_node(1, &[1, 2, 3], 63);
+        let _ = follower.step(message(2, heartbeat(1)));
+        tick_n(&mut follower, T - 1);
+        assert!(follower.step(message(3, request_vote(5))).is_empty());
+        assert_eq!(
+            follower.current_term(),
+            Term(1),
+            "the higher term is not adopted"
+        );
+        tick_n(&mut follower, 1);
+        let outputs = follower.step(message(3, request_vote(5)));
+        assert_eq!(
+            follower.current_term(),
+            Term(5),
+            "T ticks later the request is handled"
+        );
+        assert!(!outputs.is_empty(), "{outputs:?}");
+
+        let mut plain = node(1, &[1, 2, 3], 63);
+        let _ = plain.step(message(2, heartbeat(1)));
+        let _ = plain.step(message(3, request_vote(5)));
+        assert_eq!(
+            plain.current_term(),
+            Term(5),
+            "without a lease the request is handled at once"
+        );
+    }
+
+    // §4.2.3'ün dolanılmaması: koruma aynı term'li oy isteklerine de uygulanır. Takipçi daha
+    // yüksek bir term'i bir cevaptan benimser; o term'in adayından gelen istek artık "daha yüksek
+    // term'li" değildir, ama liderden haber alalı T tick geçmediği için yine yok sayılır.
+    #[test]
+    fn the_vote_guard_also_covers_requests_of_the_current_term() {
+        let mut follower = leased_node(1, &[1, 2, 3], 65);
+        let _ = follower.step(message(2, heartbeat(1)));
+        let _ = follower.step(message(3, vote(2, false)));
+        assert_eq!(
+            follower.current_term(),
+            Term(2),
+            "a response raised the term"
+        );
+        assert!(
+            follower.step(message(3, request_vote(2))).is_empty(),
+            "no vote within T ticks of hearing from a leader"
+        );
+        assert_eq!(follower.voted_for(), None);
+    }
+
+    // §4.2.3: yeniden açılış da bir liderden haber almak gibi sayılır. Düğüm çökmeden hemen önce
+    // bir liderin turunu onaylamış olabilir; çöküp hemen kalkan düğüm o liderin kiralaması
+    // sürerken başka bir adaya oy verseydi, iki lider aynı anda okuma cevaplayabilirdi.
+    #[test]
+    fn a_restarted_follower_waits_before_voting_while_leases_are_on() {
+        let mut node = leased_node(1, &[1, 2, 3], 64);
+        let disk = PersistentState {
+            current_term: Term(3),
+            ..PersistentState::default()
+        };
+        assert!(node.step(Input::Restart(disk)).is_empty());
+        assert!(node.step(message(2, request_vote(4))).is_empty());
+        assert_eq!(node.current_term(), Term(3));
+    }
+
     /// Rastgele bir girdi. Tick ağırlıklıdır (zaman aşımları ve heartbeat'ler gerçekten
     /// tetiklensin). Mesajların göndericisi 1..=5'tir: düğümün kendisi (1) ve yapılandırma dışı 5
     /// dahil. Term'ler düğümün term'i civarındadır (bir eksik, aynı, bir fazla); aynı term daha
@@ -2671,6 +2972,24 @@ mod tests {
         if node.role() == Role::Leader && below(rng, 8) == 0 {
             *next_read += 1;
             return Input::Read(ReadId(*next_read));
+        }
+        // Kiralamalı bir liderde son tura onaylar ve okumalar daha da sık üretilir: kiralama ancak
+        // çoğunluk yakın bir turu onaylayınca kurulur ve okuma onun birkaç tick'lik süresine
+        // düşmelidir (Q2'nin kiralama tarafı). Kiralamasız düğümde bu dal rastgele sayı çekmez:
+        // kiralamasız dizilerin girdileri değişmez.
+        if node.role() == Role::Leader && node.config().lease().is_some() && below(rng, 3) == 0 {
+            if below(rng, 2) == 0 {
+                *next_read += 1;
+                return Input::Read(ReadId(*next_read));
+            }
+            let msg = Message::ProbeResponse(ProbeResponse {
+                term: node.current_term(),
+                round: node.probe_round,
+            });
+            return Input::Message {
+                from: NodeId(2 + below(rng, 3)),
+                msg,
+            };
         }
         match below(rng, 22) {
             0..=8 => Input::Tick,
@@ -2804,10 +3123,30 @@ mod tests {
         }
     }
 
-    // Sözleşme testi: 300 rastgele girdi dizisinin (her biri 300 adım) her adımından sonra `step`
-    // sözleşmesi denetlenir. Test bir sürücü gibi davranır: her `Persist` farkını "diskine" uygular
-    // ve `Restart`'ta diski geri verir. Kısa bir zaman aşımı (T = 4, heartbeat = 2) kullanılır:
-    // seçimler birkaç tick'te başlasın ve bir dizide rol geçişleri sık görülsün. Denetlenenler:
+    /// Sözleşme denetiminin kapsama sayaçları: denetimin sözleşmenin her tarafını gerçekten
+    /// sınadığını göstermek için (bkz. iki sözleşme testinin eşikleri).
+    #[derive(Debug, Default)]
+    struct Coverage {
+        elections_won: u32,
+        votes_granted: u32,
+        entries_applied: u32,
+        truncations: u32,
+        not_leader_answers: u32,
+        reads_ready: u32,
+        lease_reads: u32,
+        reads_rejected: u32,
+        stale_probes_answered: u32,
+        compactions: u32,
+        restores: u32,
+        snapshots_sent: u32,
+        votes_ignored: u32,
+    }
+
+    // Sözleşme denetimi: 300 rastgele girdi dizisinin (her biri 300 adım) her adımından sonra
+    // `step` sözleşmesi denetlenir. Denetim bir sürücü gibi davranır: her `Persist` farkını
+    // "diskine" uygular ve `Restart`'ta diski geri verir. Kısa bir zaman aşımı (T = 4, heartbeat =
+    // 2) kullanılır: seçimler birkaç tick'te başlasın ve bir dizide rol geçişleri sık görülsün. İki
+    // ayarla koşar: kiralamasız ve kiralamalı (Q2). Denetlenenler:
     // - hiçbir girdi panik attırmaz (N3);
     // - kalıcı durum değiştiyse İLK çıktı TEK bir `Persist`'tir ve farkı diske uygulamak tam olarak
     //   bellekteki durumu verir; değişmediyse hiç `Persist` yoktur (O2);
@@ -2818,6 +3157,12 @@ mod tests {
     //   liderden, kendi term'inden bir girdiyi commit etmişken ve okuma geldikten sonra başlattığı
     //   turu çoğunluk onayladıktan sonra çıkar; liderliğini bırakan düğümün bekleyen okuması
     //   kalmaz; doğrulama turları birer birer artar;
+    // - Q2 (kiralama açıkken): lider okumayı tur başlatmadan ancak ve ancak, sürücünün gözlediği
+    //   gönderim anları, onaylar ve tick'lerden hesapladığı kiralama okumanın geldiği anda
+    //   geçerliyse ve kendi term'inden bir girdiyi commit etmişse kabul eder; bir takipçi, bir
+    //   liderden son haber aldığından (ya da açıldığından) bu yana T tick geçmeden gelen HER oy
+    //   isteğini, term'i ne olursa olsun, bütünüyle yok sayar (§4.2.3); geçtikten sonra daha
+    //   yüksek bir term'i benimser;
     // - S1: istemci isteğine lider olmayan düğüm log'unu değiştirmeden tek bir `NotLeader` ile
     //   (ipucu bildiği lider) cevap verir; lider cevap vermez; cevap başka hiçbir adımda çıkmaz;
     // - S2: lider olan düğümün log'unun sonunda kendi term'inden bir no-op girdi vardır;
@@ -2836,25 +3181,14 @@ mod tests {
     // Kapsama: her girdi ve mesaj varyantı üretilmeli, her role ulaşılmalı; seçim kazanma, oy
     // verme, uygulama ve log kesme yeterince sık görülmeli. Aksi hâlde test, sözleşmenin bir
     // kısmını hiç sınamadan geçerdi.
-    #[test]
-    fn random_inputs_preserve_the_step_contract() {
+    fn check_step_contract(config: Config) -> Coverage {
         let mut inputs_seen = BTreeSet::new();
         let mut messages_seen = BTreeSet::new();
         let mut roles_seen = BTreeSet::new();
-        let mut votes_granted = 0_u32;
-        let mut elections_won = 0_u32;
-        let mut entries_applied = 0_u32;
-        let mut truncations = 0_u32;
-        let mut not_leader_answers = 0_u32;
-        let mut reads_ready = 0_u32;
-        let mut reads_rejected = 0_u32;
-        let mut stale_probes_answered = 0_u32;
-        let mut compactions = 0_u32;
-        let mut restores = 0_u32;
-        let mut snapshots_sent = 0_u32;
+        let mut coverage = Coverage::default();
+        let lease = config.lease();
         for seed in 0..300 {
             let mut rng = ChaCha8Rng::from_seed(seed_bytes(1_000 + seed));
-            let config = Config::new(4, 2).expect("valid config");
             let mut node = RaftNode::new(NodeId(1), ids(&[1, 2, 3, 4]), config, seed_bytes(seed));
             let mut disk = PersistentState::default();
             // Q1'in sürücü tarafı: cevap bekleyen okumalar (okuma → onu onaylayabilecek ilk tur),
@@ -2863,6 +3197,13 @@ mod tests {
             let mut waiting: BTreeMap<ReadId, u64> = BTreeMap::new();
             let mut last_round = 0_u64;
             let mut acked: BTreeMap<NodeId, u64> = BTreeMap::new();
+            // Q2'nin sürücü tarafı (yalnızca kiralama açıkken kullanılır): düğümün tick sayısı, bu
+            // liderlikte turların gönderildiği anlar, bunlardan ve onaylardan hesaplanan kiralama
+            // sonu ve liderden son haber alındığından (ya da açılıştan) bu yana geçen tick'ler.
+            let mut clock = 0_u64;
+            let mut sent_at: BTreeMap<u64, u64> = BTreeMap::new();
+            let mut lease_until = 0_u64;
+            let mut contact = 0_u64;
             for _ in 0..300 {
                 let input = random_input(&mut rng, &node, &disk, &mut next_read);
                 inputs_seen.insert(input_name(&input));
@@ -2902,6 +3243,31 @@ mod tests {
                     } => Some(input.clone()),
                     _ => None,
                 };
+                // Bir liderden haber getiren mesaj (AppendEntries, doğrulama turu ya da snapshot)
+                // ve bir oy isteği: §4.2.3'ün sürücü tarafı.
+                let leader_message = match &input {
+                    Input::Message {
+                        from,
+                        msg:
+                            msg @ (Message::AppendEntries(_)
+                            | Message::Probe(_)
+                            | Message::InstallSnapshot(_)),
+                    } => Some((*from, msg.term())),
+                    _ => None,
+                };
+                let vote_request = match &input {
+                    Input::Message {
+                        from,
+                        msg: Message::RequestVote(request),
+                    } => Some((*from, request.term)),
+                    _ => None,
+                };
+                if tick {
+                    clock += 1;
+                    contact += 1;
+                }
+                let contact_before = contact;
+                let role_before = node.role();
                 let before = node.persistent_state();
                 let was_leader = node.role() == Role::Leader;
                 let term_before = node.current_term();
@@ -2911,7 +3277,7 @@ mod tests {
                 let after = node.persistent_state();
                 roles_seen.insert(node.role());
                 if !was_leader && node.role() == Role::Leader {
-                    elections_won += 1;
+                    coverage.elections_won += 1;
                     assert_eq!(
                         node.log().last(),
                         Some(&LogEntry {
@@ -2929,8 +3295,11 @@ mod tests {
                     // P1: snapshot'ın kapsadığı girdiler uygulanmış sayılır.
                     assert_eq!(node.commit_index(), disk.snapshot_index());
                     assert_eq!(node.last_applied(), disk.snapshot_index());
-                    // Okumalar geçicidir: çökmeyle kaybolur ve hiçbir zaman cevaplanmaz.
+                    // Okumalar geçicidir: çökmeyle kaybolur ve hiçbir zaman cevaplanmaz. Saat ve
+                    // lider teması da açılışta sıfırdan başlar.
                     waiting.clear();
+                    clock = 0;
+                    contact = 0;
                     continue;
                 }
                 // Yeni bir liderlik turları 1'den sayar; eski onaylar geçersizdir.
@@ -2939,6 +3308,34 @@ mod tests {
                 {
                     last_round = 0;
                     acked.clear();
+                    sent_at.clear();
+                    lease_until = 0;
+                }
+                // §4.2.3: bu term'in liderinden gelen bir mesaj takipçiye lideri tanıtır.
+                if let Some((from, term)) = leader_message
+                    && node.role() == Role::Follower
+                    && node.leader_hint() == Some(from)
+                    && term == node.current_term()
+                {
+                    contact = 0;
+                }
+                // §4.2.3: korumalı bir takipçi HER oy isteğini, term'i ne olursa olsun, yok sayar;
+                // koruma yoksa daha yüksek bir term T1'e göre benimsenir.
+                if lease.is_some()
+                    && let Some((from, term)) = vote_request
+                    && node.peers().contains(&from)
+                {
+                    if role_before == Role::Follower && contact_before < config.election_timeout() {
+                        assert!(outputs.is_empty(), "§4.2.3: the vote request is ignored");
+                        assert_eq!(
+                            (node.current_term(), node.voted_for()),
+                            (term_before, before.voted_for),
+                            "§4.2.3: no term is adopted and no vote is given inside a lease"
+                        );
+                        coverage.votes_ignored += 1;
+                    } else if term > term_before {
+                        assert_eq!(node.current_term(), term, "T1: the higher term is adopted");
+                    }
                 }
                 // Bir onay, liderin aynı term'deki bir turuna verilmişse ve eşten geldiyse sayılır.
                 if let Some((from, response)) = probe_ack
@@ -2968,7 +3365,7 @@ mod tests {
                         && update.snapshot.is_none()
                         && log.from.0 <= before.last_index().0
                     {
-                        truncations += 1;
+                        coverage.truncations += 1;
                     }
                     disk.apply(update);
                     assert_eq!(disk, after, "O2: replaying the update gives the new state");
@@ -2999,7 +3396,7 @@ mod tests {
                 if compact && after.snapshot != before.snapshot {
                     assert!(after.snapshot_index() > before.snapshot_index());
                     assert!(after.snapshot_index() <= applied_before);
-                    compactions += 1;
+                    coverage.compactions += 1;
                 }
                 assert!(
                     after.current_term >= before.current_term,
@@ -3029,16 +3426,46 @@ mod tests {
                             "Q1: probe rounds count up by one"
                         );
                         started_round = Some(probe.round);
+                        sent_at.entry(probe.round).or_insert(clock);
                     }
                 }
                 if let Some(round) = started_round {
                     last_round = round;
                 }
+                // Q2: kiralama, çoğunluğun onayladığı en yüksek turun gönderiminden `lease` tick
+                // sonrasına uzatılır ve yalnızca ileri gider. Bu adımın onayları da sayılır: düğüm
+                // okumaları adımın sonunda, onları gördükten sonra sonuçlandırır.
+                if let Some(lease) = lease
+                    && node.role() == Role::Leader
+                {
+                    let confirmed = (1..=last_round)
+                        .rev()
+                        .find(|&round| {
+                            1 + acked.values().filter(|&&acked| acked >= round).count()
+                                >= node.quorum()
+                        })
+                        .unwrap_or(0);
+                    if let Some(&sent) = sent_at.get(&confirmed) {
+                        lease_until = lease_until.max(sent + lease);
+                    }
+                }
+                let leased = lease.is_some()
+                    && node.role() == Role::Leader
+                    && clock < lease_until
+                    && node.log.term_at(node.commit_index()) == Some(node.current_term());
                 if let Some(id) = read
                     && node.role() == Role::Leader
                 {
-                    let round = started_round.expect("Q1: a read starts a new probe round");
-                    waiting.insert(id, round);
+                    match started_round {
+                        Some(round) => {
+                            assert!(!leased, "Q2: a valid lease serves a read without a round");
+                            waiting.insert(id, round);
+                        }
+                        None => {
+                            assert!(leased, "Q1: a read starts a round unless a lease serves it");
+                            waiting.insert(id, 0);
+                        }
+                    }
                 }
                 for output in &outputs[persists..] {
                     assert!(!responded, "S1: the client response is the last output");
@@ -3053,7 +3480,7 @@ mod tests {
                             },
                             "S1: the hint is the known leader"
                         );
-                        not_leader_answers += 1;
+                        coverage.not_leader_answers += 1;
                         continue;
                     }
                     if let Output::Read { id, outcome } = output {
@@ -3066,7 +3493,7 @@ mod tests {
                                     Some(*id) == read || waiting.contains_key(id),
                                     "Q1: a rejection answers a read"
                                 );
-                                reads_rejected += 1;
+                                coverage.reads_rejected += 1;
                             }
                             ReadOutcome::Ready => {
                                 assert_eq!(node.role(), Role::Leader, "Q1: only a leader serves");
@@ -3078,11 +3505,17 @@ mod tests {
                                 let round = waiting[id];
                                 let confirmations =
                                     acked.values().filter(|&&acked| acked >= round).count();
-                                assert!(
-                                    confirmations + 1 >= node.quorum(),
-                                    "Q1: a majority confirmed a round started after the read"
-                                );
-                                reads_ready += 1;
+                                if round == 0 || confirmations + 1 < node.quorum() {
+                                    // Q2: liderlik ya okumanın geldiği anda (yukarıda denetlendi)
+                                    // ya da şu an kiralamayla doğrulandı.
+                                    assert!(
+                                        round == 0 || leased,
+                                        "Q1/Q2: a majority confirmed a later round, or the lease \
+                                         is valid"
+                                    );
+                                    coverage.lease_reads += 1;
+                                }
+                                coverage.reads_ready += 1;
                             }
                         }
                         waiting.remove(id);
@@ -3101,7 +3534,7 @@ mod tests {
                         );
                         restoring = true;
                         next_apply = snapshot.last_index.next();
-                        restores += 1;
+                        coverage.restores += 1;
                         continue;
                     }
                     if let Output::Apply { index, command } = output {
@@ -3114,7 +3547,7 @@ mod tests {
                             "an applied command is the logged one"
                         );
                         next_apply = next_apply.next();
-                        entries_applied += 1;
+                        coverage.entries_applied += 1;
                         continue;
                     }
                     let Output::Send { to, msg } = output else {
@@ -3171,7 +3604,7 @@ mod tests {
                                 node.snapshot(),
                                 "P1: a leader sends its own snapshot"
                             );
-                            snapshots_sent += 1;
+                            coverage.snapshots_sent += 1;
                         }
                         Message::RequestVoteResponse(_)
                         | Message::AppendEntriesResponse(_)
@@ -3201,7 +3634,7 @@ mod tests {
                             );
                         }
                         if response.round == 0 && request.term != node.current_term() {
-                            stale_probes_answered += 1;
+                            coverage.stale_probes_answered += 1;
                         }
                     }
                     if let Message::RequestVoteResponse(RequestVoteResponse {
@@ -3214,7 +3647,7 @@ mod tests {
                             Some(*to),
                             "a granted vote goes to votedFor"
                         );
-                        votes_granted += 1;
+                        coverage.votes_granted += 1;
                     }
                 }
                 assert_eq!(
@@ -3265,6 +3698,27 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             "every role must be reached"
         );
+        coverage
+    }
+
+    // Sözleşme testi, kiralamasız (bkz. `check_step_contract`).
+    #[test]
+    fn random_inputs_preserve_the_step_contract() {
+        let Coverage {
+            elections_won,
+            votes_granted,
+            entries_applied,
+            truncations,
+            not_leader_answers,
+            reads_ready,
+            lease_reads,
+            reads_rejected,
+            stale_probes_answered,
+            compactions,
+            restores,
+            snapshots_sent,
+            votes_ignored,
+        } = check_step_contract(Config::new(4, 2).expect("valid config"));
         // Eşikler ölçülen değerlerin (355 liderlik, 735 oy, 1114 uygulama, 263 kuyruk değiştirme
         // (§5.3), 7501 NotLeader cevabı, 164 cevaplanan ve 4019 reddedilen okuma, başka bir term'in
         // turuna verilen 617 cevap, 137 sıkıştırma, 458 snapshot kurulumu, liderin gönderdiği 81
@@ -3316,6 +3770,58 @@ mod tests {
             stale_probes_answered >= 100,
             "too few probes of another term answered ({stale_probes_answered}); the stale-round \
              guard is barely exercised"
+        );
+        assert_eq!(lease_reads, 0, "Q2: no lease reads without a lease");
+        assert_eq!(
+            votes_ignored, 0,
+            "§4.2.3: no vote request is ignored without a lease"
+        );
+    }
+
+    // Sözleşme testi, kiralamalı (Q2; bkz. `check_step_contract`): T = 4, kiralama 3 tick.
+    // Kiralama turları her heartbeat'te başlar; okumaların bir kısmı kiralamayla, bir kısmı
+    // (kiralama dolmuşken) turla cevaplanır ve takipçiler kiralama süresince yüksek term'li oy
+    // isteklerini yok sayar.
+    #[test]
+    fn random_inputs_preserve_the_step_contract_with_leases() {
+        let config = Config::new(4, 2)
+            .and_then(|config| config.with_lease(3))
+            .expect("valid config");
+        let Coverage {
+            elections_won,
+            votes_granted,
+            entries_applied,
+            reads_ready,
+            lease_reads,
+            votes_ignored,
+            ..
+        } = check_step_contract(config);
+        // Eşikler ölçülen değerlerin (348 liderlik, 183 oy, 1085 uygulama, 455'i kiralamayla olmak
+        // üzere 1193 cevaplanan okuma, kiralama içinde yok sayılan 1622 oy isteği) çok altındadır.
+        assert!(
+            elections_won >= 100,
+            "too few elections won ({elections_won}); the leader side is barely exercised"
+        );
+        assert!(
+            votes_granted >= 50,
+            "too few votes granted ({votes_granted}); the voting side is barely exercised"
+        );
+        assert!(
+            entries_applied >= 500,
+            "too few entries applied ({entries_applied}); the commit side is barely exercised"
+        );
+        assert!(
+            lease_reads >= 50,
+            "too few reads served by a lease ({lease_reads}); Q2 is barely exercised"
+        );
+        assert!(
+            reads_ready - lease_reads >= 50,
+            "too few reads served by a round ({}); the fallback to Q1 is barely exercised",
+            reads_ready - lease_reads
+        );
+        assert!(
+            votes_ignored >= 100,
+            "too few vote requests ignored ({votes_ignored}); §4.2.3 is barely exercised"
         );
     }
 }

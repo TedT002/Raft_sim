@@ -36,6 +36,9 @@ pub enum Profile {
     Reads,
     /// The chaos mix with log compaction: nodes snapshot their state every 16 entries.
     Snapshots,
+    /// The reads mix with leader leases: a leader answers reads without a round while its lease
+    /// lasts.
+    Leases,
 }
 
 impl Profile {
@@ -47,6 +50,7 @@ impl Profile {
             Profile::Figure8 => ScenarioConfig::figure8(),
             Profile::Reads => ScenarioConfig::reads(),
             Profile::Snapshots => ScenarioConfig::snapshots(),
+            Profile::Leases => ScenarioConfig::leases(),
         }
     }
 
@@ -58,6 +62,7 @@ impl Profile {
             Profile::Figure8 => "figure8",
             Profile::Reads => "reads",
             Profile::Snapshots => "snapshots",
+            Profile::Leases => "leases",
         }
     }
 
@@ -69,6 +74,7 @@ impl Profile {
             Profile::Figure8 => " --profile figure8",
             Profile::Reads => " --profile reads",
             Profile::Snapshots => " --profile snapshots",
+            Profile::Leases => " --profile leases",
         }
     }
 }

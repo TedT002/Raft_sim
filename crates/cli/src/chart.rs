@@ -139,7 +139,7 @@ fn segments(timeline: &[StatusChange], end: u64) -> Vec<Segment> {
 
 /// Hatalar, trace'teki etkileriyle: hata programının niyetleri değil, gerçekten olanlar (ör. lider
 /// yokken "lideri çökert" hiçbir şey yapmaz ve çizilmez). Sakinleşmenin iyileştirmesi ve yeniden
-/// başlatmaları da çizilir.
+/// başlatmaları da, saat sıçramaları da çizilir.
 fn markers(cluster: &RaftCluster) -> Vec<Marker> {
     cluster
         .sim()
@@ -163,6 +163,7 @@ fn markers(cluster: &RaftCluster) -> Vec<Marker> {
                 }
                 TraceKind::Heal => "heal".to_owned(),
                 TraceKind::Network { .. } => "network".to_owned(),
+                TraceKind::ClockJump { node, ticks } => format!("clock {} +{ticks}", node.0),
                 _ => return None,
             };
             Some(Marker {
