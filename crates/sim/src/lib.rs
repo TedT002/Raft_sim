@@ -30,6 +30,15 @@
 //! - **İstemciler** ([`ClientDriver`]): sırayla çalışan, zaman aşımında aynı `(client, seq)` ile
 //!   yeniden deneyen, `NotLeader` ipucunu izleyen istemciler; cevapların bir kısmı seed'li olarak
 //!   kaybolur. Geçmiş, `checker`'ın linearizability kontrolcüsünün tipleriyle kaydedilir.
+//! - **Kaos senaryoları** ([`Scenario`], [`run`]): bir seed'den koşudan ÖNCE üretilen açık bir hata
+//!   programı (çökme, lideri çökertme, yeniden başlatma, bölünme, iyileşme, kayıp oranı) ve onu
+//!   koşturan sürücü: her olaydan sonra denetimler, hatalardan sonra canlılık, sonda
+//!   linearizability. `raftsim fuzz`/`replay` ve kaos testleri aynı programı koşar.
+//! - **Küçültme** ([`shrink`]): başarısız bir senaryodan, aynı hatayı veren daha küçük bir senaryo
+//!   (hata alt kümesi ve daha kısa hata süresi) bulur.
+//! - **Mutasyonlar:** `mutation-*` Cargo özellikleri (varsayılan derlemede yok) çekirdeğe ya da KV
+//!   durum makinesine bilerek hata ekler; derlemede en fazla biri açık olabilir
+//!   ([`ENABLED_MUTATION`]). Her birinin yakalandığı `docs/mutation-table.md`'de tablolanır.
 //!
 //! Bu crate `raft-core`'a ve `checker`'a bağımlıdır (bağımlılık yönü: `sim -> raft-core`,
 //! `sim -> checker`); tersi asla olmaz. Sans-IO çekirdek hiçbir workspace crate'ini bilmemelidir.
@@ -98,6 +107,30 @@
 // Doctest'ler de uyarısız olmalı (clippy doctest'leri görmez).
 #![doc(test(attr(deny(warnings))))]
 
+// Mutasyon testi (Faz 5): aynı anda en fazla bir `mutation-*` özelliği açılabilir (çekirdeğin
+// mutasyonları raft-core'da da denetlenir; `mutation-no-dedup` yalnızca burada vardır). Çekirdeğin
+// mutasyonu bu crate'in özellikleriyle değil `raft_core::ENABLED_MUTATION` ile sayılır: çekirdeğin
+// özelliği doğrudan (`raft-core/mutation-…`) açılsa bile sayılmış olur ve `mutation-no-dedup` ile
+// birlikte açılması derlenmez.
+const ENABLED_MUTATIONS: usize =
+    raft_core::ENABLED_MUTATION.is_some() as usize + cfg!(feature = "mutation-no-dedup") as usize;
+// `<= 1` yerine `matches!`: varsayılan derlemede sabit 0'dır ve clippy, türün en küçük değeriyle
+// yapılan her zaman doğru bir karşılaştırmayı (`absurd_extreme_comparisons`) hata sayar.
+const _: () = assert!(
+    matches!(ENABLED_MUTATIONS, 0 | 1),
+    "enable at most one mutation-* feature at a time"
+);
+
+/// Bu derlemede açık olan mutasyon özelliğinin adı (varsayılan derlemede `None`). `raftsim`,
+/// başarısız bir seed'i yeniden üretme komutuna bunu ekler: mutant bir derlemenin bulduğu seed,
+/// ancak aynı özellikle derlenince aynı hatayı verir. Çekirdeğin mutasyonları
+/// `raft_core::ENABLED_MUTATION`'dan gelir; özellik adları `cli`, `sim` ve `raft-core`'da aynıdır.
+pub const ENABLED_MUTATION: Option<&str> = if cfg!(feature = "mutation-no-dedup") {
+    Some("mutation-no-dedup")
+} else {
+    raft_core::ENABLED_MUTATION
+};
+
 mod client;
 mod disk;
 mod error;
@@ -108,6 +141,8 @@ mod node;
 mod queue;
 mod raft;
 mod rng;
+mod scenario;
+mod shrink;
 mod simulation;
 mod trace;
 
@@ -141,5 +176,9 @@ pub use raft_core::{
     PersistUpdate, PersistentState, RaftNode, Role, Term,
 };
 pub use rng::{ChaCha8Rng, Component, SeedTree, chance, uniform_inclusive};
+pub use scenario::{
+    Fault, FaultMix, Run, RunError, RunStats, Scenario, ScenarioConfig, ScheduledFault, run,
+};
+pub use shrink::{Shrunk, shrink};
 pub use simulation::{HostView, SimConfig, SimOptions, Simulation, TickOrder};
 pub use trace::{DropReason, Trace, TraceEncode, TraceEvent, TraceKind, digest};

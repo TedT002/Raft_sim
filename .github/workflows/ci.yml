@@ -86,3 +86,46 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  fuzz:
+    name: Fuzz
+    # Her push'ta profil başına 1000 seed: her biri rastgele bir hata programı (çökme, lideri
+    # çökertme, yeniden başlatma, bölünme, iyileşme, kayıp oranı değişimi) ve istemci iş yükü koşar;
+    # HER olaydan sonra invariant'lar, sonda linearizability denetlenir. Başarısız bir seed, yeniden
+    # üretme komutuyla basılır. Kapılardan ayrı bir iştir: yalnızca release derlemesi gerekir ve
+    # kapılarla paralel koşar; birinin süresi ötekinin zaman aşımını tüketmez.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      # Release derlemesi (yapı profilleri değiştirilmeden) debug derlemesinden onlarca kat
+      # hızlıdır; derleme ayrı bir adımdır ki adım süreleri derlemeyi ve taramayı ayrı göstersin.
+      - name: Build (release)
+        run: cargo build --release --locked -p cli
+      - name: Fuzz 1000 seeds (chaos profile)
+        run: cargo run --release --locked -p cli -- fuzz --seeds 0..1000 --threads 4
+      - name: Fuzz 1000 seeds (figure8 profile)
+        run: >-
+          cargo run --release --locked -p cli --
+          fuzz --seeds 0..1000 --threads 4 --profile figure8
+
+  mutations:
+    name: Mutations
+    # Mutasyon tablosu (docs/mutation-table.md) her push'ta doğrulanır: her mutasyon kendi
+    # özelliğiyle derlenir ve tablodaki seed'de tablodaki denetime takılmalıdır; aynı seed
+    # özelliksiz derlemede geçmelidir. Her satır ayrı bir derleme olduğu için kapılardan ayrı bir
+    # işte koşar.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Every mutation is caught as listed
+        run: ./scripts/check_mutations.sh

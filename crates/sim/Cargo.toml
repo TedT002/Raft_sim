@@ -14,5 +14,17 @@ checker = { workspace = true }
 rand_chacha = { workspace = true }
 thiserror = { workspace = true }
 
+# Mutasyon testi (Faz 5): çekirdeğin mutasyonları buradan geçirilir (cli de sim üzerinden açar),
+# `mutation-no-dedup` ise simülatörün kendi durum makinesine aittir. Varsayılan derlemede hiçbiri
+# yoktur; aynı anda en fazla biri açılabilir (lib.rs'teki derleme zamanı denetimi).
+[features]
+mutation-no-election-restriction = ["raft-core/mutation-no-election-restriction"]
+mutation-commit-old-terms = ["raft-core/mutation-commit-old-terms"]
+mutation-forget-vote = ["raft-core/mutation-forget-vote"]
+mutation-truncate-on-append = ["raft-core/mutation-truncate-on-append"]
+mutation-skip-prev-log-term = ["raft-core/mutation-skip-prev-log-term"]
+mutation-apply-before-commit = ["raft-core/mutation-apply-before-commit"]
+mutation-no-dedup = []
+
 [lints]
 workspace = true

@@ -263,7 +263,13 @@ impl RaftNode {
         let persist = if (self.current_term, self.voted_for) != before || log_update.is_some() {
             Some(Output::Persist(PersistUpdate {
                 current_term: self.current_term,
-                voted_for: self.voted_for,
+                // Mutasyon `mutation-forget-vote` (Faz 5) oyu diske yazmaz: çöküp kalkan düğüm aynı
+                // term'de ikinci bir adaya oy verebilir.
+                voted_for: if cfg!(feature = "mutation-forget-vote") {
+                    None
+                } else {
+                    self.voted_for
+                },
                 log: log_update,
             }))
         } else {
@@ -493,12 +499,15 @@ impl RaftNode {
         // 2. E1, §5.2: bu term'de ya hiç oy verilmedi ya da zaten bu adaya verildi (cevabı kaybolan
         //    adayın tekrarlanan isteği yine "evet" almalı).
         // 3. §5.4.1: adayın log'u en az bizimki kadar güncel (seçim kısıtı).
+        // Mutasyon `mutation-no-election-restriction` (Faz 5) 3. koşulu kapatır: eksik log'lu bir
+        // aday da oy alır ve commit edilmiş girdileri taşımayan bir lider seçilebilir.
         let vote_granted = request.term == self.current_term
             && self.voted_for.is_none_or(|candidate| candidate == from)
-            && candidate_is_up_to_date(
-                (request.last_log_term, request.last_log_index),
-                (self.log.last_term(), self.log.last_index()),
-            );
+            && (cfg!(feature = "mutation-no-election-restriction")
+                || candidate_is_up_to_date(
+                    (request.last_log_term, request.last_log_index),
+                    (self.log.last_term(), self.log.last_index()),
+                ));
         if vote_granted {
             self.voted_for = Some(from);
             // Figure 2: oy vermek seçim zamanlayıcısını sıfırlar; yeni bir adaya fırsat tanınır.
@@ -587,7 +596,15 @@ impl RaftNode {
         // Log Matching'in tümevarım adımı budur: kabul edilen her girdinin öncesi liderinkiyle
         // aynıdır. İpucu, eşleşmenin olabileceği en büyük index'tir: log'umuz kısaysa son
         // index'imiz, değilse `prev_log_index`'in bir öncesi.
-        if self.log.term_at(prev_log_index) != Some(prev_log_term) {
+        // Mutasyon `mutation-skip-prev-log-term` (Faz 5) yalnızca term karşılaştırmasını atlar;
+        // varlık denetimi kalır: log'u yeterince uzun olan takipçi, `prev_log_index`'teki
+        // girdisinin term'i liderinkinden farklı olsa bile isteği kabul eder. Tutarsız bir önekin
+        // arkasına girdi eklenir ve log'lar ayrışır.
+        let consistent = match self.log.term_at(prev_log_index) {
+            None => false,
+            Some(term) => term == prev_log_term || cfg!(feature = "mutation-skip-prev-log-term"),
+        };
+        if !consistent {
             let hint = self.log.last_index().min(prev_log_index.prev());
             return (false, hint);
         }
@@ -596,6 +613,12 @@ impl RaftNode {
         // girdilere dokunulmaz. ÇAKIŞMA YOKSA HİÇBİR ŞEY SİLİNMEZ: gecikmiş ya da çoğaltılmış eski
         // bir istek (örneğin yalnızca ilk girdiyi taşıyan) log'u o isteğin boyuna kısaltsaydı,
         // takipçinin zaten onayladığı (belki commit edilmiş) girdiler kaybolurdu.
+        // Mutasyon `mutation-truncate-on-append` (Faz 5) çakışma aramadan `prev_log_index`'ten
+        // sonrasını her istekte siler: gecikmiş ya da çoğaltılmış bir istek, takipçinin onayladığı
+        // (belki commit edilmiş) girdileri kaybettirir.
+        if cfg!(feature = "mutation-truncate-on-append") {
+            self.log.truncate_from(prev_log_index.next());
+        }
         let mut index = prev_log_index;
         for entry in entries {
             index = index.next();
@@ -672,7 +695,11 @@ impl RaftNode {
         let mut candidate = self.log.last_index();
         while candidate > self.commit_index {
             match self.log.term_at(candidate) {
-                Some(term) if term == self.current_term => {
+                // Mutasyon `mutation-commit-old-terms` (Faz 5) term koşulunu kaldırır: önceki
+                // term'lerin girdileri de kopyaları sayılarak commit edilir (Figure 8'in hatası).
+                Some(term)
+                    if term == self.current_term || cfg!(feature = "mutation-commit-old-terms") =>
+                {
                     if self.replicated_on_majority(candidate) {
                         self.commit_index = candidate;
                         return;
@@ -713,7 +740,14 @@ impl RaftNode {
     /// log[lastApplied] to state machine").
     fn apply_committed(&mut self) -> Vec<Output> {
         let mut applies = Vec::new();
-        while self.last_applied < self.commit_index {
+        // Mutasyon `mutation-apply-before-commit` (Faz 5) commit'i beklemeden log'un sonuna kadar
+        // uygular: sonradan ezilen bir girdi durum makinesine girmiş olur.
+        let target = if cfg!(feature = "mutation-apply-before-commit") {
+            self.log.last_index()
+        } else {
+            self.commit_index
+        };
+        while self.last_applied < target {
             let index = self.last_applied.next();
             // commitIndex log'un sonunu aşamaz: lider kendi log'undan, takipçi bu istekte
             // doğrulanan son girdiye kadar commit eder. Aşsaydı (bir hata) girdi uydurulmaz,

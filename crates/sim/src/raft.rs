@@ -426,6 +426,24 @@ pub enum Violation {
     },
 }
 
+impl Violation {
+    /// İhlalin türünün kısa adı: bir hatayı türüyle tanımak için (ör. küçültmede "aynı hata"
+    /// ölçütü, mutasyon tablosu).
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Violation::ElectionSafety(_) => "election safety",
+            Violation::LeaderAppendOnly(_) => "leader append-only",
+            Violation::LogMatching(_) => "log matching",
+            Violation::LeaderCompleteness(_) => "leader completeness",
+            Violation::StateMachineSafety(_) => "state machine safety",
+            Violation::Durability { .. } => "durability",
+            Violation::PersistAfterOutput { .. } => "output order",
+            Violation::CommittedEntryRewritten { .. } => "committed entry rewritten",
+        }
+    }
+}
+
 /// `RaftCluster` üzerindeki bir işlemin hatası.
 ///
 /// `Violation` uygulamanın bir invariant'ı çiğnediği anlamına gelir (bulunmak istenen hata);
@@ -744,6 +762,15 @@ impl RaftCluster {
     /// Bölünmeyi kaldırır.
     pub fn heal(&mut self) {
         self.sim.heal();
+    }
+
+    /// Ağın ayarlarını değiştirir (bkz. [`Simulation::set_network_config`]); ör. kayıp oranı.
+    ///
+    /// # Errors
+    ///
+    /// Ayarlar geçersizse [`ConfigError`]; o durumda ağ değişmez.
+    pub fn set_network(&mut self, config: NetworkConfig) -> Result<(), ConfigError> {
+        self.sim.set_network_config(config)
     }
 
     /// Son olaydan sonra bütün invariant'ları denetler ve gözlem kayıtlarını günceller.

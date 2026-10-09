@@ -1,6 +1,6 @@
 [package]
 name = "cli"
-description = "raftsim command-line interface (fuzz / replay; phase 5)."
+description = "raftsim command-line interface: fuzz a seed range, replay one seed."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,18 @@ path = "src/main.rs"
 [dependencies]
 sim = { workspace = true }
 checker = { workspace = true }
+clap = { workspace = true }
+
+# Mutasyon testi (Faz 5): `cargo run -p cli --features mutation-<isim> -- fuzz ...` bir mutasyonu
+# açar (bkz. docs/mutation-table.md). Varsayılan derlemede hiçbiri yoktur.
+[features]
+mutation-no-election-restriction = ["sim/mutation-no-election-restriction"]
+mutation-commit-old-terms = ["sim/mutation-commit-old-terms"]
+mutation-forget-vote = ["sim/mutation-forget-vote"]
+mutation-truncate-on-append = ["sim/mutation-truncate-on-append"]
+mutation-skip-prev-log-term = ["sim/mutation-skip-prev-log-term"]
+mutation-apply-before-commit = ["sim/mutation-apply-before-commit"]
+mutation-no-dedup = ["sim/mutation-no-dedup"]
 
 [lints]
 workspace = true

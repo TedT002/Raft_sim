@@ -53,6 +53,15 @@ pub enum ConfigError {
         /// En uzun düşünme süresi (tick).
         max: u64,
     },
+    /// Hatalar arası süre aralığı geçersiz: en kısa süre 0 ya da en uzundan büyük. Sıfır süreyle
+    /// hata programı zamanda hiç ilerlemez: bütün hatalar aynı âna yığılır.
+    #[error("fault_gap must satisfy 1 <= min ({min}) <= max ({max})")]
+    FaultGap {
+        /// En kısa süre (tick).
+        min: u64,
+        /// En uzun süre (tick).
+        max: u64,
+    },
 }
 
 /// Geçersiz bir bölünme tanımı. Hata durumunda ne ağ ne trace değişir.

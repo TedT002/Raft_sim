@@ -291,7 +291,14 @@ impl KvStore {
         // (istemci 0) için de geçerlidir, ama o oturum isteklerini beklemeden eşzamanlı verir:
         // orada görülen bir `Stale` bir Raft hatasının izi olurdu. KV onu sessizce atlar, ama
         // State Machine Safety ham komutları yine de denetler.
-        if let Some(session) = self.sessions.get(&client) {
+        // Mutasyon `mutation-no-dedup` (Faz 5) oturumu yok sayar: yeniden denenen bir istek ikinci
+        // kez uygulanır.
+        let session = if cfg!(feature = "mutation-no-dedup") {
+            None
+        } else {
+            self.sessions.get(&client)
+        };
+        if let Some(session) = session {
             if seq == session.seq {
                 return KvApplied::Duplicate {
                     client,

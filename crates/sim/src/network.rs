@@ -13,7 +13,7 @@ use raft_core::NodeId;
 
 use crate::error::{ConfigError, PartitionError};
 use crate::rng::{ChaCha8Rng, chance, uniform_inclusive};
-use crate::trace::DropReason;
+use crate::trace::{DropReason, TraceEncode};
 
 /// Ağın rastgele davranışını belirleyen ayarlar.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,6 +60,23 @@ impl NetworkConfig {
             });
         }
         Ok(())
+    }
+}
+
+impl TraceEncode for NetworkConfig {
+    // Kanonik kodlama: olasılıklar IEEE-754 bit desenleriyle (little-endian), gecikmeler u64
+    // olarak. Bit deseni, aynı değerin her platformda aynı baytlara düşmesini sağlar.
+    fn encode(&self, out: &mut Vec<u8>) {
+        let NetworkConfig {
+            drop_prob,
+            duplicate_prob,
+            min_delay,
+            max_delay,
+        } = self;
+        out.extend_from_slice(&drop_prob.to_bits().to_le_bytes());
+        out.extend_from_slice(&duplicate_prob.to_bits().to_le_bytes());
+        out.extend_from_slice(&min_delay.to_le_bytes());
+        out.extend_from_slice(&max_delay.to_le_bytes());
     }
 }
 
@@ -186,10 +203,23 @@ impl SimNetwork {
         &self.config
     }
 
+    /// Ayarları değiştirir (ör. bir hata programının kayıp oranını değiştirmesi). Yoldaki mesajlar
+    /// gönderildikleri andaki kararlarını korur; yeni ayarlar yalnızca bundan sonraki gönderimlere
+    /// uygulanır. RNG akışının biçimi değişmez: `route` her çağrıda yine tam dört çekiliş yapar.
+    ///
+    /// # Errors
+    ///
+    /// Ayarlar geçersizse [`ConfigError`]; o durumda ağ değişmez.
+    pub fn set_config(&mut self, config: NetworkConfig) -> Result<(), ConfigError> {
+        config.validate()?;
+        self.config = config;
+        Ok(())
+    }
+
     /// `[min_delay, max_delay]` aralığından bir gecikme (tam olarak bir çekiliş).
     fn delay(&mut self) -> NonZeroU64 {
         let ticks = uniform_inclusive(&mut self.rng, self.config.min_delay, self.config.max_delay);
-        // Doğrulama `min_delay ≥ 1`'i garanti eder ve ayarlar kurulumdan sonra değiştirilemez; bu
+        // Doğrulama `min_delay ≥ 1`'i garanti eder (kurulumda ve her ayar değişikliğinde); bu
         // yüzden 0 gelmesi imkânsızdır. Yine de panik yerine en küçük geçerli gecikmeye (1)
         // düşülür.
         NonZeroU64::new(ticks).unwrap_or(NonZeroU64::MIN)

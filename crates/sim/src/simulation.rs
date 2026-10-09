@@ -16,7 +16,7 @@ use raft_core::NodeId;
 
 use crate::disk::SimDisk;
 use crate::error::{ConfigError, LifecycleError, PartitionError};
-use crate::network::{Fate, Network};
+use crate::network::{Fate, Network, NetworkConfig, SimNetwork};
 use crate::node::{DurableState, NodeInput, NodeOutput, OutputOf, SimNode, UpdateOf};
 use crate::queue::EventQueue;
 use crate::rng::{ChaCha8Rng, uniform_inclusive};
@@ -886,6 +886,26 @@ impl<N: SimNode, Net: Network> Simulation<N, Net> {
                 reason,
             },
         });
+    }
+}
+
+impl<N: SimNode> Simulation<N, SimNetwork> {
+    /// Simüle ağın ayarlarını değiştirir (bkz. [`SimNetwork::set_config`]) ve bunu trace'e
+    /// kaydeder: değişiklik koşunun kimliğinin (trace özetinin) parçasıdır ve `replay` çıktısında
+    /// görünür.
+    ///
+    /// # Errors
+    ///
+    /// Ayarlar geçersizse [`ConfigError`]; o durumda ne ağ ne trace değişir.
+    pub fn set_network_config(&mut self, config: NetworkConfig) -> Result<(), ConfigError> {
+        self.network.set_config(config)?;
+        self.trace.record(TraceEvent {
+            time: self.now,
+            kind: TraceKind::Network {
+                digest: digest(&config),
+            },
+        });
+        Ok(())
     }
 }
 

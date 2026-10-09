@@ -17,5 +17,17 @@ repository.workspace = true
 rand_chacha = { workspace = true }
 thiserror = { workspace = true }
 
+# Mutasyon testi (Faz 5): her özellik çekirdeğe bilerek bir hata ekler; varsayılan derlemede
+# hiçbiri yoktur ve CI `--all-features` kullanmaz. `docs/mutation-table.md` her birini yakalayan
+# denetimi ve seed'i listeler; `scripts/check_mutations.sh` hepsinin hâlâ yakalandığını doğrular.
+# Aynı anda en fazla bir mutasyon açılabilir (lib.rs'teki derleme zamanı denetimi).
+[features]
+mutation-no-election-restriction = []
+mutation-commit-old-terms = []
+mutation-forget-vote = []
+mutation-truncate-on-append = []
+mutation-skip-prev-log-term = []
+mutation-apply-before-commit = []
+
 [lints]
 workspace = true

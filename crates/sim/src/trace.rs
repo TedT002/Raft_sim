@@ -11,8 +11,9 @@ use raft_core::NodeId;
 
 use crate::fnv::{Fnv1a64, fnv1a64};
 
-/// Bir değerin trace'e girecek kanonik bayt kodlaması: düğümler arası mesajlar (`SimNode::Msg`) ve
-/// diske yazılan kalıcı durum (`SimNode::Durable`) için.
+/// Bir değerin trace'e girecek kanonik bayt kodlaması: düğümler arası mesajlar (`SimNode::Msg`),
+/// diske yazılan kalıcı durum (`SimNode::Durable`), uygulanan girdiler ve istemci cevapları ile
+/// koşu sırasında değiştirilen ağ ayarları (`NetworkConfig`) için.
 ///
 /// Aynı değer her zaman aynı baytları üretmelidir; farklı değerler mümkünse farklı baytlar. Kodlama
 /// bir kez yayımlandıktan sonra değiştirilirse, o tipi kullanan koşuların özetleri de değişir.
@@ -185,6 +186,11 @@ pub enum TraceKind {
         /// Cevabın özeti.
         digest: u64,
     },
+    /// Ağın ayarları değişti (ör. kayıp oranı).
+    Network {
+        /// Yeni ayarların özeti.
+        digest: u64,
+    },
 }
 
 /// Belirli bir zamanda gerçekleşen bir trace olayı.
@@ -304,6 +310,10 @@ impl TraceEvent {
                 hasher.write_u64(node.0);
                 hasher.write_u64(*digest);
             }
+            TraceKind::Network { digest } => {
+                hasher.write_u8(15);
+                hasher.write_u64(*digest);
+            }
         }
     }
 }
@@ -417,6 +427,8 @@ mod tests {
             TraceKind::Apply { node, digest: 1 },
             TraceKind::Client { node, digest: 1 },
             TraceKind::Reply { node, digest: 1 },
+            TraceKind::Network { digest: 1 },
+            TraceKind::Network { digest: 2 },
         ];
         let count = kinds.len();
         let mut hashes: Vec<u64> = kinds

@@ -122,6 +122,45 @@
 // uyarılarına karşı korur (örnekler README gibi okunur; uyarılı örnek kötü örnektir).
 #![doc(test(attr(deny(warnings))))]
 
+// Mutasyon testi (Faz 5): `mutation-*` özellikleri çekirdeğe bilerek hata ekler. İkisi aynı anda
+// açılırsa hangi hatanın yakalandığı belirsizleşir ve mutasyon tablosu anlamını yitirir: bu
+// derleme zamanı denetimi buna izin vermez.
+const ENABLED_MUTATIONS: usize = cfg!(feature = "mutation-no-election-restriction") as usize
+    + cfg!(feature = "mutation-commit-old-terms") as usize
+    + cfg!(feature = "mutation-forget-vote") as usize
+    + cfg!(feature = "mutation-truncate-on-append") as usize
+    + cfg!(feature = "mutation-skip-prev-log-term") as usize
+    + cfg!(feature = "mutation-apply-before-commit") as usize;
+// `<= 1` yerine `matches!`: varsayılan derlemede sabit 0'dır ve clippy, türün en küçük değeriyle
+// yapılan her zaman doğru bir karşılaştırmayı (`absurd_extreme_comparisons`) hata sayar.
+const _: () = assert!(
+    matches!(ENABLED_MUTATIONS, 0 | 1),
+    "enable at most one mutation-* feature at a time"
+);
+
+/// Bu derlemede açık olan çekirdek mutasyonunun Cargo özelliği; varsayılan derlemede `None`.
+///
+/// Mutasyon testi içindir (bkz. `docs/mutation-table.md`). Bir crate'in derleme zamanı koruması
+/// yalnızca kendi özelliklerini görür: çekirdeğin bir mutasyonu doğrudan (`raft-core/mutation-…`)
+/// açılırsa, `sim` onu ancak bu sabit üzerinden fark eder. `sim` kendi mutasyonunu bununla
+/// birleştirip derlemede tek bir mutasyon bulunduğunu denetler ve yeniden üretme komutlarına doğru
+/// özelliği yazar.
+pub const ENABLED_MUTATION: Option<&str> = if cfg!(feature = "mutation-no-election-restriction") {
+    Some("mutation-no-election-restriction")
+} else if cfg!(feature = "mutation-commit-old-terms") {
+    Some("mutation-commit-old-terms")
+} else if cfg!(feature = "mutation-forget-vote") {
+    Some("mutation-forget-vote")
+} else if cfg!(feature = "mutation-truncate-on-append") {
+    Some("mutation-truncate-on-append")
+} else if cfg!(feature = "mutation-skip-prev-log-term") {
+    Some("mutation-skip-prev-log-term")
+} else if cfg!(feature = "mutation-apply-before-commit") {
+    Some("mutation-apply-before-commit")
+} else {
+    None
+};
+
 mod config;
 mod input;
 mod log;

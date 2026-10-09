@@ -37,6 +37,10 @@ thiserror = "2"
 # (`fork`), zaman aşımı ve geçici dosyalar gerekmiyor; `std` yeterli. Testler sabit bir RNG seed'iyle
 # koşar ve hata dosyası yazmaz, böylece CI'da sonuç her koşuda aynıdır.
 proptest = { version = "1", default-features = false, features = ["std"] }
+# clap: yalnızca `raftsim` ikilisinin argüman ayrıştırması (cli). `derive` özelliği argümanları
+# tiplerle tanımlar; renkli çıktı ve öneriler gibi varsayılan özellikler kapalı (`std` ve yardım
+# metni yeterli; daha küçük bağımlılık yüzeyi).
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 
 # `#![forbid(unsafe_code)]` yalnızca yazıldığı crate kökünü kapsar; `tests/*.rs` entegrasyon
 # testleri AYRI crate'lerdir ve bu özniteliği miras almaz. Workspace lint'i her hedefi
